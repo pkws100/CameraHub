@@ -1,0 +1,5 @@
+.diagnostics{margin-top:1rem;border:1px solid var(--line);border-radius:14px;background:#0b1815;padding:.8rem 1rem;color:var(--muted);font-size:.78rem}
+.diagnostics summary{cursor:pointer;color:#dceae5;font-weight:750}
+.diagnostics dl{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.65rem 1rem;margin:.9rem 0 0}
+.diagnostics dl div{min-width:0}.diagnostics dt{color:#789087}.diagnostics dd{margin:.15rem 0 0;color:#eef7f3;overflow-wrap:anywhere}
+@media(max-width:600px){.diagnostics dl{grid-template-columns:1fr 1fr}}

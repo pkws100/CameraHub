@@ -1,0 +1,54 @@
+logLevel: info
+readTimeout: 60s
+writeTimeout: 60s
+authInternalUsers:
+  - user: any
+    pass:
+    ips: [127.0.0.1, ::1, 172.28.178.0/24]
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+  - user: any
+    pass:
+    ips: [127.0.0.1, ::1, 172.28.178.0/24]
+    permissions:
+      - action: api
+      - action: metrics
+      - action: pprof
+api: true
+apiAddress: :9997
+rtsp: true
+rtspAddress: :8554
+rtmp: false
+srt: false
+moq: false
+playback: false
+hls: true
+hlsAddress: :8888
+hlsAllowOrigins: [http://127.0.0.1:8090, http://localhost:8090]
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsDirectory: ''
+webrtc: true
+webrtcAddress: :8889
+webrtcAllowOrigins: [http://127.0.0.1:8090, http://localhost:8090]
+webrtcAdditionalHosts: [127.0.0.1]
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+pathDefaults:
+  record: false
+paths:
+  garten-low:
+    source: udp+mpegts://0.0.0.0:12001
+  eingang-low:
+    source: udp+mpegts://0.0.0.0:12011
+  serverraum-low:
+    source: udp+mpegts://0.0.0.0:12021
+  rueckseite-low:
+    source: udp+mpegts://0.0.0.0:12031
+  einfahrt-low:
+    source: udp+mpegts://0.0.0.0:12041
+  garage-low:
+    source: udp+mpegts://0.0.0.0:12051

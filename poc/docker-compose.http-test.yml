@@ -1,0 +1,39 @@
+services:
+  mediamtx:
+    ports: !override
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:8889:8889"
+      - "127.0.0.1:8189:8189/udp"
+      - "127.0.0.1:8189:8189/tcp"
+      - "${ZMODO_BIND_IP}:8189:8189/udp"
+      - "${ZMODO_BIND_IP}:8189:8189/tcp"
+
+  web:
+    environment:
+      HTTP_DIAGNOSTIC_ONLY: "1"
+      ALLOW_INSECURE_LOOPBACK_MANAGEMENT: "1"
+      ALLOW_INSECURE_PRIVATE_MANAGEMENT: "1"
+      PRIVATE_HTTP_NETWORKS: "${CAMERA_HUB_PRIVATE_HTTP_NETWORKS:-192.168.1.0/24}"
+    ports: !override
+      - "127.0.0.1:8090:8090"
+
+  caddy-http:
+    image: caddy:2.10.0-alpine
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+    environment:
+      ZMODO_BIND_IP: ${ZMODO_BIND_IP}
+    volumes:
+      - ./proxy/Caddyfile.http:/etc/caddy/Caddyfile:ro
+    ports:
+      - "${ZMODO_BIND_IP}:8090:8090/tcp"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- \"http://$${ZMODO_BIND_IP}:8090/healthz\" >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

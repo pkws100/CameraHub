@@ -1,0 +1,72 @@
+name: Camera Hub CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare non-secret Compose fixtures
+        run: |
+          mkdir -p poc/runtime/secrets
+          printf 'ci-only-placeholder\n' > poc/runtime/secrets/zmodo_secret_key
+          printf 'ci-only-placeholder\n' > poc/runtime/secrets/zmodo_internal_token
+
+      - name: Validate JavaScript
+        run: |
+          node --check poc/web/app.js
+          node --check poc/web/reader.js
+          node --check poc/web/sw.js
+
+      - name: Validate PowerShell syntax
+        shell: pwsh
+        run: |
+          $errors = @()
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$parseErrors
+            )
+            $errors += $parseErrors
+          }
+          if ($errors.Count) {
+            $errors | Format-List
+            throw "PowerShell syntax validation failed."
+          }
+
+      - name: Validate Compose configurations
+        env:
+          ZMODO_BIND_IP: 192.168.1.50
+          CAMERA_HUB_PRIVATE_HTTP_NETWORKS: 192.168.1.0/24
+        run: |
+          docker compose -f poc/docker-compose.yml config --quiet
+          docker compose -f poc/docker-compose.yml -f poc/docker-compose.http-test.yml config --quiet
+          docker compose -f poc/docker-compose.yml -f poc/docker-compose.https.yml config --quiet
+
+      - name: Validate Caddy gateways
+        run: |
+          docker run --rm -e ZMODO_BIND_IP=192.168.1.50 \
+            -v "$PWD/poc/proxy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.10.0-alpine caddy validate --config /etc/caddy/Caddyfile
+          docker run --rm -e ZMODO_BIND_IP=192.168.1.50 \
+            -v "$PWD/poc/proxy/Caddyfile.http:/etc/caddy/Caddyfile:ro" \
+            caddy:2.10.0-alpine caddy validate --config /etc/caddy/Caddyfile
+
+      - name: Build backend test image
+        run: docker build -t camerahub-backend-ci poc/backend
+
+      - name: Run backend integration suite
+        run: docker run --rm --entrypoint python -e PYTHONPATH=/app camerahub-backend-ci /app/tests/integration.py

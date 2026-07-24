@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#071210">
+  <meta name="description" content="Lokales, herstellerneutrales Multi-Kamera-Gateway">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>PKWS Camera Hub</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="apple-touch-icon" href="./icons/icon-192.png">
+  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./media-modes.css">
+  <link rel="stylesheet" href="./users.css">
+  <link rel="stylesheet" href="./camera-connections.css">
+  <link rel="stylesheet" href="./audit-fixes.css">
+  <link rel="stylesheet" href="./wall-mode.css">
+  <link rel="stylesheet" href="./auth-badges.css">
+  <script defer src="./reader.js"></script>
+  <script defer src="./app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <button class="menu-button" id="menu-button" type="button" aria-label="Menü öffnen" aria-expanded="false" aria-controls="app-menu">
+      <span></span><span></span><span></span>
+    </button>
+    <div class="brand"><p>Nur im privaten Netz</p><h1>PKWS Camera Hub</h1></div>
+    <div class="system-state" id="system-state" data-state="loading" role="status" aria-live="polite"><i></i><span>System wird geprüft</span></div>
+  </header>
+
+  <div class="menu-backdrop" id="menu-backdrop" hidden></div>
+  <nav class="app-menu" id="app-menu" aria-label="Hauptnavigation" aria-hidden="true" inert>
+    <div class="menu-head"><span>Camera Hub</span><button type="button" id="menu-close" aria-label="Menü schließen">×</button></div>
+    <button class="nav-item is-active" data-view="overview"><span>01</span>Liveübersicht</button>
+    <button class="nav-item" data-view="discover" data-permission="discoverCameras"><span>02</span>Kameras suchen</button>
+    <button class="nav-item" data-view="manage" data-permission="manageCameras"><span>03</span>Kameras verwalten</button>
+    <button class="nav-item" data-view="zones" data-permission="manageZones"><span>04</span>Alarmzonen</button>
+    <button class="nav-item" data-view="users" data-permission="manageUsers"><span>05</span>Benutzer</button>
+    <button class="nav-item" data-view="system"><span>06</span>Systemstatus</button>
+    <div class="menu-foot"><div><strong id="current-user">–</strong><p id="current-role">Offene Standards · Keine Cloud</p><a href="https://github.com/pkws100/CameraHub" target="_blank" rel="noopener noreferrer">Quellcode · AGPL-3.0 · Ohne Gewähr</a></div><button type="button" id="logout">Abmelden</button></div>
+  </nav>
+
+  <main id="app" hidden>
+    <section class="view is-active" id="view-overview" data-view="overview">
+      <div class="section-head"><div><p class="kicker">Liveübersicht</p><h2>Ihre Kameras</h2></div><div class="overview-actions"><button type="button" class="primary" id="enter-wall-mode" title="Randlose Kachelübersicht für große Bildschirme">Leitstellenmodus</button><button type="button" class="ghost" id="refresh-all">Aktualisieren</button></div></div>
+      <div class="camera-grid" id="camera-grid" aria-live="polite"></div>
+      <p class="privacy-note">WebRTC primär · HLS als Fallback · Keine Aufzeichnung · Keine Drittanbieter</p>
+    </section>
+
+    <section class="view" id="view-discover" data-view="discover" hidden>
+      <div class="section-head"><div><p class="kicker">Offene Standards</p><h2>Kameras im Heimnetz finden</h2></div><div class="scan-actions"><button class="primary" id="start-scan">Suche starten</button><button id="cancel-scan" hidden>Suche beenden</button></div></div>
+      <div class="notice"><strong>Sicherer Suchbereich</strong><span>Nur das serverseitig freigegebene private Subnetz · ONVIF, RTSP und lesende Prüfungen · keine Geräteänderung</span></div>
+      <div class="scan-progress" id="scan-progress" hidden><i></i><span>Netzwerk wird kontrolliert durchsucht …</span></div>
+      <div class="discovery-list" id="discovery-list"><div class="empty-state"><h3>Noch keine Suche ausgeführt</h3><p>Gefundene Geräte erscheinen hier mit Hersteller, Protokollen und – wenn möglich – einer Vorschau.</p></div></div>
+      <button class="text-button" id="manual-add">Kamera über RTSP oder MJPEG manuell hinzufügen</button>
+    </section>
+
+    <section class="view" id="view-manage" data-view="manage" hidden>
+      <div class="section-head"><div><p class="kicker">Reihenfolge & Quellen</p><h2>Kameras verwalten</h2></div><span class="save-state" id="order-status"></span></div>
+      <p class="section-copy">Ziehen Sie Kameras am Griff oder verwenden Sie die Pfeile. Änderungen werden auf dem Gateway gespeichert.</p>
+      <div class="manage-list" id="manage-list"></div>
+    </section>
+
+    <section class="view" id="view-zones" data-view="zones" hidden>
+      <div class="section-head"><div><p class="kicker">Vorbereitung für Erkennung</p><h2>Alarm- und Ausschlussbereiche</h2></div><select id="zone-camera" aria-label="Kamera für Zonen"></select></div>
+      <div class="zone-layout">
+        <div class="zone-stage" id="zone-stage"><img id="zone-preview" alt="Lokale Kameravorschau" hidden><canvas id="zone-canvas" tabindex="0" aria-label="Zonenfläche; Punkte mit Maus oder Berührung setzen"></canvas><div class="zone-empty" id="zone-empty">Vorschau wird geladen</div></div>
+        <aside class="zone-tools">
+          <label>Zonenname<input id="zone-name" maxlength="80" value="Alarmbereich"></label>
+          <div class="segmented"><button class="is-active" data-zone-kind="alarm">Alarmzone</button><button data-zone-kind="ignore">Alarmfrei</button></div>
+          <p>Tippen Sie mindestens drei Eckpunkte in das Bild.</p>
+          <details class="zone-coordinate"><summary>Punkt per Tastatur eingeben</summary><div class="form-grid"><label>X in Prozent<input id="zone-x" type="number" min="0" max="100" value="50"></label><label>Y in Prozent<input id="zone-y" type="number" min="0" max="100" value="50"></label></div><button type="button" id="zone-add-coordinate">Punkt hinzufügen</button></details>
+          <div class="tool-actions"><button id="zone-undo">Letzten Punkt löschen</button><button id="zone-complete" class="primary">Zone übernehmen</button></div>
+          <div class="zone-list" id="zone-list"></div>
+          <button id="zone-save" class="primary wide">Zonen speichern</button>
+        </aside>
+      </div>
+    </section>
+
+    <section class="view" id="view-users" data-view="users" hidden>
+      <div class="section-head"><div><p class="kicker">Eigentümerbereich</p><h2>Benutzer und Rollen</h2></div><button class="primary" id="add-user">Benutzer anlegen</button></div>
+      <div class="role-guide">
+        <article><strong>Eigentümer</strong><span>Benutzer, Kameras, Zonen und Liveansicht</span></article>
+        <article><strong>Administrator</strong><span>Kameras, Zonen und Liveansicht</span></article>
+        <article><strong>Betrachter</strong><span>Ausschließlich Liveansicht und Systemstatus</span></article>
+      </div>
+      <div class="user-list" id="user-list"></div>
+    </section>
+
+    <section class="view" id="view-system" data-view="system" hidden>
+      <div class="section-head"><div><p class="kicker">Diagnose</p><h2>Lokaler Systemstatus</h2></div><button id="change-own-password">Eigenes Passwort ändern</button></div>
+      <div class="diagnostic-grid">
+        <article><span>Secure Context</span><strong id="diag-secure">–</strong></article>
+        <article><span>Service Worker</span><strong id="diag-sw">–</strong></article>
+        <article><span>WebRTC</span><strong id="diag-webrtc">–</strong></article>
+        <article><span>HLS</span><strong id="diag-hls">–</strong></article>
+        <article><span>Backend</span><strong id="diag-backend">–</strong></article>
+        <article><span>App-Version</span><strong id="diag-version">1.0.0</strong></article>
+        <article class="span-two"><span>Origin</span><strong id="diag-origin">–</strong></article>
+      </div>
+      <p class="privacy-note">Die Erkennungs-Adapter-API ist vorbereitet, aber standardmäßig deaktiviert.</p>
+    </section>
+
+    <section id="detail" class="detail" hidden aria-labelledby="detail-name">
+      <div class="detail-head"><button class="back" id="detail-back">← Übersicht</button><div><p id="detail-source">Quelle</p><h2 id="detail-name">Kamera</h2></div><div class="status-pill" id="detail-status" data-state="loading"><i></i><span>Verbindung wird hergestellt</span></div></div>
+      <div class="detail-video" id="detail-shell"><video id="detail-video" autoplay muted playsinline></video><img id="detail-snapshot" alt="Aktuelle Kameravorschau" hidden><iframe id="detail-hls" title="HLS-Livebild" allow="autoplay; fullscreen" hidden></iframe><button type="button" class="stream-message" id="detail-message">Livebild wird aufgebaut …</button></div>
+      <div class="detail-meta"><span>Letzter Frame: <strong id="detail-last-frame">–</strong></span><span>Qualität: <strong id="detail-quality">Hauptstream</strong></span></div>
+      <div class="controls"><button class="primary" id="detail-reconnect">Neu verbinden</button><button id="detail-fallback">Substream</button><button id="detail-hls-toggle">HLS-Fallback</button><button id="detail-audio" hidden>Audio einschalten</button><button id="detail-fullscreen">Vollbild</button></div>
+      <section class="camera-functions" id="detail-functions" hidden>
+        <div class="function-head"><div><p class="kicker">ONVIF-Steuerung</p><h3>Kamerafunktionen</h3></div><span id="ptz-state">Bereit</span></div>
+        <div class="ptz-panel" id="ptz-panel" hidden>
+          <div class="ptz-pad" aria-label="PTZ-Steuerung">
+            <button data-ptz-x="0" data-ptz-y="0.55" data-ptz-z="0" aria-label="Nach oben">↑</button>
+            <button data-ptz-x="-0.55" data-ptz-y="0" data-ptz-z="0" aria-label="Nach links">←</button>
+            <button data-ptz-stop aria-label="Bewegung stoppen">■</button>
+            <button data-ptz-x="0.55" data-ptz-y="0" data-ptz-z="0" aria-label="Nach rechts">→</button>
+            <button data-ptz-x="0" data-ptz-y="-0.55" data-ptz-z="0" aria-label="Nach unten">↓</button>
+          </div>
+          <div class="ptz-zoom"><button data-ptz-x="0" data-ptz-y="0" data-ptz-z="0.45">Zoom +</button><button data-ptz-x="0" data-ptz-y="0" data-ptz-z="-0.45">Zoom −</button></div>
+          <label>Vorhandenes Preset<select id="ptz-presets"><option value="">Preset auswählen</option></select></label>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <button type="button" id="exit-wall-mode" class="wall-exit" aria-keyshortcuts="Escape" hidden>Normalansicht</button>
+
+  <dialog id="auth-dialog" class="modal" data-static="true" aria-labelledby="auth-title">
+    <form id="auth-form"><p class="kicker">Privater Zugang</p><h2 id="auth-title">Anmelden</h2><p id="auth-copy">Livebilder und Einstellungen sind geschützt.</p>
+      <label>Benutzername<input id="auth-user" autocomplete="username" required></label>
+      <label>Passwort<input id="auth-password" type="password" autocomplete="current-password" minlength="8" required></label>
+      <p class="form-error" id="auth-error" role="alert"></p><button class="primary wide" type="submit">Weiter</button></form>
+  </dialog>
+
+  <dialog id="reauth-dialog" class="modal" aria-labelledby="reauth-title"><form id="reauth-form"><p class="kicker">Sicherheitsbestätigung</p><h2 id="reauth-title">Änderung freigeben</h2><p>Bitte bestätigen Sie Ihr Kontopasswort.</p><label>Passwort<input id="reauth-password" type="password" autocomplete="current-password" minlength="8" required></label><p class="form-error" id="reauth-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Bestätigen</button></div></form></dialog>
+
+  <dialog id="camera-dialog" class="modal camera-modal" aria-labelledby="camera-title"><form id="camera-form"><p class="kicker">Neue Quelle</p><h2 id="camera-title">Kamera hinzufügen</h2><div class="form-grid">
+    <label class="span-two">Anzeigename<input name="name" required maxlength="80"></label>
+    <label>IP-Adresse<input name="address" inputmode="decimal" required></label><label>Protokoll<select name="protocol"><option value="rtsp">RTSP</option><option value="hls">HTTP HLS</option><option value="mjpeg">HTTP MJPEG</option><option value="snapshot">HTTP Snapshot</option></select></label>
+    <label>Port<input name="port" type="number" min="1" max="65535" value="554" required></label><label>Codec<select name="codec"><option value="h264">H.264</option><option value="h265">H.265 / HEVC</option><option value="mjpeg">MJPEG</option></select></label>
+    <label class="span-two">Substream-Pfad<input name="lowSourcePath" placeholder="/stream1" required></label><label class="span-two">Hauptstream-Pfad<input name="highSourcePath" placeholder="optional"></label>
+    <label>Benutzername<input name="username" autocomplete="off"></label><label>Passwort<input name="password" type="password" autocomplete="new-password"></label>
+    <input type="hidden" name="manufacturer"><input type="hidden" name="model">
+  </div><div class="test-result" id="source-test" role="status" aria-live="polite">Bitte testen Sie die Quelle vor dem Hinzufügen.</div><p class="form-error" id="camera-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button type="button" id="test-source">Quelle testen</button><button class="primary" type="submit">Hinzufügen</button></div></form></dialog>
+
+  <dialog id="connection-dialog" class="modal connection-modal" aria-labelledby="connection-title"><form id="connection-form">
+    <input type="hidden" name="cameraId"><input type="hidden" name="draftRevision">
+    <p class="kicker">Verschlüsselte Verbindung</p><h2 id="connection-title">Kameraverbindung</h2>
+    <div class="connection-state" id="connection-state"></div>
+    <fieldset><legend>Videostream</legend><div class="form-grid">
+      <label class="span-two">IP-Adresse<input name="address" inputmode="decimal" required></label>
+      <label>Protokoll<select name="streamProtocol"><option value="rtsp">RTSP</option><option value="hls">HTTP HLS</option><option value="mjpeg">HTTP MJPEG</option><option value="snapshot">HTTP Snapshot</option></select></label>
+      <label>Stream-Port<input name="streamPort" type="number" min="1" max="65535" required></label>
+      <label class="span-two">Substream-Pfad<input name="lowSourcePath" required></label>
+      <label class="span-two">Hauptstream-Pfad<input name="highSourcePath"></label>
+      <label>Codec<select name="codec"><option value="h264">H.264</option><option value="h265">H.265 / HEVC</option><option value="mjpeg">MJPEG</option></select></label>
+    </div></fieldset>
+    <fieldset><legend>ONVIF</legend><div class="form-grid">
+      <label>Schema<select name="onvifScheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select></label>
+      <label>ONVIF-Port<input name="onvifPort" type="number" min="1" max="65535" required></label>
+      <label class="span-two">Device-Service-Pfad<input name="onvifPath" required></label>
+    </div></fieldset>
+    <fieldset><legend>Zugangsdaten</legend>
+      <label>Verwendung<select name="credentialMode" id="credential-mode"><option value="none">Ohne Anmeldung</option><option value="shared">Gemeinsam für ONVIF und Stream</option><option value="separate">Getrennte Zugänge</option></select></label>
+      <p class="credential-hint" id="credential-hint">Keine Zugangsdaten gespeichert.</p>
+      <div class="form-grid credentials-shared" id="credentials-shared" hidden>
+        <label>Benutzername<input name="sharedUsername" autocomplete="off"></label><label>Neues Passwort<input name="sharedPassword" type="password" autocomplete="new-password"></label>
+      </div>
+      <div class="form-grid credentials-separate" id="credentials-separate" hidden>
+        <label>ONVIF-Benutzer<input name="onvifUsername" autocomplete="off"></label><label>ONVIF-Passwort<input name="onvifPassword" type="password" autocomplete="new-password"></label>
+        <label>Stream-Benutzer<input name="streamUsername" autocomplete="off"></label><label>Stream-Passwort<input name="streamPassword" type="password" autocomplete="new-password"></label>
+      </div>
+    </fieldset>
+    <div class="connection-test" id="connection-test" role="status" aria-live="polite">Noch nicht geprüft.</div>
+    <p class="form-error" id="connection-error" role="alert"></p>
+    <div class="dialog-actions connection-actions"><button type="button" data-close-dialog>Abbrechen</button><button type="button" id="connection-test-button">Prüfen</button><button type="submit">Entwurf speichern</button><button class="primary" type="button" id="connection-activate" disabled>Aktivieren</button></div>
+  </form></dialog>
+
+  <dialog id="capability-dialog" class="modal capability-modal" aria-labelledby="capability-title"><div>
+    <p class="kicker">Offene Standards</p><h2 id="capability-title">Kamerafunktionen</h2>
+    <div id="capability-content" class="capability-grid"></div>
+    <p class="form-error" id="capability-error" role="alert"></p>
+    <div class="dialog-actions"><button type="button" data-close-dialog>Schließen</button><button type="button" id="capability-refresh">Neu erkennen</button></div>
+  </div></dialog>
+
+  <dialog id="user-dialog" class="modal" aria-labelledby="user-title"><form id="user-form"><p class="kicker">Neuer Zugang</p><h2 id="user-title">Benutzer anlegen</h2>
+    <label>Benutzername<input name="username" autocomplete="off" pattern="[A-Za-z0-9._-]+" maxlength="64" required></label>
+    <label>Anzeigename<input name="displayName" maxlength="80" required></label>
+    <label>Rolle<select name="role"><option value="viewer">Betrachter</option><option value="admin">Administrator</option><option value="owner">Eigentümer</option></select></label>
+    <label>Erstpasswort<input name="password" type="password" autocomplete="new-password" minlength="8" required></label>
+    <label>Passwort wiederholen<input name="confirmation" type="password" autocomplete="new-password" minlength="8" required></label>
+    <p class="form-error" id="user-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Benutzer anlegen</button></div>
+  </form></dialog>
+
+  <dialog id="password-dialog" class="modal" aria-labelledby="password-title"><form id="password-form"><p class="kicker">Passwortverwaltung</p><h2 id="password-title">Passwort setzen</h2>
+    <input type="hidden" name="userId"><label>Neues Passwort<input name="password" type="password" autocomplete="new-password" minlength="8" required></label>
+    <label>Passwort wiederholen<input name="confirmation" type="password" autocomplete="new-password" minlength="8" required></label>
+    <p class="form-error" id="password-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Passwort speichern</button></div>
+  </form></dialog>
+
+  <dialog id="own-password-dialog" class="modal" aria-labelledby="own-password-title"><form id="own-password-form"><p class="kicker">Mein Konto</p><h2 id="own-password-title">Eigenes Passwort ändern</h2>
+    <label>Aktuelles Passwort<input name="currentPassword" type="password" autocomplete="current-password" minlength="8" required></label>
+    <label>Neues Passwort<input name="newPassword" type="password" autocomplete="new-password" minlength="8" required></label>
+    <label>Passwort wiederholen<input name="confirmation" type="password" autocomplete="new-password" minlength="8" required></label>
+    <p class="form-error" id="own-password-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Passwort ändern</button></div>
+  </form></dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <template id="camera-template"><article class="camera-card"><div class="card-video"><video autoplay muted playsinline></video><img class="card-snapshot" alt="Aktuelle Kameravorschau" hidden><button type="button" class="card-placeholder" aria-label="Videowiedergabe starten"><span class="pulse"></span><span>Vorschau wartet</span></button><span class="source-badge"></span><span class="auth-badge" data-auth="false" role="img"><svg class="auth-icon auth-icon-locked" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V8a5 5 0 0 1 10 0v2m-9 0h8a2 2 0 0 1 2 2v7H6v-7a2 2 0 0 1 2-2Z"/></svg><svg class="auth-icon auth-icon-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 10V8a4 4 0 0 1 7.5-2M8 10h8a2 2 0 0 1 2 2v7H6v-7a2 2 0 0 1 2-2Z"/></svg><span class="auth-badge-text">Ohne Anmeldung</span></span><div class="wall-label"><strong class="wall-camera-name"></strong><span class="wall-camera-status" data-state="loading"><i></i><span>Verbindet</span></span></div></div><div class="card-body"><div class="card-heading"><h3></h3><div class="card-status" data-state="loading"><i></i><span class="status-text">Verbindung wird hergestellt</span></div></div><p class="last-frame">Letzter Frame: <span>–</span></p><div class="card-actions"><button class="primary open-camera">Öffnen</button><button class="reconnect-camera">Neu verbinden</button></div></div></article></template>
+</body>
+</html>
