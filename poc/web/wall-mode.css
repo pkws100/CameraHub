@@ -1,0 +1,214 @@
+.overview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: .55rem;
+}
+
+.wall-label,
+.wall-exit {
+  display: none;
+}
+
+body.wall-mode {
+  overflow: hidden;
+  padding: 0;
+  background: #000;
+}
+
+body.wall-mode .topbar,
+body.wall-mode .app-menu,
+body.wall-mode .menu-backdrop,
+body.wall-mode #view-overview > .section-head,
+body.wall-mode #view-overview > .privacy-note,
+body.wall-mode .card-body,
+body.wall-mode .source-badge {
+  display: none !important;
+}
+
+body.wall-mode main {
+  width: 100%;
+  max-width: none;
+  height: 100dvh;
+  margin: 0;
+  padding: 0;
+}
+
+body.wall-mode #view-overview {
+  position: fixed;
+  z-index: 70;
+  inset: 0;
+  display: block !important;
+  width: 100vw;
+  height: 100dvh;
+  background: #000;
+  animation: none;
+}
+
+body.wall-mode .camera-grid {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  gap: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+
+body.wall-mode .camera-grid[data-count="1"] {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+body.wall-mode .camera-grid[data-count="2"] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: minmax(0, 1fr);
+}
+
+body.wall-mode .camera-grid[data-count="3"] {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-rows: minmax(0, 1fr);
+}
+
+body.wall-mode .camera-grid[data-count="4"] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+
+body.wall-mode .camera-card {
+  min-width: 0;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: #000;
+}
+
+body.wall-mode .card-video {
+  width: 100%;
+  height: 100%;
+  aspect-ratio: auto;
+  background: #000;
+}
+
+body.wall-mode .card-video video,
+body.wall-mode .card-video .card-snapshot {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+body.wall-mode .card-placeholder {
+  border: 0;
+  border-radius: 0;
+  background: #020504;
+}
+
+body.wall-mode .wall-label {
+  position: absolute;
+  z-index: 3;
+  left: clamp(.55rem, 1.2vw, 1rem);
+  bottom: clamp(.55rem, 1.2vw, 1rem);
+  display: flex;
+  align-items: center;
+  gap: .7rem;
+  max-width: calc(100% - 2rem);
+  padding: .45rem .65rem;
+  border: 1px solid #ffffff24;
+  border-radius: 9px;
+  background: #020504c7;
+  box-shadow: 0 5px 18px #0008;
+  color: #f5fbf8;
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+}
+
+.wall-camera-name {
+  overflow: hidden;
+  font-size: clamp(.72rem, 1.1vw, 1rem);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wall-camera-status {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  color: #b8cac3;
+  font-size: clamp(.58rem, .8vw, .75rem);
+  white-space: nowrap;
+}
+
+.wall-camera-status i {
+  width: .48rem;
+  height: .48rem;
+  flex: none;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 0 .2rem #eab75b20;
+}
+
+.wall-camera-status[data-state="live"] i {
+  background: #52d7a3;
+  box-shadow: 0 0 0 .2rem #52d7a320;
+}
+
+.wall-camera-status[data-state="offline"] i {
+  background: var(--red);
+  box-shadow: 0 0 0 .2rem #ff898920;
+}
+
+body.wall-mode .wall-exit {
+  position: fixed;
+  z-index: 90;
+  top: max(1rem, env(safe-area-inset-top));
+  right: max(1rem, env(safe-area-inset-right));
+  display: block;
+  padding: .65rem .85rem;
+  border-color: #ffffff35;
+  background: #06100ed9;
+  box-shadow: 0 8px 28px #0009;
+  opacity: 0;
+  transform: translateY(-.45rem);
+  pointer-events: none;
+  transition: opacity .2s ease, transform .2s ease;
+  backdrop-filter: blur(8px);
+}
+
+body.wall-mode.wall-controls-visible .wall-exit,
+body.wall-mode .wall-exit:focus-visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+@media (orientation: portrait), (max-aspect-ratio: 4 / 3) {
+  body.wall-mode .camera-grid,
+  body.wall-mode .camera-grid[data-count="3"],
+  body.wall-mode .camera-grid[data-count="5"],
+  body.wall-mode .camera-grid[data-count="6"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: repeat(3, minmax(0, 1fr));
+  }
+
+  body.wall-mode .camera-grid[data-count="1"] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  body.wall-mode .camera-grid[data-count="2"] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+  }
+
+  body.wall-mode .camera-grid[data-count="4"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body.wall-mode .wall-exit {
+    transition: none;
+  }
+}

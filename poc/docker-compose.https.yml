@@ -1,0 +1,38 @@
+services:
+  mediamtx:
+    ports: !override
+      - "${ZMODO_BIND_IP}:8189:8189/udp"
+      - "${ZMODO_BIND_IP}:8189:8189/tcp"
+
+  web:
+    environment:
+      ALLOW_INSECURE_LOOPBACK_MANAGEMENT: "0"
+    ports: !override
+      - "127.0.0.1:8090:8090/tcp"
+
+  caddy:
+    image: caddy:2.10.0-alpine
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+    environment:
+      ZMODO_BIND_IP: ${ZMODO_BIND_IP}
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "${ZMODO_BIND_IP}:443:443/tcp"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-check-certificate -qO- \"https://$${ZMODO_BIND_IP}/healthz\" >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  caddy-data:
+  caddy-config:

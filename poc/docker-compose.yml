@@ -1,0 +1,178 @@
+name: zmodo-local-poc
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-relay: &relay
+  build: ./relay
+  restart: unless-stopped
+  depends_on:
+    mediamtx:
+      condition: service_healthy
+  stop_grace_period: 10s
+  logging: *bounded-logging
+  healthcheck:
+    test: ["CMD-SHELL", "pidof vlc >/dev/null && wget -qO- http://mediamtx:9997/v3/paths/get/$${PATH_NAME} | grep -q '\"ready\":true'"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 30s
+
+services:
+  mediamtx:
+    build: ./mediamtx
+    image: zmodo-mediamtx:1.19.2-health
+    restart: unless-stopped
+    logging: *bounded-logging
+    volumes:
+      - ${ZMODO_MEDIAMTX_CONFIG:-./mediamtx.yml}:/mediamtx.yml:ro
+    ports:
+      - "${ZMODO_BIND_IP:-127.0.0.1}:8888:8888"
+      - "${ZMODO_BIND_IP:-127.0.0.1}:8889:8889"
+      - "${ZMODO_BIND_IP:-127.0.0.1}:8189:8189/udp"
+      - "${ZMODO_BIND_IP:-127.0.0.1}:8189:8189/tcp"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9997/v3/paths/list >/dev/null"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  garten-low:
+    <<: *relay
+    # Separates Rollback-Profil: Garten wird nach bestandener dynamischer
+    # Migration nicht mehr zusammen mit den übrigen statischen Relays gestartet.
+    profiles: ["legacy-static-garten"]
+    environment:
+      RELAY_ID: garten-low
+      PATH_NAME: garten-low
+      # Kamera .8 akzeptierte im Folgeauftrag nur eine stabile Parallelsitzung;
+      # dieser neutrale Pfad transportiert daher den Hauptstream fuer Uebersicht und Detail.
+      SOURCE_URI: ${CAMERA_GARTEN_SOURCE_URI:-}
+      OUTPUT_PORT: "12001"
+
+  eingang-low:
+    <<: *relay
+    profiles: ["legacy-static"]
+    environment:
+      RELAY_ID: eingang-low
+      PATH_NAME: eingang-low
+      # Der Substream liefert im Browser keine neuen Frames; fuer diese Kachel wird der bestaetigte Hauptstream remuxt.
+      SOURCE_URI: ${CAMERA_EINGANG_SOURCE_URI:-}
+      OUTPUT_PORT: "12011"
+
+  serverraum-low:
+    <<: *relay
+    profiles: ["legacy-static"]
+    environment:
+      RELAY_ID: serverraum-low
+      PATH_NAME: serverraum-low
+      SOURCE_URI: ${CAMERA_SERVERRAUM_SOURCE_URI:-}
+      OUTPUT_PORT: "12021"
+
+  rueckseite-low:
+    <<: *relay
+    profiles: ["legacy-static"]
+    environment:
+      RELAY_ID: rueckseite-low
+      PATH_NAME: rueckseite-low
+      SOURCE_URI: ${CAMERA_RUECKSEITE_SOURCE_URI:-}
+      OUTPUT_PORT: "12031"
+
+  einfahrt-low:
+    <<: *relay
+    profiles: ["legacy-static"]
+    environment:
+      RELAY_ID: einfahrt-low
+      PATH_NAME: einfahrt-low
+      SOURCE_URI: ${CAMERA_EINFAHRT_SOURCE_URI:-}
+      OUTPUT_PORT: "12041"
+
+  garage-low:
+    <<: *relay
+    profiles: ["legacy-static"]
+    environment:
+      RELAY_ID: garage-low
+      PATH_NAME: garage-low
+      # Der Receiver-Substream war nicht decodierbar; der framebestaetigte Hauptstream dient als Garage-Fallback.
+      SOURCE_URI: ${CAMERA_GARAGE_SOURCE_URI:-}
+      OUTPUT_PORT: "12051"
+
+  web:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      mediamtx:
+        condition: service_healthy
+    logging: *bounded-logging
+    environment:
+      WEB_ROOT: /web
+      CAMERA_CONFIG: /config/cameras.json
+      MEDIAMTX_API: http://mediamtx:9997
+      DATABASE_PATH: /data/zmodo.db
+      SECRET_KEY_PATH: /run/secrets/zmodo_secret_key
+      INTERNAL_TOKEN_PATH: /run/secrets/zmodo_internal_token
+      DISCOVERY_NETWORK: ${CAMERA_HUB_DISCOVERY_NETWORK:-192.168.1.0/24}
+      TRUSTED_PROXY_NETWORKS: ${CAMERA_HUB_TRUSTED_PROXY_NETWORKS:-172.28.178.0/24}
+      STATIC_AUTHENTICATED_CAMERA_IDS: ${CAMERA_HUB_STATIC_AUTHENTICATED_IDS:-}
+      ALLOW_INSECURE_LOOPBACK_MANAGEMENT: "1"
+      ALLOW_OWNER_SETUP: ${CAMERA_HUB_ALLOW_OWNER_SETUP:-0}
+      MAX_CAMERAS: "32"
+    secrets:
+      - zmodo_secret_key
+      - zmodo_internal_token
+    volumes:
+      - ./web:/web:ro
+      - ./backend/cameras.json:/config/cameras.json:ro
+      - zmodo-data:/data
+    ports:
+      - "${ZMODO_BIND_IP:-127.0.0.1}:8090:8090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  relay-manager:
+    build: ./manager
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+    logging: *bounded-logging
+    environment:
+      BACKEND_INTERNAL: http://web:8090
+      MEDIAMTX_API: http://mediamtx:9997
+      INTERNAL_TOKEN_PATH: /run/secrets/zmodo_internal_token
+    secrets:
+      - zmodo_internal_token
+    tmpfs:
+      - /run/relay-secrets:mode=0700,uid=100,gid=101
+      - /run/relay-health:mode=0755,uid=100,gid=101
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /run/relay-health/manager"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.178.0/24
+
+volumes:
+  zmodo-data:
+
+secrets:
+  zmodo_secret_key:
+    file: ./runtime/secrets/zmodo_secret_key
+  zmodo_internal_token:
+    file: ./runtime/secrets/zmodo_internal_token
