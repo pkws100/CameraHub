@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 from urllib.parse import urlparse
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from argon2 import PasswordHasher
@@ -76,6 +76,11 @@ TRUSTED_PROXY_NETWORKS = tuple(
 STATIC_AUTHENTICATED_CAMERA_IDS = frozenset(
     value.strip()
     for value in os.environ.get("STATIC_AUTHENTICATED_CAMERA_IDS", "").split(",")
+    if value.strip()
+)
+EXTERNAL_CONTROL_HOSTS = frozenset(
+    value.strip().lower()
+    for value in os.environ.get("EXTERNAL_CONTROL_HOSTS", "czeview-bridge").split(",")
     if value.strip()
 )
 DUMMY_PASSWORD_HASH = PH.hash("CameraHub-Dummy-Password-Not-An-Account")
@@ -146,6 +151,8 @@ CREATE TABLE IF NOT EXISTS cameras(
  detail_quality TEXT, managed INTEGER NOT NULL DEFAULT 0, address TEXT, protocol TEXT,
  port INTEGER, low_source_path TEXT, high_source_path TEXT, codec TEXT NOT NULL DEFAULT 'h264',
  manufacturer TEXT, model TEXT, snapshot_uri TEXT, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL,
+ on_demand INTEGER NOT NULL DEFAULT 0,
+ external_control_url TEXT, external_capabilities_json TEXT,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS zones(
@@ -201,6 +208,12 @@ def initialize_database() -> None:
         if "user_id" not in session_columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
         camera_columns = {row["name"] for row in conn.execute("PRAGMA table_info(cameras)")}
+        if "on_demand" not in camera_columns:
+            conn.execute("ALTER TABLE cameras ADD COLUMN on_demand INTEGER NOT NULL DEFAULT 0")
+        if "external_control_url" not in camera_columns:
+            conn.execute("ALTER TABLE cameras ADD COLUMN external_control_url TEXT")
+        if "external_capabilities_json" not in camera_columns:
+            conn.execute("ALTER TABLE cameras ADD COLUMN external_capabilities_json TEXT")
         if "active_connection_id" not in camera_columns:
             conn.execute("ALTER TABLE cameras ADD COLUMN active_connection_id TEXT")
         if "last_good_connection_id" not in camera_columns:
@@ -391,6 +404,44 @@ class CameraPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     enabled: bool | None = None
     sourceLabel: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class ExternalCameraInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    path: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    sourceLabel: str = Field(min_length=1, max_length=80)
+    codec: Literal["h264", "h265"] = "h264"
+    manufacturer: str = Field(default="", max_length=128)
+    model: str = Field(default="", max_length=128)
+    detailQuality: str | None = Field(default=None, max_length=80)
+    width: int | None = Field(default=None, ge=1, le=16384)
+    height: int | None = Field(default=None, ge=1, le=16384)
+    controlUrl: str | None = Field(default=None, max_length=256)
+    ptzAxes: list[Literal["x", "y", "zoom"]] = Field(default_factory=list, max_length=3)
+
+    @field_validator("controlUrl")
+    @classmethod
+    def valid_control_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlparse(value)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("external control endpoint is not allowed") from exc
+        if (
+            parsed.scheme != "http"
+            or not parsed.hostname
+            or parsed.hostname.lower() not in EXTERNAL_CONTROL_HOSTS
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+            or port is None
+        ):
+            raise ValueError("external control endpoint is not allowed")
+        return value.rstrip("/")
 
 
 class ConnectionInput(BaseModel):
@@ -613,33 +664,46 @@ def issue_session(response: Response, request: FastAPIRequest, user: sqlite3.Row
 
 
 def public_camera(row: sqlite3.Row) -> dict:
+    external_source = row["protocol"] == "external"
     with connect() as conn:
-        capability_row = conn.execute(
+        capability_row = None if external_source else conn.execute(
             """SELECT cp.payload_json FROM camera_capabilities cp
                JOIN cameras c ON c.id=cp.camera_id
                WHERE cp.camera_id=? AND cp.connection_id=c.active_connection_id""",
             (row["id"],),
         ).fetchone()
         current = active_connection(conn, row["id"])
-    capabilities = json.loads(capability_row["payload_json"]) if capability_row else {}
+    capabilities = (
+        json.loads(row["external_capabilities_json"])
+        if external_source and row["external_capabilities_json"]
+        else json.loads(capability_row["payload_json"])
+        if capability_row
+        else {}
+    )
     active_stream_credentials = bool(
         current and (
             current["stream_credential_id"]
             or (current["credential_mode"] == "shared" and current["shared_credential_id"])
         )
     )
-    uses_credentials = active_stream_credentials if row["managed"] else row["id"] in STATIC_AUTHENTICATED_CAMERA_IDS
+    uses_credentials = (
+        active_stream_credentials
+        if row["managed"]
+        else external_source or row["id"] in STATIC_AUTHENTICATED_CAMERA_IDS
+    )
     return {
         "id": row["id"], "name": row["name"], "lowPath": row["low_path"], "highPath": row["high_path"],
         "source": row["source_label"], "fallbackAvailable": False,
         "statusPath": f"/api/cameras/{row['id']}/status", "detailQuality": row["detail_quality"],
         "enabled": bool(row["enabled"]), "position": row["position"], "managed": bool(row["managed"]),
-        "usesCredentials": uses_credentials,
+        "usesCredentials": uses_credentials, "externalSource": external_source,
+        "onDemand": bool(row["on_demand"]),
         "displayMode": "snapshot" if row["protocol"] == "snapshot" else "stream",
         "snapshotPath": f"/api/cameras/{row['id']}/snapshot" if row["protocol"] == "snapshot" else None,
         "features": {
             "audio": bool(capabilities.get("audio", {}).get("supported")),
             "ptz": bool(capabilities.get("ptz", {}).get("supported")),
+            "ptzAxes": capabilities.get("ptz", {}).get("axes", []),
         },
     }
 
@@ -658,8 +722,21 @@ def admin_camera(row: sqlite3.Row, paths: dict[str, dict] | None = None, media_a
         paths, media_api_ok = media_paths()
     live_ready = bool(media_api_ok and paths.get(row["low_path"], {}).get("ready"))
     uses_active_revision = bool(row["managed"])
-    live_auth_configured = bool(active_flags["stream"]) if uses_active_revision else row["id"] in STATIC_AUTHENTICATED_CAMERA_IDS
-    credential_source = "active-revision" if uses_active_revision else ("static-relay" if live_auth_configured else "none")
+    external_source = row["protocol"] == "external"
+    live_auth_configured = (
+        bool(active_flags["stream"])
+        if uses_active_revision
+        else external_source or row["id"] in STATIC_AUTHENTICATED_CAMERA_IDS
+    )
+    credential_source = (
+        "active-revision"
+        if uses_active_revision
+        else "external-secret"
+        if external_source
+        else "static-relay"
+        if live_auth_configured
+        else "none"
+    )
     result.update({
         "address": row["address"], "protocol": row["protocol"], "port": row["port"], "codec": row["codec"],
         "manufacturer": row["manufacturer"], "model": row["model"],
@@ -670,7 +747,7 @@ def admin_camera(row: sqlite3.Row, paths: dict[str, dict] | None = None, media_a
         "activeRevision": current["revision"] if current else None,
         "draftRevision": draft["revision"] if draft else None,
         "draftTestStatus": draft["test_status"] if draft else None,
-        "relayMode": "dynamic" if row["managed"] else "static-rollback",
+        "relayMode": "dynamic" if row["managed"] else ("external-on-demand" if external_source else "static-rollback"),
         "liveAccess": {
             "ready": live_ready,
             "state": "live" if live_ready else ("media-server-offline" if not media_api_ok else "offline"),
@@ -1122,7 +1199,8 @@ def healthz():
             row["low_path"]
             for row in conn.execute(
                 """SELECT low_path FROM cameras
-                   WHERE enabled=1 AND protocol!='snapshot' AND (managed=0 OR codec='h264')"""
+                   WHERE enabled=1 AND protocol!='snapshot' AND on_demand=0
+                     AND (managed=0 OR codec='h264')"""
             )
         }
     expected = len(expected_paths)
@@ -1835,6 +1913,18 @@ def save_capabilities(conn: sqlite3.Connection, camera_id: str, connection: sqli
 @app.post("/api/admin/cameras/{camera_id}/capabilities/refresh")
 def refresh_capabilities(camera_id: str, actor: sqlite3.Row = Depends(require_admin_elevated)):
     with connect() as conn:
+        camera = conn.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
+        if camera and camera["protocol"] == "external":
+            payload = json.loads(camera["external_capabilities_json"] or "{}")
+            if not payload:
+                raise HTTPException(404, "external-capabilities-unavailable")
+            audit(conn, actor["user_id"], "camera.capabilities.refreshed", "camera", camera_id)
+            return {
+                "cameraId": camera_id,
+                "revision": 1,
+                "checkedAt": camera["updated_at"],
+                **payload,
+            }
         connection = active_connection(conn, camera_id)
         if not connection:
             raise HTTPException(404, "connection-not-found")
@@ -1858,6 +1948,18 @@ def refresh_capabilities(camera_id: str, actor: sqlite3.Row = Depends(require_ad
 @app.get("/api/admin/cameras/{camera_id}/capabilities")
 def get_capabilities(camera_id: str, _: sqlite3.Row = Depends(require_admin)):
     with connect() as conn:
+        camera = conn.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
+        if camera and camera["protocol"] == "external":
+            payload = json.loads(camera["external_capabilities_json"] or "{}")
+            if not payload:
+                return {"cameraId": camera_id, "revision": 0, "checkedAt": None, "available": False}
+            return {
+                "cameraId": camera_id,
+                "revision": 1,
+                "checkedAt": camera["updated_at"],
+                "available": True,
+                **payload,
+            }
         row = conn.execute(
             """SELECT cp.* FROM camera_capabilities cp JOIN cameras c ON c.id=cp.camera_id
                WHERE cp.camera_id=? AND cp.connection_id=c.active_connection_id""",
@@ -1866,6 +1968,48 @@ def get_capabilities(camera_id: str, _: sqlite3.Row = Depends(require_admin)):
     if not row:
         return {"cameraId": camera_id, "revision": 0, "checkedAt": None, "available": False}
     return {"cameraId": camera_id, "revision": row["revision"], "checkedAt": row["checked_at"], "available": True, **json.loads(row["payload_json"])}
+
+
+def external_ptz_context(camera_id: str, profile_token: str) -> tuple[sqlite3.Row, dict] | None:
+    with connect() as conn:
+        camera = conn.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
+    if not camera or camera["protocol"] != "external":
+        return None
+    payload = json.loads(camera["external_capabilities_json"] or "{}")
+    if (
+        profile_token != "external"
+        or not camera["external_control_url"]
+        or not payload.get("ptz", {}).get("supported")
+    ):
+        raise HTTPException(409, "ptz-not-supported")
+    return camera, payload
+
+
+def external_control_request(camera: sqlite3.Row, action: str, direction: str | None = None) -> None:
+    parsed = urlparse(camera["external_control_url"])
+    if parsed.hostname is None or parsed.hostname.lower() not in EXTERNAL_CONTROL_HOSTS:
+        raise HTTPException(502, "external-control-endpoint-invalid")
+    body = {"direction": direction} if direction else {}
+    request = Request(
+        f"{camera['external_control_url']}/v1/cameras/{quote(camera['id'], safe='')}/ptz/{action}",
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {INTERNAL_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=8) as response:
+            result = json.load(response)
+    except HTTPError as exc:
+        if exc.code in {400, 404, 409, 422}:
+            raise HTTPException(409, "external-ptz-rejected") from exc
+        raise HTTPException(502, "external-ptz-failed") from exc
+    except (OSError, ValueError, URLError) as exc:
+        raise HTTPException(502, "external-ptz-unavailable") from exc
+    if not result.get("ok"):
+        raise HTTPException(502, "external-ptz-failed")
 
 
 def ptz_context(camera_id: str, profile_token: str) -> tuple[OnvifClient, dict]:
@@ -1903,6 +2047,25 @@ def enforce_ptz_rate(camera_id: str) -> None:
 @app.post("/api/admin/cameras/{camera_id}/ptz/move")
 def ptz_move(camera_id: str, body: PTZMove, _: sqlite3.Row = Depends(require_admin_elevated)):
     enforce_ptz_rate(camera_id)
+    external = external_ptz_context(camera_id, body.profileToken)
+    if external:
+        camera, payload = external
+        components = {"x": body.x, "y": body.y, "zoom": body.zoom}
+        active = [(axis, value) for axis, value in components.items() if abs(value) > 0.01]
+        axes = set(payload.get("ptz", {}).get("axes", []))
+        if len(active) != 1 or active[0][0] not in axes:
+            raise HTTPException(409, "ptz-axis-not-supported")
+        axis, value = active[0]
+        direction = {
+            ("x", -1): "left",
+            ("x", 1): "right",
+            ("y", -1): "down",
+            ("y", 1): "up",
+            ("zoom", -1): "out",
+            ("zoom", 1): "in",
+        }[(axis, -1 if value < 0 else 1)]
+        external_control_request(camera, "start", direction)
+        return {"ok": True}
     client, _ = ptz_context(camera_id, body.profileToken)
     try:
         client.ptz_move(body.profileToken, body.x, body.y, body.zoom)
@@ -1913,6 +2076,10 @@ def ptz_move(camera_id: str, body: PTZMove, _: sqlite3.Row = Depends(require_adm
 
 @app.post("/api/admin/cameras/{camera_id}/ptz/stop")
 def ptz_stop(camera_id: str, body: PTZStop, _: sqlite3.Row = Depends(require_admin_csrf)):
+    external = external_ptz_context(camera_id, body.profileToken)
+    if external:
+        external_control_request(external[0], "stop")
+        return {"ok": True}
     client, _ = ptz_context(camera_id, body.profileToken)
     try:
         client.ptz_stop(body.profileToken)
@@ -2013,10 +2180,10 @@ def preview(camera_id: str, _: sqlite3.Row = Depends(require_session)):
         row = conn.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
         connection = active_connection(conn, camera_id) if row else None
         snapshot_credentials = connection_credentials(conn, connection, "stream") if connection and row["protocol"] == "snapshot" else ("", "")
-    if not row or not row["address"]:
+    if not row:
         raise HTTPException(404, "preview-unavailable")
     if row["protocol"] == "snapshot":
-        if not connection:
+        if not row["address"] or not connection:
             raise HTTPException(404, "preview-unavailable")
         username, password = snapshot_credentials
         uri = (
@@ -2045,24 +2212,58 @@ def preview(camera_id: str, _: sqlite3.Row = Depends(require_session)):
             raise HTTPException(502, "preview-invalid")
         PREVIEW_CACHE[camera_id] = (time.time() + 2, data)
         return Response(data, media_type=content_type.split(";", 1)[0], headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
-    uri = f"rtsp://mediamtx:8554/{quote(row['low_path'], safe='')}"
-    command = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
-    if uri.startswith("rtsp://"):
-        command += ["-rtsp_transport", "tcp"]
-    command += ["-i", uri, "-frames:v", "1", "-an", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
-    if not PREVIEW_SEMAPHORE.acquire(blocking=False):
-        raise HTTPException(429, "preview-busy")
+    transient_lease_id = None
     try:
+        if row["on_demand"]:
+            transient_lease_id = f"preview-{secrets.token_urlsafe(12)}"
+            LEASES.setdefault(camera_id, {})[transient_lease_id] = time.time() + 90
+            deadline = time.monotonic() + 45
+            while True:
+                paths, api_ok = media_paths()
+                if api_ok and paths.get(row["low_path"], {}).get("ready"):
+                    break
+                if time.monotonic() >= deadline:
+                    raise HTTPException(504, "preview-source-timeout")
+                time.sleep(0.5)
+        uri = f"rtsp://mediamtx:8554/{quote(row['low_path'], safe='')}"
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp"]
+        command += ["-i", uri, "-frames:v", "1", "-an", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+        if not PREVIEW_SEMAPHORE.acquire(blocking=False):
+            raise HTTPException(429, "preview-busy")
         try:
-            result = subprocess.run(command, capture_output=True, timeout=12, check=False)
-        except subprocess.TimeoutExpired:
-            raise HTTPException(504, "preview-timeout")
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    timeout=30 if row["on_demand"] else 12,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                raise HTTPException(504, "preview-timeout")
+        finally:
+            PREVIEW_SEMAPHORE.release()
+        if result.returncode != 0 or not result.stdout.startswith(b"\xff\xd8"):
+            raise HTTPException(502, "preview-failed")
+        PREVIEW_CACHE[camera_id] = (time.time() + 2, result.stdout)
+        return Response(result.stdout, media_type="image/jpeg", headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
     finally:
-        PREVIEW_SEMAPHORE.release()
-    if result.returncode != 0 or not result.stdout.startswith(b"\xff\xd8"):
-        raise HTTPException(502, "preview-failed")
-    PREVIEW_CACHE[camera_id] = (time.time() + 2, result.stdout)
-    return Response(result.stdout, media_type="image/jpeg", headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
+        if transient_lease_id:
+            leases = LEASES.get(camera_id)
+            if leases:
+                leases.pop(transient_lease_id, None)
+                if not leases:
+                    LEASES.pop(camera_id, None)
+
+
+def active_camera_leases(camera_id: str) -> dict[str, float]:
+    leases = LEASES.get(camera_id, {})
+    now = time.time()
+    for key, expiry in list(leases.items()):
+        if expiry <= now:
+            leases.pop(key, None)
+    if not leases:
+        LEASES.pop(camera_id, None)
+    return leases
 
 
 @app.post("/api/cameras/{camera_id}/lease")
@@ -2071,13 +2272,21 @@ def acquire_lease(camera_id: str, _: sqlite3.Row = Depends(require_csrf)):
         if not conn.execute("SELECT 1 FROM cameras WHERE id=? AND enabled=1", (camera_id,)).fetchone():
             raise HTTPException(404, "camera-not-found")
     lease_id = secrets.token_urlsafe(18)
+    active_camera_leases(camera_id)
     leases = LEASES.setdefault(camera_id, {})
-    now = time.time()
-    for key, expiry in list(leases.items()):
-        if expiry <= now:
-            leases.pop(key, None)
-    leases[lease_id] = now + 90
+    leases[lease_id] = time.time() + 90
     return {"cameraId": camera_id, "leaseId": lease_id, "expiresIn": 90}
+
+
+@app.put("/api/cameras/{camera_id}/lease")
+def renew_lease(camera_id: str, leaseId: str | None = None, _: sqlite3.Row = Depends(require_csrf)):
+    if not leaseId:
+        raise HTTPException(400, "lease-id-required")
+    leases = active_camera_leases(camera_id)
+    if leaseId not in leases:
+        raise HTTPException(404, "lease-not-found")
+    leases[leaseId] = time.time() + 90
+    return {"cameraId": camera_id, "leaseId": leaseId, "expiresIn": 90}
 
 
 @app.delete("/api/cameras/{camera_id}/lease")
@@ -2098,6 +2307,115 @@ def require_internal(authorization: str = Header(default="")) -> None:
         raise HTTPException(401, "internal-auth-required")
 
 
+@app.put("/internal/v1/external-cameras/{camera_id}")
+def ensure_external_camera(
+    camera_id: str,
+    body: ExternalCameraInput,
+    _: None = Depends(require_internal),
+):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", camera_id):
+        raise HTTPException(422, "invalid-camera-id")
+    stamp = now_iso()
+    axes = list(dict.fromkeys(body.ptzAxes))
+    capabilities = {
+        "device": {
+            "manufacturer": body.manufacturer,
+            "model": body.model,
+            "firmwareVersion": None,
+            "serialNumber": None,
+            "hardwareId": "external-adapter",
+        },
+        "profiles": [{
+            "token": "external",
+            "name": "CZEview P2P",
+            "codec": body.codec,
+            "width": body.width,
+            "height": body.height,
+            "frameRate": None,
+            "bitrate": None,
+            "audioCodec": None,
+            "streamPath": body.path,
+        }],
+        "audio": {"supported": False, "codecs": []},
+        "ptz": {
+            "supported": bool(body.controlUrl and axes),
+            "axes": axes,
+            "presets": [],
+            "absoluteMove": False,
+            "relativeMove": False,
+            "continuousMove": bool(body.controlUrl and axes),
+        },
+        "snapshot": {"supported": True},
+        "imaging": False,
+        "events": False,
+        "analytics": False,
+        "deviceIo": False,
+    }
+    capabilities_json = json.dumps(capabilities, separators=(",", ":"))
+    with DB_LOCK, connect() as conn:
+        row = conn.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
+        if row and row["protocol"] != "external":
+            raise HTTPException(409, "camera-id-in-use")
+        if row:
+            conn.execute(
+                """UPDATE cameras SET source_label=?,low_path=?,high_path=?,detail_quality=?,
+                   protocol='external',codec=?,manufacturer=?,model=?,on_demand=1,
+                   external_control_url=?,external_capabilities_json=?,updated_at=?
+                   WHERE id=?""",
+                (
+                    body.sourceLabel, body.path, body.path, body.detailQuality,
+                    body.codec, body.manufacturer, body.model, body.controlUrl,
+                    capabilities_json, stamp, camera_id,
+                ),
+            )
+        else:
+            position = conn.execute("SELECT COALESCE(MAX(position),-1)+1 FROM cameras").fetchone()[0]
+            try:
+                conn.execute(
+                    """INSERT INTO cameras(
+                       id,name,position,enabled,source_label,low_path,high_path,detail_quality,
+                       managed,address,protocol,port,low_source_path,high_source_path,codec,
+                       manufacturer,model,on_demand,external_control_url,
+                       external_capabilities_json,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        camera_id, body.name, position, 1, body.sourceLabel, body.path, body.path,
+                        body.detailQuality, 0, None, "external", None, None, None, body.codec,
+                        body.manufacturer, body.model, 1, body.controlUrl,
+                        capabilities_json, stamp, stamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(409, "camera-path-in-use") from exc
+    return {
+        "cameraId": camera_id,
+        "path": body.path,
+        "registered": True,
+        "ptz": capabilities["ptz"]["supported"],
+        "active": bool(active_camera_leases(camera_id)),
+    }
+
+
+@app.get("/internal/v1/external-cameras/{camera_id}/lease")
+def external_camera_lease(camera_id: str, _: None = Depends(require_internal)):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT enabled,on_demand FROM cameras WHERE id=? AND protocol='external'",
+            (camera_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "external-camera-not-found")
+    leases = active_camera_leases(camera_id)
+    now = time.time()
+    return {
+        "cameraId": camera_id,
+        "enabled": bool(row["enabled"]),
+        "active": bool(row["enabled"] and leases),
+        "leaseCount": len(leases),
+        "expiresIn": max(0, int(max(leases.values()) - now)) if leases else 0,
+    }
+
+
 @app.get("/internal/v1/relay-config")
 def relay_config(_: None = Depends(require_internal)):
     now = time.time()
@@ -2115,10 +2433,7 @@ def relay_config(_: None = Depends(require_internal)):
             continue
         capability_payload = json.loads(capability_row["payload_json"]) if capability_row else {}
         audio = bool(capability_payload.get("audio", {}).get("supported"))
-        camera_leases = LEASES.get(row["id"], {})
-        for key, expiry in list(camera_leases.items()):
-            if expiry <= now:
-                camera_leases.pop(key, None)
+        camera_leases = active_camera_leases(row["id"])
         active = row["codec"] == "h264" or bool(camera_leases)
         items.append({"id": f"{row['id']}-low", "cameraId": row["id"], "connectionId": connection["id"], "connectionRevision": connection["revision"], "path": row["low_path"], "sourceUri": source_uri(row), "codec": row["codec"], "audio": audio, "active": active})
         if row["high_path"] != row["low_path"] and row["high_source_path"] != row["low_source_path"]:

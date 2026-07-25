@@ -18,7 +18,8 @@ authInternalUsers:
       - action: pprof
 api: true
 apiAddress: :9997
-rtsp: false
+rtsp: true
+rtspAddress: :8554
 rtmp: false
 srt: false
 moq: false

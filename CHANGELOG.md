@@ -2,6 +2,35 @@
 
 Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
+## [Unveröffentlicht]
+
+### Hinzugefügt
+
+- optionale CZEview-P2P-Brücke für die untersuchte Akku-/Solarkamera;
+- bedarfsgesteuertes Wake-on-View, erneuerbare Kamera-Leases und automatische
+  Registrierung eines neutralen externen MediaMTX-Pfads;
+- kurzlebiger Snapshot-Lease, der eine schlafende Akku-Kamera für genau eine
+  JPEG-Erfassung weckt und danach wieder freigibt;
+- H.264-Aufbereitung mit häufigen Schlüsselbildern für zuverlässigen
+  WebRTC-, HLS- und Snapshot-Einstieg;
+- rollen- und CSRF-geschützter horizontaler CZEview-Schwenk über einen
+  internen, begrenzten Steueradapter;
+- reproduzierbare CZEview-Evidenz- und Betriebsdokumentation.
+
+### Sicherheit
+
+- CZEview-Zugangsdaten werden aus der ignorierten `.env` in eine
+  ACL-geschützte Runtime-Secret-Datei übertragen;
+- Konto, Passwort, Plattform-Token, Geräte-ID und Seriennummer werden weder an
+  Viewer-APIs noch an normale Logs ausgegeben;
+- die Brücke besitzt keinen Docker-Socket und nutzt nur das interne
+  Service-Token sowie interne MediaMTX-Endpunkte;
+- der CZEview-Steueradapter wird nicht auf dem Host veröffentlicht und
+  akzeptiert ausschließlich authentifizierte Links-/Rechts-/Stoppbefehle;
+- der private HTTP-Modus leitet sein zulässiges Verwaltungsnetz aus dem aktiven
+  lokalen Interface ab; der für CZEview erforderliche RTSP-Publisher bleibt
+  ausschließlich im internen Docker-Netz erreichbar.
+
 ## [1.0.0] – 2026-07-24
 
 ### Hinzugefügt

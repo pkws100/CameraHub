@@ -112,6 +112,7 @@ services:
       WEB_ROOT: /web
       CAMERA_CONFIG: /config/cameras.json
       MEDIAMTX_API: http://mediamtx:9997
+      EXTERNAL_CONTROL_HOSTS: czeview-bridge
       DATABASE_PATH: /data/zmodo.db
       SECRET_KEY_PATH: /run/secrets/zmodo_secret_key
       INTERNAL_TOKEN_PATH: /run/secrets/zmodo_internal_token
@@ -162,6 +163,42 @@ services:
       retries: 3
       start_period: 30s
 
+  czeview-bridge:
+    build: ./czeview
+    profiles: ["czeview"]
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+    logging: *bounded-logging
+    environment:
+      BACKEND_INTERNAL: http://web:8090
+      MEDIAMTX_API: http://mediamtx:9997
+      MEDIAMTX_PUBLISH_URL: rtsp://mediamtx:8554/czeview-low
+      INTERNAL_TOKEN_PATH: /run/secrets/zmodo_internal_token
+      CZEVIEW_CREDENTIALS_PATH: /run/secrets/czeview_credentials
+      CZEVIEW_SESSION_PATH: /data/session.json
+      CZEVIEW_CAMERA_ID: czeview
+      CZEVIEW_STREAM_PATH: czeview-low
+      CZEVIEW_CONTROL_PORT: "8787"
+    secrets:
+      - zmodo_internal_token
+      - czeview_credentials
+    volumes:
+      - czeview-session:/data
+    expose:
+      - "8787"
+    tmpfs:
+      - /run/bridge-health:mode=0755,uid=100,gid=101
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /run/bridge-health/state"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
 networks:
   default:
     ipam:
@@ -170,9 +207,12 @@ networks:
 
 volumes:
   zmodo-data:
+  czeview-session:
 
 secrets:
   zmodo_secret_key:
     file: ./runtime/secrets/zmodo_secret_key
   zmodo_internal_token:
     file: ./runtime/secrets/zmodo_internal_token
+  czeview_credentials:
+    file: ./runtime/secrets/czeview_credentials.json

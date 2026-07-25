@@ -1,0 +1,105 @@
+diff --git a/cloudedge/client.py b/cloudedge/client.py
+--- a/cloudedge/client.py
++++ b/cloudedge/client.py
+@@ -151,6 +151,7 @@ class CloudEdgeClient:
+         session_cache_file: str = ".cloudedge_session_cache",
+         enable_network_ping: bool = True,
+         ping_timeout: float = 2.0,
++        source_app: str = "8",
+     ):
+         """
+         Initialize CloudEdge API client.
+@@ -186,6 +187,13 @@ class CloudEdgeClient:
+                 f"Invalid phone code (use format like '+1'): {phone_code}",
+                 details={"field": "phone_code", "value": phone_code}
+             )
++
++        source_app = str(source_app)
++        if not source_app.isdigit():
++            raise ValidationError(
++                "Source app must contain digits only",
++                details={"field": "source_app"}
++            )
+         
+         normalized_country_code = country_code.upper()
+         if normalized_country_code == "UK":
+@@ -195,6 +203,7 @@ class CloudEdgeClient:
+         self.password = password
+         self.country_code = normalized_country_code
+         self.phone_code = phone_code if phone_code.startswith('+') else f'+{phone_code}'
++        self.source_app = source_app
+         
+         # Endpoints are discovered dynamically via _discover_endpoints()
+         self.BASE_URL: Optional[str] = None
+@@ -647,7 +656,7 @@ class CloudEdgeClient:
+         phone_code_bare = self.phone_code.lstrip("+")
+         params = {
+             "phoneType": "a",
+-            "sourceApp": "8",
++            "sourceApp": self.source_app,
+             "appVer": "5.5.1",
+             "appVerCode": "551",
+             "localTime": str(timestamp),
+@@ -656,7 +665,7 @@ class CloudEdgeClient:
+             "countryCode": self.country_code,
+             "userAccount": encrypted_account,
+             "phoneCode": phone_code_bare,
+-            "partnerId": "8",
++            "partnerId": self.source_app,
+             "nonce": query_nonce,
+         }
+ 
+@@ -767,7 +776,7 @@ class CloudEdgeClient:
+         
+         # Create signature
+         ca_sign_data = (
+-            f"phoneType=a&sourceApp=8&appVer=5.5.1&iotType=4&equipmentNo=&"
++            f"phoneType=a&sourceApp={self.source_app}&appVer=5.5.1&iotType=4&equipmentNo=&"
+             f"appVerCode=551&localTime={timestamp}&password={encrypted_password}&"
+             f"t={timestamp}&lngType=en&countryCode={self.country_code}&"
+             f"userAccount={encrypted_username}&phoneCode={self.phone_code}"
+@@ -778,7 +787,7 @@ class CloudEdgeClient:
+         
+         login_data = {
+             "phoneType": "a",
+-            "sourceApp": "8",
++            "sourceApp": self.source_app,
+             "appVer": "5.5.1",
+             "iotType": "4",
+             "equipmentNo": "",
+@@ -907,7 +916,7 @@ class CloudEdgeClient:
+ 
+         params = {
+             'appVer': '5.5.1', 'appVerCode': '551', 'lngType': 'en',
+-            'phoneType': 'a', 'sdkVer': '1.0.0', 'sourceApp': '8',
++            'phoneType': 'a', 'sdkVer': '1.0.0', 'sourceApp': self.source_app,
+             'countryCode': self.country_code,
+             'phoneCode': self.phone_code,
+             'iotType': '4',
+@@ -1022,7 +1031,7 @@ class CloudEdgeClient:
+             'lngType': 'en',
+             'phoneType': 'a',
+             'sdkVer': '1.0.0',
+-            'sourceApp': '8',
++            'sourceApp': self.source_app,
+             'userID': self.session_data['userID'],
+             'userToken': self.session_data['userToken']
+         }
+@@ -1054,7 +1063,7 @@ class CloudEdgeClient:
+         params_str = (
+             f"appVer=5.5.1&appVerCode=551&lngType=en&phoneType=a&"
+             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
+-            f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
++            f"signatureVersion=1.0&sourceApp={self.source_app}&timestamp={timestamp}&"
+             f"userID={self.session_data['userID']}"
+         )
+         
+@@ -1143,7 +1152,7 @@ class CloudEdgeClient:
+         params_str = (
+             f"appVer=5.5.1&appVerCode=551&homeID={home_id}&lngType=en&phoneType=a&"
+             f"signatureMethod=HMAC-SHA1&signatureNonce={nonce}&"
+-            f"signatureVersion=1.0&sourceApp=8&timestamp={timestamp}&"
++            f"signatureVersion=1.0&sourceApp={self.source_app}&timestamp={timestamp}&"
+             f"userID={self.session_data['userID']}"
+         )
+         
