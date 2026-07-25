@@ -147,6 +147,19 @@ Rollbackpfad; ihre Quelladressen gehören nur in die ignorierte `.env`.
 Camera Hub verändert weder Kamera-, Receiver-, Router- noch
 Aufzeichnungseinstellungen.
 
+## Akku-/Cloudkameras
+
+Akkukameras werden nicht automatisch wie dauerhaft erreichbare RTSP-Kameras
+behandelt. Eine Integration benötigt einen belegten lokalen Standardstream oder
+eine offiziell freigegebene Provider-Schnittstelle sowie ein lease-basiertes
+Wake-/Stop-Modell.
+
+Die CZEview ZY-Q5 wurde im Schlaf- und Wachzustand untersucht. Es wurde kein
+reproduzierbarer lokaler Standardstream und noch kein für dieses Consumergerät
+freigegebener Providerzugang nachgewiesen. Deshalb enthält Camera Hub keine
+instabile Scheinintegration. Befund und sicherer nächster Schritt stehen in
+[CZE-PROVIDER-INVESTIGATION.md](CZE-PROVIDER-INVESTIGATION.md).
+
 ## Lizenz
 
 Camera Hub wird unter der [GNU Affero General Public License v3.0](LICENSE)

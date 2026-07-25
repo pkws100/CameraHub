@@ -2,6 +2,18 @@
 
 Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
+## [Unveröffentlicht]
+
+### Dokumentation
+
+- CZEview-ZY-Q5-Akku-/Cloudkamera im Schlaf- und Wachzustand schonend
+  untersucht;
+- fehlenden lokalen Standardstream und die Grenze zu undokumentierten
+  App-/Cloudsitzungen nachvollziehbar dokumentiert;
+- Anforderungen für einen späteren offiziellen, lease-basierten
+  Provider-Adapter festgelegt;
+- Ignore-Regeln um Paket-, Browser- und lokale Providerartefakte ergänzt.
+
 ## [1.0.0] – 2026-07-24
 
 ### Hinzugefügt
