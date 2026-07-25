@@ -15,7 +15,23 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
   WebRTC-, HLS- und Snapshot-Einstieg;
 - rollen- und CSRF-geschützter horizontaler CZEview-Schwenk über einen
   internen, begrenzten Steueradapter;
-- reproduzierbare CZEview-Evidenz- und Betriebsdokumentation.
+- reproduzierbare CZEview-Evidenz- und Betriebsdokumentation;
+- Erkennung des standardisierten Tapo-ONVIF-Dienstes auf Port 2020;
+- Tapo-kompatible, weiterhin bearbeitbare Vorschläge für Haupt- und Substream;
+- Übernahme des ONVIF-Endpunkts bereits bei der verschlüsselten
+  Kamera-Ersteinrichtung;
+- automatische lesende ONVIF-Funktionserkennung nach erfolgreichem
+  RTSP-Frame-Nachweis;
+- Erkennung von H.264-B-Frames in Haupt- und Substream sowie ein gezielter
+  H.264-Baseline-Kompatibilitäts-Relay ausschließlich für betroffene Quellen;
+  bestehende WebRTC-kompatible Quellen bleiben im Stream-Copy-Pfad;
+- interner, nicht am Host veröffentlichter MediaMTX-RTSP-Eingang für Kameras,
+  deren kurze RTSP-Sitzung ein standardisiertes Keepalive benötigt.
+
+### Geändert
+
+- RTSP-Frame-Tests erlauben langsamer startenden Kameras ein kontrolliertes
+  Zeitfenster, ohne aggressive Wiederholungen.
 
 ### Sicherheit
 

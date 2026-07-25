@@ -1,0 +1,77 @@
+.device-row {
+  grid-template-columns: 160px minmax(0, 1fr) auto;
+}
+
+.device-preview {
+  width: 160px;
+  aspect-ratio: 16 / 10;
+  display: grid;
+  place-items: center;
+  object-fit: cover;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #030806;
+  color: var(--muted);
+  font-size: .72rem;
+  text-align: center;
+}
+
+.device-preview.is-empty {
+  padding: .7rem;
+}
+
+.device-description {
+  min-width: 0;
+}
+
+.discovery-actions {
+  display: flex;
+  flex-direction: column;
+  gap: .45rem;
+  align-items: stretch;
+}
+
+.discovery-target {
+  padding: .7rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #081411;
+  color: var(--mint2);
+  font-size: .78rem;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .device-row {
+    grid-template-columns: 130px minmax(0, 1fr);
+  }
+
+  .device-preview {
+    width: 130px;
+  }
+
+  .discovery-actions {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 620px) {
+  .device-row {
+    grid-template-columns: 1fr;
+  }
+
+  .device-preview {
+    width: 100%;
+    max-height: 230px;
+  }
+
+  .discovery-actions {
+    justify-content: stretch;
+  }
+
+  .discovery-actions button {
+    flex: 1;
+  }
+}

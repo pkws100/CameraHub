@@ -18,6 +18,9 @@ authInternalUsers:
       - action: pprof
 api: true
 apiAddress: :9997
+# RTSP remains reachable only inside the Compose network; no host port is
+# published. The relay manager uses it for codec compatibility relays.
+
 rtsp: true
 rtspAddress: :8554
 rtmp: false

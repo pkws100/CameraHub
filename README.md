@@ -112,6 +112,9 @@ Dieser Modus besitzt transportbedingt keinen Secure Context und sollte nicht
   ONVIF-/Stream-Zugang, verschlüsselten Entwürfen, Prüfung, Aktivierung und
   Rückkehr zur letzten funktionierenden Revision;
 - ONVIF-Profil-, Codec- und Auflösungsanzeige sowie flüchtige No-Store-Vorschau, sofern das Gerät diese Daten ohne Konfigurationsänderung bereitstellt;
+- TP-Link-Tapo-Erkennung über den dokumentierten ONVIF-Port 2020 mit
+  bearbeitbaren `stream1`-/`stream2`-Vorschlägen und verschlüsseltem
+  Kamerakonto; Details stehen in [TAPO-C220.md](TAPO-C220.md);
 - lesende ONVIF-Funktionsmatrix für Audio, PTZ, vorhandene Presets, Events,
   Analytics und Geräteausgänge; nur vorhandene PTZ-Presets können aufgerufen
   werden, Gegensprechen und physische Ausgänge bleiben deaktiviert;
