@@ -11,6 +11,7 @@
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="apple-touch-icon" href="./icons/icon-192.png">
   <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./discovery.css">
   <link rel="stylesheet" href="./media-modes.css">
   <link rel="stylesheet" href="./users.css">
   <link rel="stylesheet" href="./camera-connections.css">
@@ -134,6 +135,17 @@
   </dialog>
 
   <dialog id="reauth-dialog" class="modal" aria-labelledby="reauth-title"><form id="reauth-form"><p class="kicker">Sicherheitsbestätigung</p><h2 id="reauth-title">Änderung freigeben</h2><p>Bitte bestätigen Sie Ihr Kontopasswort.</p><label>Passwort<input id="reauth-password" type="password" autocomplete="current-password" minlength="8" required></label><p class="form-error" id="reauth-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Bestätigen</button></div></form></dialog>
+
+  <dialog id="discovery-auth-dialog" class="modal" aria-labelledby="discovery-auth-title"><form id="discovery-auth-form">
+    <p class="kicker">Einmalige Streamprüfung</p><h2 id="discovery-auth-title">Streams und Vorschau erkennen</h2>
+    <p>Camera Hub liest die ONVIF-Profile und erzeugt serverseitig ein einzelnes Vorschaubild aus echten Videoframes. Die Angaben werden erst beim Hinzufügen gespeichert.</p>
+    <div class="discovery-target" id="discovery-auth-target"></div>
+    <label>Benutzername<input name="username" autocomplete="off" maxlength="128"></label>
+    <label>Passwort<input name="password" type="password" autocomplete="new-password" maxlength="256"></label>
+    <div class="test-result" id="discovery-auth-state" role="status" aria-live="polite">Noch nicht geprüft.</div>
+    <p class="form-error" id="discovery-auth-error" role="alert"></p>
+    <div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Streams & Vorschau prüfen</button></div>
+  </form></dialog>
 
   <dialog id="camera-dialog" class="modal camera-modal" aria-labelledby="camera-title"><form id="camera-form"><p class="kicker">Neue Quelle</p><h2 id="camera-title">Kamera hinzufügen</h2><div class="form-grid">
     <label class="span-two">Anzeigename<input name="name" required maxlength="80"></label>

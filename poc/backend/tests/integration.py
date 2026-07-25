@@ -373,11 +373,119 @@ try:
     wsse = camera_app.OnvifClient("http://127.0.0.1/onvif/device_service", "owner", "transient-secret").wsse_header()
     assert "PasswordDigest" in wsse and "transient-secret" not in wsse and "<wsse:Nonce" in wsse
 
+    discovery_secret = "Discovery-Only-Secret-42!"
+    discovery_user = "discovery-user"
+    discovery_scan_id = "scan-auth-preview"
+    discovery_device_id = "device-auth-preview"
+    camera_app.SCANS[discovery_scan_id] = {
+        "id": discovery_scan_id,
+        "state": "complete",
+        "createdAt": camera_app.now_iso(),
+        "createdEpoch": time.time(),
+        "results": [{
+            "id": discovery_device_id,
+            "address": "192.168.50.199",
+            "manufacturer": "Unbekannt",
+            "model": "Unbekannt",
+            "onvif": True,
+            "onvifPort": 2020,
+            "rtsp": True,
+            "openPorts": [554, 2020],
+            "profiles": [],
+            "previewAvailable": False,
+            "configuredCameraId": None,
+            "configuredName": None,
+            "_snapshotUri": None,
+        }],
+    }
+
+    class DiscoveryOnvif:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def capabilities(self):
+            return {
+                "device": {"manufacturer": "StandardsCam", "model": "ONVIF Preview"},
+                "profiles": [
+                    {"token": "low", "name": "Sub", "codec": "h264", "width": 640, "height": 360, "frameRate": 15, "bitrate": 512, "audioCodec": "pcma"},
+                    {"token": "high", "name": "Main", "codec": "h264", "width": 1920, "height": 1080, "frameRate": 25, "bitrate": 2048, "audioCodec": "pcma"},
+                ],
+            }
+        def stream_uri(self, token):
+            return f"rtsp://192.168.50.199:554/{token}"
+
+    original_onvif_client = camera_app.OnvifClient
+    original_transient_preview = camera_app.transient_rtsp_preview
+    captured_source = []
+    camera_app.OnvifClient = DiscoveryOnvif
+    camera_app.transient_rtsp_preview = lambda uri: captured_source.append(uri) or b"\xff\xd8discovery-frame\xff\xd9"
+    discovery_result = request(
+        f"/api/admin/discovery/scans/{discovery_scan_id}/devices/{discovery_device_id}/probe",
+        "POST",
+        {"username": discovery_user, "password": discovery_secret},
+        admin_session["csrfToken"],
+        opener=admin_client,
+    )
+    camera_app.OnvifClient = original_onvif_client
+    camera_app.transient_rtsp_preview = original_transient_preview
+    assert discovery_result["previewAvailable"] and discovery_result["previewVerified"]
+    assert discovery_result["profiles"][0]["streamPath"] == "/low"
+    assert "streamUri" not in json.dumps(discovery_result)
+    assert discovery_secret not in json.dumps(discovery_result)
+    assert discovery_secret not in json.dumps(camera_app.SCANS[discovery_scan_id])
+    assert discovery_user not in json.dumps(camera_app.SCANS[discovery_scan_id])
+    parsed_discovery_source = camera_app.urlparse(captured_source[0])
+    assert unquote(parsed_discovery_source.username or "") == discovery_user
+    assert unquote(parsed_discovery_source.password or "") == discovery_secret
+    preview_request = urllib.request.Request(
+        base + f"/api/admin/discovery/scans/{discovery_scan_id}/devices/{discovery_device_id}/preview",
+        headers={"Host": "127.0.0.1"},
+    )
+    with admin_client.open(preview_request, timeout=10) as response:
+        assert response.headers["Cache-Control"] == "no-store, private"
+        assert response.headers["Content-Type"].startswith("image/jpeg")
+        assert response.read().startswith(b"\xff\xd8")
+
+    configured_scan_id = "scan-configured-preview"
+    configured_device_id = "device-configured-preview"
+    camera_app.SCANS[configured_scan_id] = {
+        "id": configured_scan_id,
+        "state": "complete",
+        "createdAt": camera_app.now_iso(),
+        "createdEpoch": time.time(),
+        "results": [{
+            "id": configured_device_id,
+            "address": "192.168.50.8",
+            "manufacturer": "Configured",
+            "model": "Camera",
+            "onvif": True,
+            "onvifPort": 80,
+            "rtsp": True,
+            "openPorts": [554],
+            "profiles": [],
+            "previewAvailable": True,
+            "configuredCameraId": "garten",
+            "configuredName": "Garten",
+            "_configuredPreviewPath": "garten-low",
+            "_snapshotUri": None,
+        }],
+    }
+    original_capture_frame = camera_app.capture_rtsp_frame
+    configured_paths = []
+    camera_app.capture_rtsp_frame = lambda path: configured_paths.append(path) or b"\xff\xd8configured-frame\xff\xd9"
+    configured_preview_request = urllib.request.Request(
+        base + f"/api/admin/discovery/scans/{configured_scan_id}/devices/{configured_device_id}/preview",
+        headers={"Host": "127.0.0.1"},
+    )
+    with admin_client.open(configured_preview_request, timeout=10) as response:
+        assert response.read().startswith(b"\xff\xd8")
+    camera_app.capture_rtsp_frame = original_capture_frame
+    assert configured_paths == ["garten-low"]
+
     internal = urllib.request.Request(base + "/internal/v1/detection/cameras", headers={"Authorization": f"Bearer {camera_app.INTERNAL_TOKEN}"})
     with urllib.request.urlopen(internal, timeout=5) as response:
         detection = json.load(response)
     assert detection["enabled"] is False and detection["cameras"]
-    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock internal-adapter")
+    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter")
 finally:
     server.should_exit = True
     thread.join(timeout=5)

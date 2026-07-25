@@ -55,6 +55,7 @@ CONNECTION_TESTS: dict[str, tuple[float, str, dict]] = {}
 ACTIVATION_LOCK = threading.Lock()
 PREVIEW_SEMAPHORE = threading.BoundedSemaphore(2)
 PREVIEW_CACHE: dict[str, tuple[float, bytes]] = {}
+DISCOVERY_PREVIEW_CACHE: dict[tuple[str, str], tuple[float, bytes]] = {}
 REAUTH_ATTEMPTS: dict[str, list[float]] = {}
 HTTP_DIAGNOSTIC_ONLY = os.environ.get("HTTP_DIAGNOSTIC_ONLY") == "1"
 ALLOW_INSECURE_LOOPBACK_MANAGEMENT = (
@@ -407,6 +408,11 @@ class CameraCreate(BaseModel):
         if not value.startswith("/") or any(ch in value for ch in "\r\n@?#"):
             raise ValueError("invalid ONVIF path")
         return value
+
+
+class DiscoveryProbeRequest(BaseModel):
+    username: str = Field(default="", max_length=128)
+    password: str = Field(default="", max_length=256)
 
 
 class CameraPatch(BaseModel):
@@ -888,6 +894,68 @@ def media_paths() -> tuple[dict[str, dict], bool]:
         return {}, False
 
 
+def mediamtx_config_request(path: str, method: str = "GET", payload: dict | None = None) -> dict:
+    body = json.dumps(payload).encode() if payload is not None else None
+    request = Request(
+        f"{MEDIAMTX_API}{path}",
+        data=body,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    with urlopen(request, timeout=5) as response:
+        return json.load(response) if response.length not in (None, 0) else {}
+
+
+def capture_rtsp_frame(path: str, timeout: int = 12) -> bytes:
+    uri = f"rtsp://mediamtx:8554/{quote(path, safe='')}"
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
+        "-i", uri, "-frames:v", "1", "-an", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+    ]
+    if not PREVIEW_SEMAPHORE.acquire(timeout=15):
+        raise HTTPException(429, "preview-busy")
+    try:
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(504, "preview-timeout") from exc
+    finally:
+        PREVIEW_SEMAPHORE.release()
+    if result.returncode != 0 or not result.stdout.startswith(b"\xff\xd8"):
+        raise HTTPException(502, "preview-frame-unavailable")
+    return result.stdout
+
+
+def transient_rtsp_preview(source_uri: str) -> bytes:
+    """Resolve one frame without exposing or persisting the authenticated source URI."""
+    path = "discovery-preview-" + secrets.token_urlsafe(12).replace("_", "").replace("-", "")
+    encoded = quote(path, safe="")
+    try:
+        mediamtx_config_request(
+            f"/v3/config/paths/add/{encoded}",
+            "POST",
+            {"source": source_uri, "sourceOnDemand": False, "rtspTransport": "tcp", "record": False},
+        )
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            try:
+                if mediamtx_config_request(f"/v3/paths/get/{encoded}").get("ready"):
+                    return capture_rtsp_frame(path)
+            except (HTTPError, OSError, ValueError):
+                pass
+            time.sleep(0.4)
+        raise HTTPException(504, "preview-stream-timeout")
+    except HTTPException:
+        raise
+    except (HTTPError, OSError, ValueError) as exc:
+        raise HTTPException(502, "preview-stream-failed") from exc
+    finally:
+        try:
+            mediamtx_config_request(f"/v3/config/paths/delete/{encoded}", "DELETE")
+        except (HTTPError, OSError, ValueError):
+            pass
+
+
 def camera_status(row: sqlite3.Row, paths: dict[str, dict], api_ok: bool) -> dict:
     path = paths.get(row["low_path"], {})
     live = bool(path.get("ready"))
@@ -1194,9 +1262,9 @@ def one_status(camera_id: str, _: sqlite3.Row = Depends(require_session)):
     return camera_status(row, paths, ok)
 
 
-def probe_port(ip: str, port: int) -> bool:
+def probe_port(ip: str, port: int, timeout: float = 0.35) -> bool:
     try:
-        with socket.create_connection((ip, port), timeout=0.35):
+        with socket.create_connection((ip, port), timeout=timeout):
             return True
     except OSError:
         return False
@@ -1371,22 +1439,87 @@ def scan_network(scan_id: str) -> None:
         try:
             SCANS[scan_id].update(state="running", startedAt=now_iso())
             discovered = ws_discovery()
-            hosts = sorted((str(ip) for ip in ALLOWED_NETWORK.hosts()), key=lambda ip: (ip not in discovered, ipaddress.ip_address(ip)))
-            results = []
             with connect() as conn:
-                configured = {
-                    row["address"]: {"cameraId": row["camera_id"], "name": row["name"]}
-                    for row in conn.execute(
-                        """SELECT cc.address,cc.camera_id,c.name FROM camera_connections cc
-                           JOIN cameras c ON c.id=cc.camera_id WHERE cc.state='active'"""
-                    )
+                configured = {}
+                for row in conn.execute(
+                    """SELECT cc.address,cc.camera_id,cc.stream_protocol,cc.stream_port,cc.onvif_port,
+                              c.name,c.low_path,c.manufacturer,c.model,
+                              cp.payload_json
+                       FROM camera_connections cc
+                       JOIN cameras c ON c.id=cc.camera_id
+                       LEFT JOIN camera_capabilities cp
+                         ON cp.camera_id=c.id AND cp.connection_id=cc.id
+                       WHERE cc.state='active'"""
+                ):
+                    try:
+                        saved_capabilities = json.loads(row["payload_json"] or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        saved_capabilities = {}
+                    configured[row["address"]] = {
+                        "cameraId": row["camera_id"],
+                        "name": row["name"],
+                        "lowPath": row["low_path"],
+                        "streamProtocol": row["stream_protocol"],
+                        "streamPort": row["stream_port"],
+                        "onvifPort": row["onvif_port"],
+                        "manufacturer": row["manufacturer"] or "",
+                        "model": row["model"] or "",
+                        "profiles": saved_capabilities.get("profiles", []),
+                    }
+            results = [
+                {
+                    "id": str(uuid.uuid4()),
+                    "address": address,
+                    "manufacturer": known["manufacturer"] or "Unbekannt",
+                    "model": known["model"] or "Unbekannt",
+                    "onvif": bool(known["onvifPort"]),
+                    "onvifPort": known["onvifPort"],
+                    "rtsp": known["streamProtocol"] == "rtsp",
+                    "wsDiscovery": address in discovered,
+                    "openPorts": sorted(set(filter(None, (known["streamPort"], known["onvifPort"])))),
+                    "profiles": known["profiles"],
+                    "previewAvailable": True,
+                    "configuredCameraId": known["cameraId"],
+                    "configuredName": known["name"],
+                    "_snapshotUri": None,
+                    "_configuredPreviewPath": known["lowPath"],
                 }
+                for address, known in configured.items()
+                if ipaddress.ip_address(address) in ALLOWED_NETWORK
+            ]
+            results.sort(key=lambda candidate: ipaddress.ip_address(candidate["address"]))
+            SCANS[scan_id].update(results=list(results))
+            # Known cameras and WS-Discovery responders are checked first. This
+            # avoids starving devices that limit parallel management sockets.
+            priority_hosts = discovered | set(configured)
+            hosts = sorted(
+                (str(ip) for ip in ALLOWED_NETWORK.hosts()),
+                key=lambda ip: (ip not in priority_hosts, ipaddress.ip_address(ip)),
+            )
             from concurrent.futures import ThreadPoolExecutor, as_completed
             def inspect_host(ip: str):
+                known = configured.get(ip)
+                if known:
+                    return None
                 open_ports = []
                 for port in SCAN_PORTS:
-                    if probe_port(ip, port) or probe_port(ip, port):
+                    # Some authenticated consumer cameras throttle or delay new
+                    # RTSP/ONVIF sockets while a live session is active. Give
+                    # only these two standard ports one bounded slow retry.
+                    if (
+                        probe_port(ip, port)
+                        or probe_port(ip, port)
+                        or (port in (554, 2020) and probe_port(ip, port, 1.5))
+                    ):
                         open_ports.append(port)
+                if known:
+                    stream_port = known.get("streamPort")
+                    if stream_port and stream_port not in open_ports and rtsp_options(ip, stream_port):
+                        open_ports.append(stream_port)
+                    onvif_port = known.get("onvifPort")
+                    if onvif_port and onvif_port not in open_ports and probe_port(ip, onvif_port, 2.5):
+                        open_ports.append(onvif_port)
+                    open_ports.sort()
                 if not open_ports:
                     return None
                 inventory = {"supported": False, "manufacturer": "", "model": "", "profiles": [], "snapshotUri": None}
@@ -1400,8 +1533,24 @@ def scan_network(scan_id: str) -> None:
                 rtsp = any(rtsp_options(ip, port) for port in rtsp_ports)
                 if not inventory["supported"] and not rtsp:
                     return None
-                known = configured.get(ip)
-                return {"id": str(uuid.uuid4()), "address": ip, "manufacturer": inventory["manufacturer"] or "Unbekannt", "model": inventory["model"] or "Unbekannt", "onvif": inventory["supported"], "onvifPort": onvif_port, "rtsp": rtsp, "wsDiscovery": ip in discovered, "openPorts": open_ports, "profiles": inventory["profiles"], "previewAvailable": bool(inventory["snapshotUri"]), "configuredCameraId": known["cameraId"] if known else None, "configuredName": known["name"] if known else None, "_snapshotUri": inventory["snapshotUri"]}
+                saved_profiles = known["profiles"] if known and known["profiles"] else []
+                return {
+                    "id": str(uuid.uuid4()),
+                    "address": ip,
+                    "manufacturer": inventory["manufacturer"] or (known["manufacturer"] if known else "") or "Unbekannt",
+                    "model": inventory["model"] or (known["model"] if known else "") or "Unbekannt",
+                    "onvif": inventory["supported"],
+                    "onvifPort": onvif_port,
+                    "rtsp": rtsp,
+                    "wsDiscovery": ip in discovered,
+                    "openPorts": open_ports,
+                    "profiles": inventory["profiles"] or saved_profiles,
+                    "previewAvailable": bool(inventory["snapshotUri"] or known),
+                    "configuredCameraId": known["cameraId"] if known else None,
+                    "configuredName": known["name"] if known else None,
+                    "_snapshotUri": inventory["snapshotUri"],
+                    "_configuredPreviewPath": known["lowPath"] if known else None,
+                }
             with ThreadPoolExecutor(max_workers=24) as pool:
                 futures = [pool.submit(inspect_host, ip) for ip in hosts]
                 for completed, future in enumerate(as_completed(futures), start=1):
@@ -1427,6 +1576,8 @@ def start_scan(_: sqlite3.Row = Depends(require_admin_elevated)):
     for key in list(SCANS):
         if SCANS[key]["createdEpoch"] < cutoff:
             del SCANS[key]
+            for preview_key in [item for item in DISCOVERY_PREVIEW_CACHE if item[0] == key]:
+                DISCOVERY_PREVIEW_CACHE.pop(preview_key, None)
     if any(item["state"] in {"queued", "running"} for item in SCANS.values()):
         raise HTTPException(409, "scan-already-running")
     if SCANS and time.time() - max(item["createdEpoch"] for item in SCANS.values()) < 60:
@@ -1447,11 +1598,131 @@ def get_scan(scan_id: str, _: sqlite3.Row = Depends(require_admin)):
     return result
 
 
+def discovery_item(scan_id: str, device_id: str) -> tuple[dict, dict]:
+    scan = SCANS.get(scan_id)
+    if not scan:
+        raise HTTPException(404, "scan-not-found")
+    item = next((candidate for candidate in scan.get("results", []) if candidate["id"] == device_id), None)
+    if not item:
+        raise HTTPException(404, "device-not-found")
+    try:
+        if ipaddress.ip_address(item["address"]) not in ALLOWED_NETWORK:
+            raise HTTPException(400, "device-outside-discovery-network")
+    except ValueError as exc:
+        raise HTTPException(400, "device-address-invalid") from exc
+    return scan, item
+
+
+def public_discovery_item(item: dict) -> dict:
+    return {key: value for key, value in item.items() if not key.startswith("_")}
+
+
+@app.post("/api/admin/discovery/scans/{scan_id}/devices/{device_id}/probe")
+def probe_discovery_streams(
+    scan_id: str,
+    device_id: str,
+    body: DiscoveryProbeRequest,
+    _: sqlite3.Row = Depends(require_admin_elevated),
+):
+    """Authenticate transiently, enumerate ONVIF profiles and prove one real video frame."""
+    _, item = discovery_item(scan_id, device_id)
+    if item.get("configuredCameraId"):
+        raise HTTPException(409, "device-already-configured")
+    address = item["address"]
+    onvif_port = item.get("onvifPort")
+    if not onvif_port:
+        onvif_port = next(
+            (port for port in item.get("openPorts", []) if port in (2020, 80, 443, 8000, 8080, 8899, 10080)),
+            None,
+        )
+    if not onvif_port:
+        raise HTTPException(422, "onvif-service-unavailable")
+    scheme = "https" if onvif_port == 443 else "http"
+    device_url = f"{scheme}://{address}:{onvif_port}/onvif/device_service"
+    try:
+        client = OnvifClient(device_url, body.username, body.password, timeout=5, allowed_url=safe_onvif_url)
+        capabilities = client.capabilities()
+    except OnvifError as exc:
+        allowed = {
+            "onvif-authentication-failed",
+            "onvif-timeout",
+            "onvif-unreachable",
+            "onvif-invalid-xml",
+            "onvif-http-error",
+        }
+        raise HTTPException(422, exc.code if exc.code in allowed else "onvif-probe-failed") from exc
+
+    profiles = []
+    stream_sources = []
+    for profile in capabilities.get("profiles", [])[:16]:
+        sanitized = {
+            key: profile.get(key)
+            for key in ("token", "name", "codec", "width", "height", "frameRate", "bitrate", "audioCodec")
+        }
+        try:
+            uri = client.stream_uri(profile.get("token", ""))
+            parsed = urlparse(uri)
+            stream_path = safe_stream_path(uri)
+            if parsed.hostname != address or not stream_path:
+                raise ValueError("unexpected stream endpoint")
+            stream_port = parsed.port or 554
+            sanitized["streamPath"] = stream_path
+            sanitized["streamPort"] = stream_port
+            auth = (
+                f"{quote(body.username, safe='')}:{quote(body.password, safe='')}@"
+                if body.username else ""
+            )
+            stream_sources.append(
+                (sanitized, f"rtsp://{auth}{address}:{stream_port}{stream_path}")
+            )
+        except (OnvifError, ValueError):
+            sanitized["streamPath"] = None
+            sanitized["streamPort"] = None
+        profiles.append(sanitized)
+    if not stream_sources:
+        raise HTTPException(422, "onvif-no-usable-stream-profile")
+
+    stream_sources.sort(
+        key=lambda entry: ((entry[0].get("width") or 0) * (entry[0].get("height") or 0), entry[0].get("name") or "")
+    )
+    preview_error = None
+    for _, source_uri in stream_sources:
+        try:
+            frame = transient_rtsp_preview(source_uri)
+            DISCOVERY_PREVIEW_CACHE[(scan_id, device_id)] = (time.time() + 5 * 60, frame)
+            break
+        except HTTPException as exc:
+            preview_error = exc.detail
+    else:
+        frame = None
+
+    device = capabilities.get("device", {})
+    item.update(
+        manufacturer=device.get("manufacturer") or item.get("manufacturer") or "Unbekannt",
+        model=device.get("model") or item.get("model") or "Unbekannt",
+        onvif=True,
+        onvifPort=onvif_port,
+        rtsp=True,
+        profiles=profiles,
+        previewAvailable=bool(frame),
+        previewVerified=bool(frame),
+        previewError=None if frame else (preview_error or "preview-frame-unavailable"),
+    )
+    return public_discovery_item(item)
+
+
 @app.get("/api/admin/discovery/scans/{scan_id}/devices/{device_id}/preview")
 def discovery_preview(scan_id: str, device_id: str, _: sqlite3.Row = Depends(require_admin)):
-    scan = SCANS.get(scan_id)
-    item = next((candidate for candidate in (scan or {}).get("results", []) if candidate["id"] == device_id), None)
-    uri = item.get("_snapshotUri") if item else None
+    _, item = discovery_item(scan_id, device_id)
+    cached = DISCOVERY_PREVIEW_CACHE.get((scan_id, device_id))
+    if cached and cached[0] > time.time():
+        return Response(cached[1], media_type="image/jpeg", headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
+    configured_path = item.get("_configuredPreviewPath")
+    if configured_path:
+        frame = capture_rtsp_frame(configured_path)
+        DISCOVERY_PREVIEW_CACHE[(scan_id, device_id)] = (time.time() + 30, frame)
+        return Response(frame, media_type="image/jpeg", headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
+    uri = item.get("_snapshotUri")
     if not uri or not safe_device_url(uri):
         raise HTTPException(404, "preview-unavailable")
     try:
