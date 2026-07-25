@@ -170,8 +170,17 @@ Rollbackpfad; ihre Quelladressen gehören nur in die ignorierte `.env`.
 Camera Hub verändert weder Kamera-, Receiver-, Router- noch
 Aufzeichnungseinstellungen.
 
-## Lizenz
+## Akku-/Cloudkameras
 
+Akkukameras werden nicht automatisch wie dauerhaft erreichbare RTSP-Kameras
+behandelt. Die erste Schlaf-/Wach-Untersuchung fand keinen lokalen
+Standarddienst. Der anschließend mit dem bekannten CZEview-Konto praktisch
+bestätigte P2P-Zugriff ermöglicht heute eine lease-basierte, optionale
+Integration. Der historische Zwischenstand steht in
+[CZE-PROVIDER-INVESTIGATION.md](CZE-PROVIDER-INVESTIGATION.md), der aktuelle
+Betrieb in [CZEVIEW-INTEGRATION.md](CZEVIEW-INTEGRATION.md).
+
+## Lizenz
 Camera Hub wird unter der [GNU Affero General Public License v3.0](LICENSE)
 bereitgestellt. Die Software kommt ohne Gewährleistung; Details stehen in der
 Lizenzdatei.

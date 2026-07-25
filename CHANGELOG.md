@@ -47,6 +47,13 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
   lokalen Interface ab; der für CZEview erforderliche RTSP-Publisher bleibt
   ausschließlich im internen Docker-Netz erreichbar.
 
+### Dokumentation
+
+- CZEview-Akku-/Cloudkamera zunächst im Schlaf- und Wachzustand schonend auf
+  lokale Standarddienste untersucht und den später nachgewiesenen
+  kontogestützten P2P-Zugriff getrennt dokumentiert;
+- Ignore-Regeln um Paket-, Browser- und lokale Providerartefakte ergänzt.
+
 ## [1.0.0] – 2026-07-24
 
 ### Hinzugefügt
