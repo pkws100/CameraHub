@@ -34,8 +34,7 @@ def request_json(url: str, method: str = "GET", payload: dict | None = None) -> 
         return json.load(response) if response.length != 0 else {}
 
 
-def mediamtx_path(name: str, port: int) -> None:
-    payload = {"source": f"udp+mpegts://0.0.0.0:{port}", "record": False}
+def configure_mediamtx_path(name: str, payload: dict) -> None:
     encoded = quote(name, safe="")
     try:
         request_json(f"{MEDIAMTX}/v3/config/paths/add/{encoded}", "POST", payload)
@@ -54,6 +53,34 @@ def mediamtx_path(name: str, port: int) -> None:
     # Pfads wird deshalb nur dessen Laufzeitkonfiguration ersetzt.
     delete_mediamtx_path(name)
     request_json(f"{MEDIAMTX}/v3/config/paths/add/{encoded}", "POST", payload)
+
+
+def mediamtx_path(name: str, port: int) -> None:
+    configure_mediamtx_path(name, {"source": f"udp+mpegts://0.0.0.0:{port}", "record": False})
+
+
+def mediamtx_ingress_path(name: str, source_uri: str) -> None:
+    configure_mediamtx_path(
+        name,
+        {
+            "source": source_uri,
+            "sourceOnDemand": False,
+            "rtspTransport": "tcp",
+            "record": False,
+        },
+    )
+
+
+def wait_for_path(name: str, timeout: int = 12) -> None:
+    encoded = quote(name, safe="")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if request_json(f"{MEDIAMTX}/v3/paths/get/{encoded}").get("ready"):
+                return
+        except (OSError, ValueError, URLError, HTTPError):
+            pass
+        time.sleep(0.5)
 
 
 def delete_mediamtx_path(name: str) -> None:
@@ -75,6 +102,8 @@ def stop_source(source_id: str, delete_path: bool = False) -> None:
     except subprocess.TimeoutExpired:
         process.kill(); process.wait(timeout=3)
     item["playlist"].unlink(missing_ok=True)
+    if item.get("ingress"):
+        delete_mediamtx_path(item["ingress"])
     if delete_path:
         delete_mediamtx_path(item["path"])
     print(f"relay={source_id} state=stopped", flush=True)
@@ -88,16 +117,45 @@ def start_source(item: dict, port: int) -> None:
     playlist = SECRET_DIR / f"{item['id']}.m3u"
     playlist.write_text("#EXTM3U\n" + item["sourceUri"] + "\n", encoding="utf-8")
     playlist.chmod(0o600)
-    output = f"#std{{access=udp,mux=ts,dst=mediamtx:{port}}}"
-    if item["codec"] in {"h265", "mjpeg"}:
-        output = f"#transcode{{vcodec=h264,vb=1800,fps=15,scale=1,acodec=none}}:std{{access=udp,mux=ts,dst=mediamtx:{port}}}"
-    command = ["cvlc", "-I", "dummy", "--no-one-instance", "--rtsp-tcp"]
-    if not item.get("audio"):
-        command += ["--no-audio", "--no-sout-audio"]
-    command += ["--sout", output, "--sout-keep", "--play-and-exit", str(playlist)]
+    transcode = bool(item.get("transcode")) or item["codec"] in {"h265", "mjpeg"}
+    ingress = None
+    if transcode:
+        ingress = "relay-input-" + hashlib.blake2s(item["id"].encode(), digest_size=8).hexdigest()
+        mediamtx_ingress_path(ingress, item["sourceUri"])
+        wait_for_path(ingress)
+        bitrate = "3000k" if item["id"].endswith("-high") else "900k"
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-rtsp_transport", "tcp",
+            "-i", f"rtsp://mediamtx:8554/{ingress}",
+            "-map", "0:v:0", "-an",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-profile:v", "baseline", "-bf", "0",
+            "-g", "30", "-keyint_min", "30", "-sc_threshold", "0",
+            "-r", "15", "-pix_fmt", "yuv420p", "-b:v", bitrate,
+        ]
+        if item["id"].endswith("-high"):
+            command += ["-vf", "scale=1920:-2"]
+        command += ["-f", "mpegts", f"udp://mediamtx:{port}?pkt_size=1316"]
+    else:
+        output = f"#std{{access=udp,mux=ts,dst=mediamtx:{port}}}"
+        command = ["cvlc", "-I", "dummy", "--no-one-instance", "--rtsp-tcp"]
+        if not item.get("audio"):
+            command += ["--no-audio", "--no-sout-audio"]
+        command += ["--sout", output, "--sout-keep", "--play-and-exit", str(playlist)]
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    processes[item["id"]] = {"process": process, "playlist": playlist, "path": item["path"], "signature": (item["path"], item["sourceUri"], item["codec"], bool(item.get("audio")), item.get("connectionId"), port), "port": port}
-    print(f"relay={item['id']} state=started codec={item['codec']} audio={bool(item.get('audio'))} revision={item.get('connectionRevision')} secret=redacted", flush=True)
+    processes[item["id"]] = {
+        "process": process,
+        "playlist": playlist,
+        "path": item["path"],
+        "ingress": ingress,
+        "signature": (
+            item["path"], item["sourceUri"], item["codec"], bool(item.get("audio")),
+            bool(item.get("transcode")), item.get("connectionId"), port,
+        ),
+        "port": port,
+    }
+    print(f"relay={item['id']} state=started codec={item['codec']} audio={bool(item.get('audio'))} transcode={transcode} revision={item.get('connectionRevision')} secret=redacted", flush=True)
 
 
 def assign_ports(source_ids) -> dict[str, int]:
@@ -124,7 +182,7 @@ def reconcile(config: dict) -> None:
             print(f"relay={source_id} state=exited retry_scheduled=true", flush=True)
         elif source_id not in desired:
             stop_source(source_id, delete_path=True)
-        elif current["signature"] != (desired[source_id]["path"], desired[source_id]["sourceUri"], desired[source_id]["codec"], bool(desired[source_id].get("audio")), desired[source_id].get("connectionId"), assigned_ports[source_id]):
+        elif current["signature"] != (desired[source_id]["path"], desired[source_id]["sourceUri"], desired[source_id]["codec"], bool(desired[source_id].get("audio")), bool(desired[source_id].get("transcode")), desired[source_id].get("connectionId"), assigned_ports[source_id]):
             path_changed = current["path"] != desired[source_id]["path"]
             stop_source(source_id, delete_path=path_changed)
     for source_id in sorted(desired):

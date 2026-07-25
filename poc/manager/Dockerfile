@@ -1,6 +1,6 @@
 FROM alpine:3.22
 
-RUN apk add --no-cache python3 vlc \
+RUN apk add --no-cache ffmpeg python3 vlc \
     && addgroup -S manager \
     && adduser -S -G manager manager
 WORKDIR /app

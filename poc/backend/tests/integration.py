@@ -88,6 +88,10 @@ def request(path: str, method: str = "GET", body=None, csrf: str | None = None, 
 
 
 try:
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=3"
+        ).fetchone()
     state = request("/api/auth/state")
     assert state == {"setupRequired": True, "authenticated": False}
     assert request("/api/auth/setup", "POST", {"username": "owner", "password": "short7"}, expected=422)["detail"]
@@ -179,6 +183,7 @@ try:
     assert "192.168.50." not in serialized and password not in serialized and "rtsp://" not in serialized
     ciphertext = camera_app.encrypt_text("camera-secret")
     assert "camera-secret" not in ciphertext and camera_app.decrypt_text(ciphertext) == "camera-secret"
+    assert 2020 in camera_app.SCAN_PORTS
 
     denied = request("/api/admin/cameras/order", "PUT", {"cameraIds": [item["id"] for item in cameras]}, expected=403)
     assert denied["detail"] == "csrf-invalid"
@@ -213,6 +218,7 @@ try:
     added = request("/api/admin/cameras", "POST", {
         "name": "OpenCam Vorschau", "address": "192.168.50.220", "protocol": "snapshot", "port": 8080,
         "lowSourcePath": "/snapshot.jpg", "codec": "mjpeg", "username": "viewer", "password": vendor_secret,
+        "onvifScheme": "http", "onvifPort": 2020, "onvifPath": "/onvif/device_service",
         "manufacturer": "OpenCam", "model": "Standards-Test",
     }, csrf)
     assert added["managed"] is True and added["hasCredentials"] is True and "password" not in added
@@ -227,7 +233,16 @@ try:
     assert "192.168.50.220" not in json.dumps(viewer_camera) and vendor_secret not in json.dumps(viewer_camera)
     with camera_app.connect() as conn:
         stored = conn.execute("SELECT username_ct,password_ct FROM credentials").fetchone()
+        stored_connection = conn.execute(
+            "SELECT onvif_scheme,onvif_port,onvif_path FROM camera_connections WHERE camera_id=?",
+            (added["id"],),
+        ).fetchone()
     assert vendor_secret not in stored["password_ct"] and camera_app.decrypt_text(stored["password_ct"]) == vendor_secret
+    assert dict(stored_connection) == {
+        "onvif_scheme": "http",
+        "onvif_port": 2020,
+        "onvif_path": "/onvif/device_service",
+    }
     renamed = request(f"/api/admin/cameras/{added['id']}", "PATCH", {"name": "OpenCam Eingang"}, csrf)
     assert renamed["name"] == "OpenCam Eingang"
     request(f"/api/admin/cameras/{added['id']}", "DELETE", csrf=csrf, expected=204)
@@ -247,7 +262,7 @@ try:
     original_connection_test = camera_app.connection_test_result
     camera_app.connection_test_result = lambda camera_id, body: {
         "cameraId": camera_id, "verified": True,
-        "stream": {"low": {"ok": True, "codec": "h264", "width": 640, "height": 480, "packets": 30}, "high": {"ok": True, "codec": "h264", "width": 1280, "height": 720, "packets": 30}},
+        "stream": {"low": {"ok": True, "codec": "h264", "width": 640, "height": 480, "packets": 30, "hasBFrames": 0}, "high": {"ok": True, "codec": "h264", "width": 1280, "height": 720, "packets": 30, "hasBFrames": 2}},
         "onvif": {"ok": True, "device": {"manufacturer": "OpenCam", "model": "Authenticated"}},
         "capabilities": None,
     }
@@ -275,6 +290,9 @@ try:
     camera_app.activation_monitor = lambda *_args: None
     activated = request("/api/admin/cameras/garten/connection/activate", "POST", {"revision": draft["revision"]}, csrf)
     assert activated["state"] == "monitoring" and request("/api/admin/cameras/garten/connection")["activeRevision"] == draft["revision"]
+    activated_viewer = next(item for item in request("/api/cameras")["cameras"] if item["id"] == "garten")
+    assert activated_viewer["highWebRTCCompatible"] is False
+    assert activated_viewer["compatibilityRelay"] is True
     with camera_app.connect() as conn:
         conn.execute("UPDATE cameras SET managed=1 WHERE id='garten'")
         conn.commit()
@@ -282,6 +300,7 @@ try:
     dynamic_garden = next(item for item in dynamic_config["cameras"] if item["cameraId"] == "garten")
     dynamic_source = camera_app.urlparse(dynamic_garden["sourceUri"])
     assert dynamic_garden["connectionRevision"] == draft["revision"]
+    assert dynamic_garden["transcode"] is True
     assert unquote(dynamic_source.username or "") == "camera-user"
     assert unquote(dynamic_source.password or "") == shared_secret
     with camera_app.connect() as conn:
@@ -289,6 +308,9 @@ try:
         conn.commit()
     rolled_back = request("/api/admin/cameras/garten/connection/rollback", "POST", csrf=csrf)
     assert rolled_back["state"] == "active" and rolled_back["revision"] == 1
+    rolled_back_viewer = next(item for item in request("/api/cameras")["cameras"] if item["id"] == "garten")
+    assert rolled_back_viewer["highWebRTCCompatible"] is True
+    assert rolled_back_viewer["compatibilityRelay"] is False
     camera_app.activation_monitor = original_monitor
     camera_app.connection_test_result = original_connection_test
 
@@ -351,11 +373,119 @@ try:
     wsse = camera_app.OnvifClient("http://127.0.0.1/onvif/device_service", "owner", "transient-secret").wsse_header()
     assert "PasswordDigest" in wsse and "transient-secret" not in wsse and "<wsse:Nonce" in wsse
 
+    discovery_secret = "Discovery-Only-Secret-42!"
+    discovery_user = "discovery-user"
+    discovery_scan_id = "scan-auth-preview"
+    discovery_device_id = "device-auth-preview"
+    camera_app.SCANS[discovery_scan_id] = {
+        "id": discovery_scan_id,
+        "state": "complete",
+        "createdAt": camera_app.now_iso(),
+        "createdEpoch": time.time(),
+        "results": [{
+            "id": discovery_device_id,
+            "address": "192.168.50.199",
+            "manufacturer": "Unbekannt",
+            "model": "Unbekannt",
+            "onvif": True,
+            "onvifPort": 2020,
+            "rtsp": True,
+            "openPorts": [554, 2020],
+            "profiles": [],
+            "previewAvailable": False,
+            "configuredCameraId": None,
+            "configuredName": None,
+            "_snapshotUri": None,
+        }],
+    }
+
+    class DiscoveryOnvif:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def capabilities(self):
+            return {
+                "device": {"manufacturer": "StandardsCam", "model": "ONVIF Preview"},
+                "profiles": [
+                    {"token": "low", "name": "Sub", "codec": "h264", "width": 640, "height": 360, "frameRate": 15, "bitrate": 512, "audioCodec": "pcma"},
+                    {"token": "high", "name": "Main", "codec": "h264", "width": 1920, "height": 1080, "frameRate": 25, "bitrate": 2048, "audioCodec": "pcma"},
+                ],
+            }
+        def stream_uri(self, token):
+            return f"rtsp://192.168.50.199:554/{token}"
+
+    original_onvif_client = camera_app.OnvifClient
+    original_transient_preview = camera_app.transient_rtsp_preview
+    captured_source = []
+    camera_app.OnvifClient = DiscoveryOnvif
+    camera_app.transient_rtsp_preview = lambda uri: captured_source.append(uri) or b"\xff\xd8discovery-frame\xff\xd9"
+    discovery_result = request(
+        f"/api/admin/discovery/scans/{discovery_scan_id}/devices/{discovery_device_id}/probe",
+        "POST",
+        {"username": discovery_user, "password": discovery_secret},
+        admin_session["csrfToken"],
+        opener=admin_client,
+    )
+    camera_app.OnvifClient = original_onvif_client
+    camera_app.transient_rtsp_preview = original_transient_preview
+    assert discovery_result["previewAvailable"] and discovery_result["previewVerified"]
+    assert discovery_result["profiles"][0]["streamPath"] == "/low"
+    assert "streamUri" not in json.dumps(discovery_result)
+    assert discovery_secret not in json.dumps(discovery_result)
+    assert discovery_secret not in json.dumps(camera_app.SCANS[discovery_scan_id])
+    assert discovery_user not in json.dumps(camera_app.SCANS[discovery_scan_id])
+    parsed_discovery_source = camera_app.urlparse(captured_source[0])
+    assert unquote(parsed_discovery_source.username or "") == discovery_user
+    assert unquote(parsed_discovery_source.password or "") == discovery_secret
+    preview_request = urllib.request.Request(
+        base + f"/api/admin/discovery/scans/{discovery_scan_id}/devices/{discovery_device_id}/preview",
+        headers={"Host": "127.0.0.1"},
+    )
+    with admin_client.open(preview_request, timeout=10) as response:
+        assert response.headers["Cache-Control"] == "no-store, private"
+        assert response.headers["Content-Type"].startswith("image/jpeg")
+        assert response.read().startswith(b"\xff\xd8")
+
+    configured_scan_id = "scan-configured-preview"
+    configured_device_id = "device-configured-preview"
+    camera_app.SCANS[configured_scan_id] = {
+        "id": configured_scan_id,
+        "state": "complete",
+        "createdAt": camera_app.now_iso(),
+        "createdEpoch": time.time(),
+        "results": [{
+            "id": configured_device_id,
+            "address": "192.168.50.8",
+            "manufacturer": "Configured",
+            "model": "Camera",
+            "onvif": True,
+            "onvifPort": 80,
+            "rtsp": True,
+            "openPorts": [554],
+            "profiles": [],
+            "previewAvailable": True,
+            "configuredCameraId": "garten",
+            "configuredName": "Garten",
+            "_configuredPreviewPath": "garten-low",
+            "_snapshotUri": None,
+        }],
+    }
+    original_capture_frame = camera_app.capture_rtsp_frame
+    configured_paths = []
+    camera_app.capture_rtsp_frame = lambda path: configured_paths.append(path) or b"\xff\xd8configured-frame\xff\xd9"
+    configured_preview_request = urllib.request.Request(
+        base + f"/api/admin/discovery/scans/{configured_scan_id}/devices/{configured_device_id}/preview",
+        headers={"Host": "127.0.0.1"},
+    )
+    with admin_client.open(configured_preview_request, timeout=10) as response:
+        assert response.read().startswith(b"\xff\xd8")
+    camera_app.capture_rtsp_frame = original_capture_frame
+    assert configured_paths == ["garten-low"]
+
     internal = urllib.request.Request(base + "/internal/v1/detection/cameras", headers={"Authorization": f"Bearer {camera_app.INTERNAL_TOKEN}"})
     with urllib.request.urlopen(internal, timeout=5) as response:
         detection = json.load(response)
     assert detection["enabled"] is False and detection["cameras"]
-    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock internal-adapter")
+    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter")
 finally:
     server.should_exit = True
     thread.join(timeout=5)

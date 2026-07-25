@@ -56,6 +56,17 @@ function Initialize-LocalSecret([string]$Path) {
     }
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
+
+function Get-IPv4NetworkCidr([string]$Address, [int]$PrefixLength) {
+    $bytes = [Net.IPAddress]::Parse($Address).GetAddressBytes()
+    $network = [byte[]]::new(4)
+    for ($index = 0; $index -lt 4; $index++) {
+        $remaining = $PrefixLength - ($index * 8)
+        $mask = if ($remaining -ge 8) { 255 } elseif ($remaining -le 0) { 0 } else { (256 - [math]::Pow(2, 8 - $remaining)) }
+        $network[$index] = $bytes[$index] -band [int]$mask
+    }
+    return "$([Net.IPAddress]::new($network))/$PrefixLength"
+}
 Initialize-LocalSecret (Join-Path $secretDirectory 'zmodo_secret_key')
 Initialize-LocalSecret (Join-Path $secretDirectory 'zmodo_internal_token')
 
@@ -66,6 +77,7 @@ $composeFiles = @('docker-compose.yml')
 $bindAddress = '127.0.0.1'
 $configValue = './mediamtx.yml'
 $browserUrl = 'http://127.0.0.1:8090/'
+$privateHttpNetworks = ''
 
 if ($Mode -ne 'Loopback') {
     if (-not $LanAddress) {
@@ -79,6 +91,7 @@ if ($Mode -ne 'Loopback') {
         throw "LAN-Start nur mit Netzwerkprofil Private; aktuell: $($profile.NetworkCategory)."
     }
     $bindAddress = $LanAddress
+    $privateHttpNetworks = Get-IPv4NetworkCidr -Address $address.IPAddress -PrefixLength $address.PrefixLength
 }
 
 switch ($Mode) {
@@ -139,7 +152,7 @@ if (Test-Path -LiteralPath $localEnv) {
     }
 }
 $staticAuthenticatedValue = ($staticAuthenticatedIds | Sort-Object -Unique) -join ','
-$envText = "ZMODO_BIND_IP=$bindAddress`nZMODO_MEDIAMTX_CONFIG=$configValue`nCAMERA_HUB_ALLOW_OWNER_SETUP=$allowOwnerSetup`nCAMERA_HUB_STATIC_AUTHENTICATED_IDS=$staticAuthenticatedValue`n"
+$envText = "ZMODO_BIND_IP=$bindAddress`nZMODO_MEDIAMTX_CONFIG=$configValue`nCAMERA_HUB_ALLOW_OWNER_SETUP=$allowOwnerSetup`nCAMERA_HUB_STATIC_AUTHENTICATED_IDS=$staticAuthenticatedValue`nCAMERA_HUB_PRIVATE_HTTP_NETWORKS=$privateHttpNetworks`n"
 [IO.File]::WriteAllText($composeEnv, $envText, [Text.UTF8Encoding]::new($false))
 $state = [ordered]@{ mode=$Mode; bindAddress=$bindAddress; composeFiles=$composeFiles; browserUrl=$browserUrl }
 [IO.File]::WriteAllText($modeFile, ($state | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
