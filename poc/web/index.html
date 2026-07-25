@@ -139,7 +139,9 @@
     <label class="span-two">Anzeigename<input name="name" required maxlength="80"></label>
     <label>IP-Adresse<input name="address" inputmode="decimal" required></label><label>Protokoll<select name="protocol"><option value="rtsp">RTSP</option><option value="hls">HTTP HLS</option><option value="mjpeg">HTTP MJPEG</option><option value="snapshot">HTTP Snapshot</option></select></label>
     <label>Port<input name="port" type="number" min="1" max="65535" value="554" required></label><label>Codec<select name="codec"><option value="h264">H.264</option><option value="h265">H.265 / HEVC</option><option value="mjpeg">MJPEG</option></select></label>
-    <label class="span-two">Substream-Pfad<input name="lowSourcePath" placeholder="/stream1" required></label><label class="span-two">Hauptstream-Pfad<input name="highSourcePath" placeholder="optional"></label>
+    <label class="span-two">Substream-Pfad<input name="lowSourcePath" placeholder="/stream2" required></label><label class="span-two">Hauptstream-Pfad<input name="highSourcePath" placeholder="/stream1 oder optional"></label>
+    <label>ONVIF-Schema<select name="onvifScheme"><option value="http">HTTP</option><option value="https">HTTPS</option></select></label><label>ONVIF-Port<input name="onvifPort" type="number" min="1" max="65535" value="80" required></label>
+    <label class="span-two">ONVIF-Gerätedienst<input name="onvifPath" value="/onvif/device_service" required></label>
     <label>Benutzername<input name="username" autocomplete="off"></label><label>Passwort<input name="password" type="password" autocomplete="new-password"></label>
     <input type="hidden" name="manufacturer"><input type="hidden" name="model">
   </div><div class="test-result" id="source-test" role="status" aria-live="polite">Bitte testen Sie die Quelle vor dem Hinzufügen.</div><p class="form-error" id="camera-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button type="button" id="test-source">Quelle testen</button><button class="primary" type="submit">Hinzufügen</button></div></form></dialog>

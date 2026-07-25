@@ -88,6 +88,10 @@ def request(path: str, method: str = "GET", body=None, csrf: str | None = None, 
 
 
 try:
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=3"
+        ).fetchone()
     state = request("/api/auth/state")
     assert state == {"setupRequired": True, "authenticated": False}
     assert request("/api/auth/setup", "POST", {"username": "owner", "password": "short7"}, expected=422)["detail"]
@@ -179,6 +183,7 @@ try:
     assert "192.168.50." not in serialized and password not in serialized and "rtsp://" not in serialized
     ciphertext = camera_app.encrypt_text("camera-secret")
     assert "camera-secret" not in ciphertext and camera_app.decrypt_text(ciphertext) == "camera-secret"
+    assert 2020 in camera_app.SCAN_PORTS
 
     denied = request("/api/admin/cameras/order", "PUT", {"cameraIds": [item["id"] for item in cameras]}, expected=403)
     assert denied["detail"] == "csrf-invalid"
@@ -213,6 +218,7 @@ try:
     added = request("/api/admin/cameras", "POST", {
         "name": "OpenCam Vorschau", "address": "192.168.50.220", "protocol": "snapshot", "port": 8080,
         "lowSourcePath": "/snapshot.jpg", "codec": "mjpeg", "username": "viewer", "password": vendor_secret,
+        "onvifScheme": "http", "onvifPort": 2020, "onvifPath": "/onvif/device_service",
         "manufacturer": "OpenCam", "model": "Standards-Test",
     }, csrf)
     assert added["managed"] is True and added["hasCredentials"] is True and "password" not in added
@@ -227,7 +233,16 @@ try:
     assert "192.168.50.220" not in json.dumps(viewer_camera) and vendor_secret not in json.dumps(viewer_camera)
     with camera_app.connect() as conn:
         stored = conn.execute("SELECT username_ct,password_ct FROM credentials").fetchone()
+        stored_connection = conn.execute(
+            "SELECT onvif_scheme,onvif_port,onvif_path FROM camera_connections WHERE camera_id=?",
+            (added["id"],),
+        ).fetchone()
     assert vendor_secret not in stored["password_ct"] and camera_app.decrypt_text(stored["password_ct"]) == vendor_secret
+    assert dict(stored_connection) == {
+        "onvif_scheme": "http",
+        "onvif_port": 2020,
+        "onvif_path": "/onvif/device_service",
+    }
     renamed = request(f"/api/admin/cameras/{added['id']}", "PATCH", {"name": "OpenCam Eingang"}, csrf)
     assert renamed["name"] == "OpenCam Eingang"
     request(f"/api/admin/cameras/{added['id']}", "DELETE", csrf=csrf, expected=204)
@@ -247,7 +262,7 @@ try:
     original_connection_test = camera_app.connection_test_result
     camera_app.connection_test_result = lambda camera_id, body: {
         "cameraId": camera_id, "verified": True,
-        "stream": {"low": {"ok": True, "codec": "h264", "width": 640, "height": 480, "packets": 30}, "high": {"ok": True, "codec": "h264", "width": 1280, "height": 720, "packets": 30}},
+        "stream": {"low": {"ok": True, "codec": "h264", "width": 640, "height": 480, "packets": 30, "hasBFrames": 0}, "high": {"ok": True, "codec": "h264", "width": 1280, "height": 720, "packets": 30, "hasBFrames": 2}},
         "onvif": {"ok": True, "device": {"manufacturer": "OpenCam", "model": "Authenticated"}},
         "capabilities": None,
     }
@@ -275,6 +290,9 @@ try:
     camera_app.activation_monitor = lambda *_args: None
     activated = request("/api/admin/cameras/garten/connection/activate", "POST", {"revision": draft["revision"]}, csrf)
     assert activated["state"] == "monitoring" and request("/api/admin/cameras/garten/connection")["activeRevision"] == draft["revision"]
+    activated_viewer = next(item for item in request("/api/cameras")["cameras"] if item["id"] == "garten")
+    assert activated_viewer["highWebRTCCompatible"] is False
+    assert activated_viewer["compatibilityRelay"] is True
     with camera_app.connect() as conn:
         conn.execute("UPDATE cameras SET managed=1 WHERE id='garten'")
         conn.commit()
@@ -282,6 +300,7 @@ try:
     dynamic_garden = next(item for item in dynamic_config["cameras"] if item["cameraId"] == "garten")
     dynamic_source = camera_app.urlparse(dynamic_garden["sourceUri"])
     assert dynamic_garden["connectionRevision"] == draft["revision"]
+    assert dynamic_garden["transcode"] is True
     assert unquote(dynamic_source.username or "") == "camera-user"
     assert unquote(dynamic_source.password or "") == shared_secret
     with camera_app.connect() as conn:
@@ -289,6 +308,9 @@ try:
         conn.commit()
     rolled_back = request("/api/admin/cameras/garten/connection/rollback", "POST", csrf=csrf)
     assert rolled_back["state"] == "active" and rolled_back["revision"] == 1
+    rolled_back_viewer = next(item for item in request("/api/cameras")["cameras"] if item["id"] == "garten")
+    assert rolled_back_viewer["highWebRTCCompatible"] is True
+    assert rolled_back_viewer["compatibilityRelay"] is False
     camera_app.activation_monitor = original_monitor
     camera_app.connection_test_result = original_connection_test
 

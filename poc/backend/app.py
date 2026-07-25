@@ -43,7 +43,7 @@ MAX_CAMERAS = int(os.environ.get("MAX_CAMERAS", "32"))
 SESSION_SECONDS = 8 * 60 * 60
 ELEVATION_SECONDS = 10 * 60
 SCAN_TTL_SECONDS = 15 * 60
-SCAN_PORTS = (80, 443, 554, 8000, 8080, 8554, 8899, 10080, 10554)
+SCAN_PORTS = (80, 443, 554, 2020, 8000, 8080, 8554, 8899, 10080, 10554)
 PH = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 DB_LOCK = threading.RLock()
 SCAN_LOCK = threading.Lock()
@@ -51,7 +51,7 @@ SCANS: dict[str, dict] = {}
 LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 LEASES: dict[str, dict[str, float]] = {}
 PTZ_ATTEMPTS: dict[str, list[float]] = {}
-CONNECTION_TESTS: dict[str, tuple[float, str]] = {}
+CONNECTION_TESTS: dict[str, tuple[float, str, dict]] = {}
 ACTIVATION_LOCK = threading.Lock()
 PREVIEW_SEMAPHORE = threading.BoundedSemaphore(2)
 PREVIEW_CACHE: dict[str, tuple[float, bytes]] = {}
@@ -145,6 +145,8 @@ CREATE TABLE IF NOT EXISTS cameras(
  source_label TEXT NOT NULL, low_path TEXT NOT NULL UNIQUE, high_path TEXT NOT NULL,
  detail_quality TEXT, managed INTEGER NOT NULL DEFAULT 0, address TEXT, protocol TEXT,
  port INTEGER, low_source_path TEXT, high_source_path TEXT, codec TEXT NOT NULL DEFAULT 'h264',
+ high_webrtc_compatible INTEGER NOT NULL DEFAULT 1,
+ force_transcode INTEGER NOT NULL DEFAULT 0,
  manufacturer TEXT, model TEXT, snapshot_uri TEXT, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
@@ -205,6 +207,15 @@ def initialize_database() -> None:
             conn.execute("ALTER TABLE cameras ADD COLUMN active_connection_id TEXT")
         if "last_good_connection_id" not in camera_columns:
             conn.execute("ALTER TABLE cameras ADD COLUMN last_good_connection_id TEXT")
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=3").fetchone() is None:
+            if "high_webrtc_compatible" not in camera_columns:
+                conn.execute("ALTER TABLE cameras ADD COLUMN high_webrtc_compatible INTEGER NOT NULL DEFAULT 1")
+            if "force_transcode" not in camera_columns:
+                conn.execute("ALTER TABLE cameras ADD COLUMN force_transcode INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)",
+                (now_iso(),),
+            )
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             legacy = conn.execute("SELECT * FROM owner WHERE id=1").fetchone()
             if legacy:
@@ -289,10 +300,11 @@ def initialize_database() -> None:
             conn.execute("UPDATE camera_connections SET state='active',updated_at=? WHERE id=?", (stamp, fallback["id"]))
             conn.execute(
                 """UPDATE cameras SET active_connection_id=?,address=?,protocol=?,port=?,low_source_path=?,
-                   high_source_path=?,codec=?,credential_id=?,updated_at=? WHERE id=?""",
+                   high_source_path=?,codec=?,high_webrtc_compatible=?,force_transcode=?,credential_id=?,updated_at=? WHERE id=?""",
                 (
                     fallback["id"], fallback["address"], fallback["stream_protocol"], fallback["stream_port"],
                     fallback["low_source_path"], fallback["high_source_path"], fallback["codec"],
+                    1, 0,
                     fallback["shared_credential_id"], stamp, item["camera_id"],
                 ),
             )
@@ -366,6 +378,9 @@ class CameraCreate(BaseModel):
     codec: Literal["h264", "h265", "mjpeg"] = "h264"
     username: str = Field(default="", max_length=128)
     password: str = Field(default="", max_length=256)
+    onvifScheme: Literal["http", "https"] = "http"
+    onvifPort: int = Field(ge=1, le=65535, default=80)
+    onvifPath: str = Field(default="/onvif/device_service", min_length=1, max_length=256)
     manufacturer: str = Field(default="", max_length=128)
     model: str = Field(default="", max_length=128)
 
@@ -384,6 +399,13 @@ class CameraCreate(BaseModel):
             return value
         if not value.startswith("/") or any(ch in value for ch in "\r\n@"):
             raise ValueError("invalid source path")
+        return value
+
+    @field_validator("onvifPath")
+    @classmethod
+    def valid_onvif_path(cls, value: str) -> str:
+        if not value.startswith("/") or any(ch in value for ch in "\r\n@?#"):
+            raise ValueError("invalid ONVIF path")
         return value
 
 
@@ -635,10 +657,15 @@ def public_camera(row: sqlite3.Row) -> dict:
         "statusPath": f"/api/cameras/{row['id']}/status", "detailQuality": row["detail_quality"],
         "enabled": bool(row["enabled"]), "position": row["position"], "managed": bool(row["managed"]),
         "usesCredentials": uses_credentials,
+        "highWebRTCCompatible": bool(row["high_webrtc_compatible"]),
+        "compatibilityRelay": bool(row["force_transcode"]),
         "displayMode": "snapshot" if row["protocol"] == "snapshot" else "stream",
         "snapshotPath": f"/api/cameras/{row['id']}/snapshot" if row["protocol"] == "snapshot" else None,
         "features": {
-            "audio": bool(capabilities.get("audio", {}).get("supported")),
+            "audio": bool(
+                capabilities.get("audio", {}).get("supported")
+                and not row["force_transcode"]
+            ),
             "ptz": bool(capabilities.get("ptz", {}).get("supported")),
         },
     }
@@ -824,6 +851,32 @@ def source_uri_from_connection(conn: sqlite3.Connection, row: sqlite3.Row, high:
     auth = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username else ""
     scheme = "http" if row["stream_protocol"] in {"hls", "mjpeg", "snapshot"} else "rtsp"
     return f"{scheme}://{auth}{row['address']}:{row['stream_port']}{path}"
+
+
+def connection_high_webrtc_compatible(row: sqlite3.Row, fallback: bool = True) -> bool:
+    if row["high_source_path"] == row["low_source_path"]:
+        return True
+    try:
+        result = json.loads(row["test_result_json"] or "{}")
+        high = result.get("stream", {}).get("high", {})
+        if high.get("ok"):
+            return not int(high.get("hasBFrames") or 0)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return fallback
+
+
+def connection_requires_transcode(row: sqlite3.Row, fallback: bool = False) -> bool:
+    try:
+        result = json.loads(row["test_result_json"] or "{}")
+        streams = result.get("stream", {})
+        tested = [streams.get("low", {}), streams.get("high", {})]
+        successful = [item for item in tested if item.get("ok")]
+        if successful:
+            return any(int(item.get("hasBFrames") or 0) > 0 for item in successful)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return fallback
 
 
 def media_paths() -> tuple[dict[str, dict], bool]:
@@ -1337,16 +1390,18 @@ def scan_network(scan_id: str) -> None:
                 if not open_ports:
                     return None
                 inventory = {"supported": False, "manufacturer": "", "model": "", "profiles": [], "snapshotUri": None}
-                for port in [p for p in open_ports if p in (80, 443, 8000, 8080, 8899, 10080)]:
+                onvif_port = None
+                for port in [p for p in open_ports if p in (80, 443, 2020, 8000, 8080, 8899, 10080)]:
                     inventory = onvif_inventory(ip, port)
                     if inventory["supported"]:
+                        onvif_port = port
                         break
                 rtsp_ports = [p for p in open_ports if p in (554, 8554, 10554)]
                 rtsp = any(rtsp_options(ip, port) for port in rtsp_ports)
                 if not inventory["supported"] and not rtsp:
                     return None
                 known = configured.get(ip)
-                return {"id": str(uuid.uuid4()), "address": ip, "manufacturer": inventory["manufacturer"] or "Unbekannt", "model": inventory["model"] or "Unbekannt", "onvif": inventory["supported"], "rtsp": rtsp, "wsDiscovery": ip in discovered, "openPorts": open_ports, "profiles": inventory["profiles"], "previewAvailable": bool(inventory["snapshotUri"]), "configuredCameraId": known["cameraId"] if known else None, "configuredName": known["name"] if known else None, "_snapshotUri": inventory["snapshotUri"]}
+                return {"id": str(uuid.uuid4()), "address": ip, "manufacturer": inventory["manufacturer"] or "Unbekannt", "model": inventory["model"] or "Unbekannt", "onvif": inventory["supported"], "onvifPort": onvif_port, "rtsp": rtsp, "wsDiscovery": ip in discovered, "openPorts": open_ports, "profiles": inventory["profiles"], "previewAvailable": bool(inventory["snapshotUri"]), "configuredCameraId": known["cameraId"] if known else None, "configuredName": known["name"] if known else None, "_snapshotUri": inventory["snapshotUri"]}
             with ThreadPoolExecutor(max_workers=24) as pool:
                 futures = [pool.submit(inspect_host, ip) for ip in hosts]
                 for completed, future in enumerate(as_completed(futures), start=1):
@@ -1445,10 +1500,10 @@ def source_uri(row: sqlite3.Row, high: bool = False) -> str:
 def ffprobe_uri(uri: str) -> dict:
     command = ["ffprobe", "-v", "error"]
     if uri.startswith("rtsp://"):
-        command += ["-rtsp_transport", "tcp"]
-    command += ["-read_intervals", "%+5", "-count_packets", "-show_entries", "stream=index,codec_type,codec_name,width,height,avg_frame_rate,nb_read_packets", "-of", "json", uri]
+        command += ["-rtsp_transport", "tcp", "-rw_timeout", "12000000"]
+    command += ["-read_intervals", "%+5", "-count_packets", "-show_entries", "stream=index,codec_type,codec_name,width,height,avg_frame_rate,has_b_frames,nb_read_packets", "-of", "json", uri]
     try:
-        result = subprocess.run(command, capture_output=True, timeout=12, check=False)
+        result = subprocess.run(command, capture_output=True, timeout=25, check=False)
         payload = json.loads(result.stdout or b"{}")
         video = next((item for item in payload.get("streams", []) if item.get("codec_type") == "video"), None)
         audio = next((item for item in payload.get("streams", []) if item.get("codec_type") == "audio"), None)
@@ -1460,6 +1515,7 @@ def ffprobe_uri(uri: str) -> dict:
             "width": video.get("width"),
             "height": video.get("height"),
             "frameRate": video.get("avg_frame_rate"),
+            "hasBFrames": int(video.get("has_b_frames") or 0),
             "packets": int(video.get("nb_read_packets") or 0),
             "audioAvailable": bool(audio and int(audio.get("nb_read_packets") or 0) > 0),
             "audioCodec": audio.get("codec_name") if audio else None,
@@ -1484,6 +1540,18 @@ def add_camera(body: CameraCreate, _: sqlite3.Row = Depends(require_admin_elevat
     proof = ffprobe_uri(f"{scheme}://{auth}{body.address}:{body.port}{body.lowSourcePath}")
     if not proof.get("ok"):
         raise HTTPException(422, "camera-frame-test-required")
+    high_source = body.highSourcePath or body.lowSourcePath
+    high_proof = proof
+    if body.protocol == "rtsp" and high_source != body.lowSourcePath:
+        high_proof = ffprobe_uri(f"{scheme}://{auth}{body.address}:{body.port}{high_source}")
+    high_webrtc_compatible = int(
+        high_source == body.lowSourcePath
+        or (bool(high_proof.get("ok")) and not int(high_proof.get("hasBFrames") or 0))
+    )
+    force_transcode = int(
+        int(proof.get("hasBFrames") or 0) > 0
+        or int(high_proof.get("hasBFrames") or 0) > 0
+    )
     with DB_LOCK, connect() as conn:
         if conn.execute("SELECT COUNT(*) FROM cameras").fetchone()[0] >= MAX_CAMERAS:
             raise HTTPException(409, "camera-limit-reached")
@@ -1504,14 +1572,13 @@ def add_camera(body: CameraCreate, _: sqlite3.Row = Depends(require_admin_elevat
             credential_id = str(uuid.uuid4())
             conn.execute("INSERT INTO credentials VALUES(?,?,?,?)", (credential_id, encrypt_text(body.username), encrypt_text(body.password), now_iso()))
         stamp = now_iso()
-        high_source = body.highSourcePath or body.lowSourcePath
         conn.execute(
             """INSERT INTO cameras(id,name,position,enabled,source_label,low_path,high_path,detail_quality,managed,address,protocol,port,
-               low_source_path,high_source_path,codec,manufacturer,model,credential_id,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               low_source_path,high_source_path,codec,high_webrtc_compatible,force_transcode,manufacturer,model,credential_id,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (camera_id, body.name, position, 1, "Dynamisch", f"{camera_id}-low", f"{camera_id}-high", "Automatisch erkannt", 1,
-             body.address, body.protocol, body.port, body.lowSourcePath, high_source, body.codec, body.manufacturer, body.model,
-              credential_id, stamp, stamp),
+             body.address, body.protocol, body.port, body.lowSourcePath, high_source, body.codec, high_webrtc_compatible,
+             force_transcode, body.manufacturer, body.model, credential_id, stamp, stamp),
         )
         connection_id = str(uuid.uuid4())
         conn.execute(
@@ -1521,7 +1588,7 @@ def add_camera(body: CameraCreate, _: sqlite3.Row = Depends(require_admin_elevat
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 connection_id, camera_id, 1, "active", body.address, body.protocol, body.port, body.lowSourcePath,
-                high_source, body.codec, "http", 80, "/onvif/device_service", "shared" if credential_id else "none",
+                high_source, body.codec, body.onvifScheme, body.onvifPort, body.onvifPath, "shared" if credential_id else "none",
                 credential_id, "verified", stamp, stamp, stamp,
             ),
         )
@@ -1529,6 +1596,26 @@ def add_camera(body: CameraCreate, _: sqlite3.Row = Depends(require_admin_elevat
             "UPDATE cameras SET active_connection_id=?,last_good_connection_id=? WHERE id=?",
             (connection_id, connection_id, camera_id),
         )
+        connection = conn.execute("SELECT * FROM camera_connections WHERE id=?", (connection_id,)).fetchone()
+        if connection and body.protocol == "rtsp":
+            try:
+                client = OnvifClient(
+                    f"{body.onvifScheme}://{body.address}:{body.onvifPort}{body.onvifPath}",
+                    body.username,
+                    body.password,
+                    timeout=5,
+                    allowed_url=safe_onvif_url,
+                )
+                capabilities = client.capabilities()
+                save_capabilities(conn, camera_id, connection, capabilities)
+                device = capabilities.get("device", {})
+                conn.execute(
+                    """UPDATE cameras SET manufacturer=COALESCE(NULLIF(?,''),manufacturer),
+                       model=COALESCE(NULLIF(?,''),model),updated_at=? WHERE id=?""",
+                    (device.get("manufacturer", ""), device.get("model", ""), stamp, camera_id),
+                )
+            except OnvifError:
+                pass
         row = conn.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
     return admin_camera(row)
 
@@ -1610,7 +1697,11 @@ def test_camera_connection(camera_id: str, body: ConnectionInput, _: sqlite3.Row
             raise HTTPException(404, "camera-not-found")
     result = connection_test_result(camera_id, body)
     if result["verified"]:
-        CONNECTION_TESTS[camera_id] = (time.time() + 300, connection_input_digest(camera_id, body))
+        CONNECTION_TESTS[camera_id] = (
+            time.time() + 300,
+            connection_input_digest(camera_id, body),
+            result,
+        )
     return result
 
 
@@ -1640,17 +1731,18 @@ def save_camera_connection(camera_id: str, body: ConnectionInput, actor: sqlite3
         test_status = "verified" if tested and tested[0] > time.time() and secrets.compare_digest(
             tested[1], connection_input_digest(camera_id, body)
         ) else "untested"
+        test_result_json = json.dumps(tested[2]) if test_status == "verified" else None
         conn.execute(
             """INSERT INTO camera_connections(
                id,camera_id,revision,state,address,stream_protocol,stream_port,low_source_path,high_source_path,codec,
                onvif_scheme,onvif_port,onvif_path,credential_mode,shared_credential_id,onvif_credential_id,
-               stream_credential_id,test_status,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               stream_credential_id,test_status,test_result_json,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 connection_id, camera_id, revision, "draft", body.address, body.streamProtocol, body.streamPort,
                 body.lowSourcePath, body.highSourcePath or body.lowSourcePath, body.codec, body.onvifScheme,
                 body.onvifPort, body.onvifPath, body.credentialMode, shared_id, onvif_id, stream_id,
-                test_status, stamp, stamp,
+                test_status, test_result_json, stamp, stamp,
             ),
         )
         CONNECTION_TESTS.pop(camera_id, None)
@@ -1715,10 +1807,12 @@ def activation_monitor(camera_id: str, connection_id: str, previous_id: str | No
             previous = conn.execute("SELECT * FROM camera_connections WHERE id=?", (previous_id,)).fetchone()
             conn.execute(
                 """UPDATE cameras SET active_connection_id=?,address=?,protocol=?,port=?,low_source_path=?,
-                   high_source_path=?,codec=?,credential_id=?,updated_at=? WHERE id=?""",
+                   high_source_path=?,codec=?,high_webrtc_compatible=?,force_transcode=?,credential_id=?,updated_at=? WHERE id=?""",
                 (
                     previous_id, previous["address"], previous["stream_protocol"], previous["stream_port"],
                     previous["low_source_path"], previous["high_source_path"], previous["codec"],
+                    int(connection_high_webrtc_compatible(previous)),
+                    int(connection_requires_transcode(previous)),
                     previous["shared_credential_id"], stamp, camera_id,
                 ),
             )
@@ -1751,10 +1845,12 @@ def activate_camera_connection(camera_id: str, body: ConnectionActivation, actor
         conn.execute("DELETE FROM camera_profiles WHERE camera_id=?", (camera_id,))
         conn.execute(
             """UPDATE cameras SET active_connection_id=?,address=?,protocol=?,port=?,low_source_path=?,
-               high_source_path=?,codec=?,credential_id=?,updated_at=? WHERE id=?""",
+               high_source_path=?,codec=?,high_webrtc_compatible=?,force_transcode=?,credential_id=?,updated_at=? WHERE id=?""",
             (
                 target["id"], target["address"], target["stream_protocol"], target["stream_port"],
                 target["low_source_path"], target["high_source_path"], target["codec"],
+                int(connection_high_webrtc_compatible(target, bool(camera["high_webrtc_compatible"]))),
+                int(connection_requires_transcode(target, bool(camera["force_transcode"]))),
                 target["shared_credential_id"], stamp, camera_id,
             ),
         )
@@ -1790,10 +1886,12 @@ def rollback_camera_connection(camera_id: str, actor: sqlite3.Row = Depends(requ
         conn.execute("UPDATE camera_connections SET state='active',updated_at=? WHERE id=?", (stamp, target["id"]))
         conn.execute(
             """UPDATE cameras SET active_connection_id=?,address=?,protocol=?,port=?,low_source_path=?,
-               high_source_path=?,codec=?,credential_id=?,updated_at=? WHERE id=?""",
+               high_source_path=?,codec=?,high_webrtc_compatible=?,force_transcode=?,credential_id=?,updated_at=? WHERE id=?""",
             (
                 target["id"], target["address"], target["stream_protocol"], target["stream_port"],
                 target["low_source_path"], target["high_source_path"], target["codec"],
+                int(connection_high_webrtc_compatible(target)),
+                int(connection_requires_transcode(target)),
                 target["shared_credential_id"], stamp, camera_id,
             ),
         )
@@ -2120,9 +2218,9 @@ def relay_config(_: None = Depends(require_internal)):
             if expiry <= now:
                 camera_leases.pop(key, None)
         active = row["codec"] == "h264" or bool(camera_leases)
-        items.append({"id": f"{row['id']}-low", "cameraId": row["id"], "connectionId": connection["id"], "connectionRevision": connection["revision"], "path": row["low_path"], "sourceUri": source_uri(row), "codec": row["codec"], "audio": audio, "active": active})
+        items.append({"id": f"{row['id']}-low", "cameraId": row["id"], "connectionId": connection["id"], "connectionRevision": connection["revision"], "path": row["low_path"], "sourceUri": source_uri(row), "codec": row["codec"], "audio": audio, "transcode": bool(row["force_transcode"]), "active": active})
         if row["high_path"] != row["low_path"] and row["high_source_path"] != row["low_source_path"]:
-            items.append({"id": f"{row['id']}-high", "cameraId": row["id"], "connectionId": connection["id"], "connectionRevision": connection["revision"], "path": row["high_path"], "sourceUri": source_uri(row, high=True), "codec": row["codec"], "audio": audio, "active": active})
+            items.append({"id": f"{row['id']}-high", "cameraId": row["id"], "connectionId": connection["id"], "connectionRevision": connection["revision"], "path": row["high_path"], "sourceUri": source_uri(row, high=True), "codec": row["codec"], "audio": audio, "transcode": bool(row["force_transcode"]), "active": active})
     return {"revision": int(now), "cameras": items}
 
 
