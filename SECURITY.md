@@ -38,12 +38,23 @@
 - Kamera-Verbindungen werden revisionsweise gespeichert. Benutzer- und
   Passwortfelder bleiben beim Bearbeiten leer; APIs liefern nur
   Vorhanden-/Nicht-vorhanden-Markierungen.
+- Die optionale CZEview-Brücke erhält nur die ausdrücklich ausgewählten
+  CZEview-Felder als Docker-Secret. `.env`, Plattform-Token, Seriennummer und
+  Kontodaten werden nicht über Viewer- oder Verwaltungs-APIs ausgeliefert.
+- Wegen der Plattformgrenze wird für CZEview ein eigenes, freigegebenes
+  Betrachterkonto empfohlen. Ein gemeinsam mit der Mobil-App verwendetes Konto
+  kann dort durch die Brückenanmeldung abgemeldet werden.
 - ONVIF unterstützt HTTP Basic/Digest und WS-Security PasswordDigest. Das
   Klartextpasswort wird nicht in den SOAP-Header übernommen.
 - PTZ-Bewegung und vorhandene Presets sind nur für Eigentümer/Administratoren,
   mit CSRF-Schutz, Rate-Limit und aktueller Passwortbestätigung freigeschaltet.
   Ein Stop-Befehl wird auch bei Abbruch, Hintergrundwechsel und Seitenwechsel
   gesendet.
+- Die CZEview-Brücke veröffentlicht ihren Steueradapter nicht auf dem Host.
+  Camera Hub darf ihn nur über den fest erlaubten internen Dienstnamen und das
+  Service-Token ansprechen. Freigegeben sind ausschließlich begrenzte
+  Links-/Rechtsbewegungen und Stopp; vertikale Bewegung, Zoom, Kalibrierung
+  und Presets bleiben für diese Kamera deaktiviert.
 - ONVIF- und Snapshot-HTTP-Clients folgen keinen Weiterleitungen. Ein geprüftes
   Kameraziel kann dadurch nicht auf Link-Local-, Internet- oder interne
   Containeradressen umleiten.
@@ -57,7 +68,13 @@
 - Der Relay-Manager besitzt keinen Docker-Socket. Temporäre Playlists mit
   Quell-Secrets liegen nur in einem Container-tmpfs.
 - H.265/MJPEG-Transcoding wird nur bei aktivem Lease gestartet; H.264 bleibt
-  Stream-Copy.
+  Stream-Copy. Die CZEview-Ausnahme codiert kurze proprietäre H.264-P2P-Fenster
+  bedarfsgesteuert mit häufigen Schlüsselbildern neu, damit später
+  hinzukommende WebRTC-/HLS-Leser einsteigen können.
+- Die CZEview-Kamera wird nur bei einem erneuerbaren Viewer-Lease geweckt. Das
+  Schließen oder Pausieren der Ansicht gibt den Lease frei; die Brücke beendet
+  anschließend ihren Publisher. Ein Snapshot verwendet einen eigenen
+  kurzlebigen Lease und entfernt ihn auch bei Timeout oder Fehler.
 - Vorschauen werden bevorzugt aus dem neutralen internen MediaMTX-Pfad
   erzeugt, nicht über eine zweite direkte Kamerasitzung. Gleichzeitige
   FFmpeg-Vorschauen sind begrenzt; Antworten werden nicht dauerhaft gespeichert
@@ -86,10 +103,11 @@
   akzeptiert; Uvicorn wertet solche Header nicht eigenständig aus.
 - Der private HTTP-Gateway-Modus ist eine ausdrückliche Ausnahme für
   vertrauenswürdige lokale Anzeige- und Verwaltungsgeräte. Er bindet an eine
-  konkrete RFC1918-Adresse, akzeptiert nur konfigurierte private Zielnetze und
-  wird zusätzlich durch die Windows-Firewall auf das konkrete Quellsubnetz
-  begrenzt. HLS und WHEP bleiben dabei hinter der App-Sitzung am lokalen
-  Reverse Proxy; MediaMTX-Webports werden nicht direkt veröffentlicht.
+  konkrete RFC1918-Adresse und leitet das zulässige Verwaltungsnetz aus deren
+  aktiver Präfixlänge ab. Die Windows-Firewall begrenzt den Zugriff zusätzlich
+  auf dasselbe konkrete Quellsubnetz. HLS und WHEP bleiben dabei hinter der
+  App-Sitzung am lokalen Reverse Proxy; MediaMTX-Webports werden nicht direkt
+  veröffentlicht.
 - Für WireGuard/Nginx Proxy Manager bleibt äußeres HTTPS erforderlich.
   `X-Forwarded-Proto` wird nur von ausdrücklich vertrauten Proxy-Netzen
   akzeptiert. Der direkte private HTTP-Modus darf niemals öffentlich geroutet

@@ -80,10 +80,25 @@
     if(!state) return; clearTimeout(state.retryTimer); clearTimeout(state.startupTimer); clearTimeout(state.snapshotTimer); state.retryTimer=state.startupTimer=state.snapshotTimer=null; state.generation+=1;
     if(state.reader) state.reader.close(); state.reader=null; state.video?.pause(); if(state.video) state.video.srcObject=null;
     if(state.snapshot){state.snapshot.onload=null;state.snapshot.onerror=null;state.snapshot.removeAttribute('src');}
+    if(release){clearTimeout(state.leaseTimer);state.leaseTimer=null;}
     if(release && state.camera?.id && state.leaseId && appState.csrf){
       const leaseId=state.leaseId;state.leaseId=null;
       api(`/api/cameras/${encodeURIComponent(state.camera.id)}/lease?leaseId=${encodeURIComponent(leaseId)}`,{method:'DELETE'}).catch(()=>{});
     }
+  }
+  function scheduleLeaseRenewal(state){
+    clearTimeout(state.leaseTimer);state.leaseTimer=null;
+    if(!state.leaseId||!appState.csrf)return;
+    const cameraId=state.camera.id,leaseId=state.leaseId;
+    state.leaseTimer=setTimeout(async()=>{
+      if(state.leaseId!==leaseId)return;
+      try{
+        await api(`/api/cameras/${encodeURIComponent(cameraId)}/lease?leaseId=${encodeURIComponent(leaseId)}`,{method:'PUT'});
+        if(state.leaseId===leaseId)scheduleLeaseRenewal(state);
+      }catch{
+        if(state.leaseId===leaseId){state.leaseId=null;state.leaseTimer=null;}
+      }
+    },45000);
   }
   function mark(state,status,text){ state.status.dataset.state=status; const target=state.status.querySelector('.status-text,span:last-child'); if(target) target.textContent=text; if(state.wallStatus){state.wallStatus.dataset.state=status;const wallText=$('span',state.wallStatus);if(wallText)wallText.textContent=status==='live'?'Live':text;} if(state.placeholder) state.placeholder.hidden=status==='live'; }
   async function resumePlayback(state){
@@ -98,7 +113,8 @@
     closeReader(state,false); if(manual)state.retryCount=0; if(appState.suspended||!navigator.onLine){mark(state,'offline','Netzwerk offline');return;}
     if(state===appState.detail){$('#detail-video').hidden=false; $('#detail-hls').hidden=true; $('#detail-hls').removeAttribute('src');}
     const generation=state.generation; mark(state,'loading','Verbindung wird hergestellt');
-    if(!state.leaseId)try { const lease=await api(`/api/cameras/${encodeURIComponent(state.camera.id)}/lease`,{method:'POST'});if(state.generation!==generation){api(`/api/cameras/${encodeURIComponent(state.camera.id)}/lease?leaseId=${encodeURIComponent(lease.leaseId)}`,{method:'DELETE'}).catch(()=>{});return;}state.leaseId=lease.leaseId; } catch(error){ if(error.status===401){showAuth(false);return;} }
+    if(!state.leaseId)try { const lease=await api(`/api/cameras/${encodeURIComponent(state.camera.id)}/lease`,{method:'POST'});if(state.generation!==generation){api(`/api/cameras/${encodeURIComponent(state.camera.id)}/lease?leaseId=${encodeURIComponent(lease.leaseId)}`,{method:'DELETE'}).catch(()=>{});return;}state.leaseId=lease.leaseId;scheduleLeaseRenewal(state); } catch(error){ if(error.status===401){showAuth(false);return;} }
+    else if(!state.leaseTimer)scheduleLeaseRenewal(state);
     if(state.generation!==generation)return;
     let reader; reader=new MediaMTXWebRTCReader({url:whepUrl(path),user:'',pass:'',token:'',onError:()=>{if(state.generation!==generation||state.reader!==reader)return;closeReader(state,false);scheduleRetry(state,path,mode);},onTrack:(event)=>{if(state.generation!==generation)return;state.video.srcObject=event.streams[0];state.video.play().catch(()=>mark(state,'loading','Zum Start antippen'));}});
     state.reader=reader; state.path=path; state.mode=mode; state.firstFrameReceived=false;
@@ -122,7 +138,7 @@
   }
   function renderCamera(camera){
     const fragment=$('#camera-template').content.cloneNode(true),card=$('.camera-card',fragment),video=$('video',fragment),snapshot=$('.card-snapshot',fragment),status=$('.card-status',fragment);
-    const state={camera,card,video,snapshot,status,wallStatus:$('.wall-camera-status',fragment),placeholder:$('.card-placeholder',fragment),lastFrame:$('.last-frame span',fragment),reader:null,retryTimer:null,startupTimer:null,snapshotTimer:null,retryCount:0,generation:0,visible:false,lastFrameAt:null,firstFrameReceived:false,mode:'low',path:camera.lowPath,leaseId:null};
+    const state={camera,card,video,snapshot,status,wallStatus:$('.wall-camera-status',fragment),placeholder:$('.card-placeholder',fragment),lastFrame:$('.last-frame span',fragment),reader:null,retryTimer:null,startupTimer:null,snapshotTimer:null,leaseTimer:null,retryCount:0,generation:0,visible:false,lastFrameAt:null,firstFrameReceived:false,mode:'low',path:camera.lowPath,leaseId:null};
     if(camera.displayMode==='snapshot')video.hidden=true;else bindVideoEvents(state);
     const authBadge=$('.auth-badge',fragment),usesCredentials=Boolean(camera.usesCredentials),authText=usesCredentials?'Mit Anmeldung':'Ohne Anmeldung';
     card.dataset.cameraId=camera.id;$('h3',fragment).textContent=camera.name;$('.wall-camera-name',fragment).textContent=camera.name;$('.source-badge',fragment).textContent=camera.source;authBadge.dataset.auth=String(usesCredentials);authBadge.setAttribute('aria-label',authText);authBadge.title=authText;$('.auth-badge-text',fragment).textContent=authText;$('.open-camera',fragment).addEventListener('click',()=>openDetail(camera.id));$('.reconnect-camera',fragment).addEventListener('click',()=>camera.displayMode==='snapshot'?startSnapshot(state,true):connect(state,camera.lowPath,'low',true));state.placeholder.addEventListener('click',()=>resumePlayback(state));video.addEventListener('click',()=>resumePlayback(state));appState.states.set(camera.id,state);$('#camera-grid').append(fragment);appState.observer.observe(card);
@@ -140,9 +156,10 @@
     $('#detail-hls-toggle').textContent=highAvailable&&!highWebRTC?'HLS-Hauptstream':'HLS-Fallback';
     const state={camera,video:$('#detail-video'),snapshot:$('#detail-snapshot'),status:$('#detail-status'),placeholder:$('#detail-message'),lastFrame:$('#detail-last-frame'),reader:null,retryTimer:null,startupTimer:null,snapshotTimer:null,retryCount:0,generation:0,lastFrameAt:null,firstFrameReceived:false,mode,path:initialPath,returnFocus,leaseId:null};appState.detail=state;
     const isSnapshot=camera.displayMode==='snapshot';$('#detail-video').hidden=isSnapshot;$('#detail-snapshot').hidden=!isSnapshot;$('#detail-fallback').hidden=isSnapshot||!highWebRTC;$('#detail-hls-toggle').hidden=isSnapshot;$('#detail-audio').hidden=isSnapshot||!camera.features?.audio;$('#detail-video').muted=true;$('#detail-audio').textContent='Audio einschalten';loadDetailFunctions(camera);$('#detail-back').focus();if(isSnapshot)startSnapshot(state,true);else{bindVideoEvents(state);connect(state,initialPath,mode,true);}
+
   }
   async function loadDetailFunctions(camera){
-    appState.ptz=null;$('#detail-functions').hidden=true;$('#ptz-panel').hidden=true;$('#ptz-presets').replaceChildren(new Option('Preset auswählen',''));
+    appState.ptz=null;$('#detail-functions').hidden=true;$('#ptz-panel').hidden=true;$('#ptz-presets').replaceChildren(new Option('Preset auswählen',''));$$('[data-ptz-x]').forEach(button=>button.disabled=false);
     if(!appState.permissions.controlCameras||!camera.features?.ptz)return;
     try{
       const data=await api(`/api/admin/cameras/${encodeURIComponent(camera.id)}/capabilities`),profile=data.profiles?.[0];
@@ -150,6 +167,7 @@
       if(!data.available||!data.ptz?.supported||!profile?.token)return;
       appState.ptz={cameraId:camera.id,profileToken:profile.token,moving:false,pending:false,stopRequested:false,operation:0,stopSentFor:0,movePromise:null};
       $('#detail-functions').hidden=false;$('#ptz-panel').hidden=false;$('#ptz-state').textContent='Bereit';
+      const axes=new Set(data.ptz.axes||['x','y','zoom']);$$('[data-ptz-x]').forEach(button=>{const needsX=Number(button.dataset.ptzX||0)!==0,needsY=Number(button.dataset.ptzY||0)!==0,needsZoom=Number(button.dataset.ptzZ||0)!==0;button.disabled=(needsX&&!axes.has('x'))||(needsY&&!axes.has('y'))||(needsZoom&&!axes.has('zoom'));});
       (data.ptz.presets||[]).forEach(item=>$('#ptz-presets').add(new Option(item.name||'Preset',item.token)));
     }catch{}
   }
@@ -198,6 +216,11 @@
   }
   function connectionBadges(camera){
     const active=camera.activeCredentials||{},draft=camera.draftCredentials||{},live=camera.liveAccess||{};
+    if(camera.externalSource){
+      return live.ready
+        ? '<span class="connection-badge live-auth" data-state="verified">Live · CZEview-Anmeldung aktiv</span>'
+        : '<span class="connection-badge" data-state="offline">Bereit · startet beim Öffnen</span>';
+    }
     const activeHasAuth=Boolean(active.onvif||active.stream),draftHasAuth=Boolean(draft.onvif||draft.stream);
     const badges=[];
     badges.push(`<span class="connection-badge" data-state="${escapeHtml(camera.connectionState||'missing')}">Aktiv ${camera.activeRevision?`R${camera.activeRevision}`:'fehlt'} · ${activeHasAuth?'Zugang gespeichert':'ohne Zugang'}</span>`);
@@ -220,12 +243,13 @@
   function renderManage(){
     const list=$('#manage-list');list.replaceChildren();appState.adminCameras.forEach((camera)=>{
       const row=document.createElement('article');row.className='manage-row';row.dataset.id=camera.id;
-      row.innerHTML=`<button class="drag-handle" aria-label="${escapeHtml(camera.name)} verschieben">↕</button><div><h3>${escapeHtml(camera.name)}</h3><div class="manage-meta"><span>${escapeHtml(camera.source)}</span><span>${escapeHtml(camera.manufacturer||'')}</span><span>${escapeHtml(camera.codec.toUpperCase())}</span><span>${camera.enabled?'Aktiv':'Deaktiviert'}</span></div><div class="connection-statuses" aria-label="Verbindungsstatus">${connectionBadges(camera)}</div></div><div class="row-actions"><button data-connection>Verbindung</button><button data-capabilities>Funktionen</button><button data-rollback>Letzte Verbindung</button><button data-move="up" aria-label="Nach oben">↑</button><button data-move="down" aria-label="Nach unten">↓</button><button data-rename>Umbenennen</button><button data-toggle>${camera.enabled?'In App deaktivieren':'In App aktivieren'}</button>${camera.managed?'<button data-remove>Entfernen</button>':''}</div>`;
+      const connectionActions=camera.externalSource?'<button data-capabilities>Funktionen</button>':`<button data-connection>Verbindung</button><button data-capabilities>Funktionen</button><button data-rollback>Letzte Verbindung</button>`;
+      row.innerHTML=`<button class="drag-handle" aria-label="${escapeHtml(camera.name)} verschieben">↕</button><div><h3>${escapeHtml(camera.name)}</h3><div class="manage-meta"><span>${escapeHtml(camera.source)}</span><span>${escapeHtml(camera.manufacturer||'')}</span><span>${escapeHtml(camera.codec.toUpperCase())}</span><span>${camera.enabled?'Aktiv':'Deaktiviert'}</span></div><div class="connection-statuses" aria-label="Verbindungsstatus">${connectionBadges(camera)}</div></div><div class="row-actions">${connectionActions}<button data-move="up" aria-label="Nach oben">↑</button><button data-move="down" aria-label="Nach unten">↓</button><button data-rename>Umbenennen</button><button data-toggle>${camera.enabled?'In App deaktivieren':'In App aktivieren'}</button>${camera.managed?'<button data-remove>Entfernen</button>':''}</div>`;
       $('.drag-handle',row).addEventListener('pointerdown',beginDrag);
       $$('[data-move]',row).forEach(button=>button.addEventListener('click',()=>moveCamera(camera.id,button.dataset.move==='up'?-1:1)));
-      $('[data-connection]',row).addEventListener('click',()=>openConnectionDialog(camera));
-      $('[data-capabilities]',row).addEventListener('click',()=>openCapabilities(camera));
-      $('[data-rollback]',row).addEventListener('click',()=>rollbackConnection(camera));
+      $('[data-connection]',row)?.addEventListener('click',()=>openConnectionDialog(camera));
+      $('[data-capabilities]',row)?.addEventListener('click',()=>openCapabilities(camera));
+      $('[data-rollback]',row)?.addEventListener('click',()=>rollbackConnection(camera));
       $('[data-rename]',row).addEventListener('click',()=>renameCamera(camera));$('[data-toggle]',row).addEventListener('click',()=>toggleCamera(camera));$('[data-remove]',row)?.addEventListener('click',()=>removeCamera(camera));list.append(row);
     });
   }

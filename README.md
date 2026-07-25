@@ -2,8 +2,10 @@
 
 Lokales, herstellerneutrales Multi-Kamera-Gateway für ONVIF-, RTSP-, HLS-,
 Snapshot- und MJPEG-Kameras. Camera Hub verbindet standardisierte Kameras mit
-einer geschützten PWA und WebRTC/HLS-Ausgabe. Proprietäre Hersteller-Plug-ins
-und Cloud-Dienste werden nicht benötigt.
+einer geschützten PWA und WebRTC/HLS-Ausgabe. Der Kern benötigt keine
+proprietären Hersteller-Plug-ins oder Cloud-Dienste. Für CZEview-Akku-Kameras
+steht zusätzlich eine ausdrücklich optionale, cloud-unterstützte P2P-Brücke
+bereit.
 
 > **Version 1.0.0:** Dieser erste Release ist für einen selbst verwalteten
 > privaten Docker-Host vorgesehen. Vor einer Erreichbarkeit über das Internet
@@ -34,6 +36,19 @@ Stoppen und Status:
 .\stop-zmodo-pwa.ps1
 .\status-zmodo-pwa.ps1
 ```
+
+## Optionale CZEview-Akku-Kamera
+
+Die untersuchte CZEview-Kamera besitzt keinen nachgewiesenen lokalen
+RTSP-/ONVIF-Dienst. Camera Hub kann ihr bestätigtes H.264-Livebild stattdessen
+über eine optionale, bedarfsgesteuerte P2P-Brücke beziehen. Die Kamera wird
+erst beim Öffnen der Ansicht geweckt und nach Freigabe des Leases nicht
+dauerhaft wach gehalten.
+
+Einrichtung, Sicherheitsgrenzen, Ein-Sitzungs-Hinweis und technische Evidenz
+stehen in [CZEVIEW-INTEGRATION.md](CZEVIEW-INTEGRATION.md). Ohne vollständige
+CZEview-Einträge in der ignorierten `poc/.env` wird die Brücke nicht gestartet;
+alle bisherigen Kamerawege bleiben unverändert.
 
 ## Zugriff über die private IP
 
@@ -74,8 +89,11 @@ verwendet werden:
 ```
 
 PWA, API, HLS und WHEP teilen dann beispielsweise `http://192.168.1.50:8090/`.
-MediaMTX-Webports bleiben intern; zusätzlich zu TCP 8090 ist nur der
-WebRTC-Medienport 8189/TCP+UDP für das konkrete private Netz freigegeben.
+Das Startskript leitet das für HTTP-Verwaltung zulässige Netz aus der bestätigten
+LAN-Adresse und ihrer aktiven Präfixlänge ab; innerhalb dieses ausdrücklich
+ausgewählten privaten Netzes besteht keine HTTPS-Pflicht. MediaMTX-Webports
+bleiben intern; zusätzlich zu TCP 8090 ist nur der WebRTC-Medienport
+8189/TCP+UDP für das konkrete private Netz freigegeben.
 Dieser Modus besitzt transportbedingt keinen Secure Context und sollte nicht
 über öffentliche oder unzuverlässige Netze angeboten werden.
 
@@ -101,6 +119,8 @@ Dieser Modus besitzt transportbedingt keinen Secure Context und sollte nicht
   Analytics und Geräteausgänge; nur vorhandene PTZ-Presets können aufgerufen
   werden, Gegensprechen und physische Ausgänge bleiben deaktiviert;
 - H.264-Stream-Copy, bedarfsgesteuerter H.265-/MJPEG-Kompatibilitätsweg;
+- optionale CZEview-P2P-Brücke mit Wake-on-View, erneuerbarem Lease und
+  nachgewiesenem horizontalem Schwenk;
 - dynamischer Relay-Manager ohne Docker-Socket;
 - Detection-Adaptervertrag, standardmäßig deaktiviert;
 - Service Worker ausschließlich für statische App-Dateien.
@@ -150,8 +170,17 @@ Rollbackpfad; ihre Quelladressen gehören nur in die ignorierte `.env`.
 Camera Hub verändert weder Kamera-, Receiver-, Router- noch
 Aufzeichnungseinstellungen.
 
-## Lizenz
+## Akku-/Cloudkameras
 
+Akkukameras werden nicht automatisch wie dauerhaft erreichbare RTSP-Kameras
+behandelt. Die erste Schlaf-/Wach-Untersuchung fand keinen lokalen
+Standarddienst. Der anschließend mit dem bekannten CZEview-Konto praktisch
+bestätigte P2P-Zugriff ermöglicht heute eine lease-basierte, optionale
+Integration. Der historische Zwischenstand steht in
+[CZE-PROVIDER-INVESTIGATION.md](CZE-PROVIDER-INVESTIGATION.md), der aktuelle
+Betrieb in [CZEVIEW-INTEGRATION.md](CZEVIEW-INTEGRATION.md).
+
+## Lizenz
 Camera Hub wird unter der [GNU Affero General Public License v3.0](LICENSE)
 bereitgestellt. Die Software kommt ohne Gewährleistung; Details stehen in der
 Lizenzdatei.

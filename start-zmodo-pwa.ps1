@@ -79,6 +79,7 @@ $configValue = './mediamtx.yml'
 $browserUrl = 'http://127.0.0.1:8090/'
 $privateHttpNetworks = ''
 
+
 if ($Mode -ne 'Loopback') {
     if (-not $LanAddress) {
         throw 'Für HttpTest und Https muss -LanAddress mit der privaten Host-IP angegeben werden.'
@@ -92,6 +93,7 @@ if ($Mode -ne 'Loopback') {
     }
     $bindAddress = $LanAddress
     $privateHttpNetworks = Get-IPv4NetworkCidr -Address $address.IPAddress -PrefixLength $address.PrefixLength
+
 }
 
 switch ($Mode) {
@@ -129,8 +131,10 @@ $sourceVariables = [ordered]@{
     CAMERA_GARAGE_SOURCE_URI = 'garage'
 }
 $staticAuthenticatedIds = [Collections.Generic.List[string]]::new()
+$localValues = @{}
+$czeviewEnabled = $false
+$czeviewSecretPath = Join-Path $secretDirectory 'czeview_credentials.json'
 if (Test-Path -LiteralPath $localEnv) {
-    $localValues = @{}
     foreach ($line in [IO.File]::ReadAllLines($localEnv)) {
         $trimmed = $line.Trim()
         if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
@@ -150,16 +154,48 @@ if (Test-Path -LiteralPath $localEnv) {
             # Die eigentliche Compose-Validierung meldet eine ungültige Quelle.
         }
     }
+    $czeviewRequired = @(
+        'CZEVIEW_USEREMAIL',
+        'CZEVIEW_PASSWORD',
+        'CZEVIEW_COUNTRY_CODE',
+        'CZEVIEW_PHONE_CODE',
+        'CZEVIEW_SOURCE_APP'
+    )
+    $czeviewEnabled = @(
+        $czeviewRequired | Where-Object {
+            [string]::IsNullOrWhiteSpace([string]$localValues[$_])
+        }
+    ).Count -eq 0
+    if ($czeviewEnabled) {
+        $czeviewSecret = [ordered]@{}
+        foreach ($key in $czeviewRequired + @('CZEVIEW_DEVICE_SERIAL', 'CZEVIEW_CAMERA_NAME')) {
+            $value = [string]$localValues[$key]
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                $czeviewSecret[$key] = $value.Trim().Trim('"').Trim("'")
+            }
+        }
+        [IO.File]::WriteAllText(
+            $czeviewSecretPath,
+            ($czeviewSecret | ConvertTo-Json -Compress),
+            [Text.UTF8Encoding]::new($false)
+        )
+    }
 }
+if (-not $czeviewEnabled) {
+    [IO.File]::WriteAllText($czeviewSecretPath, '{}', [Text.UTF8Encoding]::new($false))
+}
+Initialize-LocalSecret $czeviewSecretPath
 $staticAuthenticatedValue = ($staticAuthenticatedIds | Sort-Object -Unique) -join ','
 $envText = "ZMODO_BIND_IP=$bindAddress`nZMODO_MEDIAMTX_CONFIG=$configValue`nCAMERA_HUB_ALLOW_OWNER_SETUP=$allowOwnerSetup`nCAMERA_HUB_STATIC_AUTHENTICATED_IDS=$staticAuthenticatedValue`nCAMERA_HUB_PRIVATE_HTTP_NETWORKS=$privateHttpNetworks`n"
+
 [IO.File]::WriteAllText($composeEnv, $envText, [Text.UTF8Encoding]::new($false))
-$state = [ordered]@{ mode=$Mode; bindAddress=$bindAddress; composeFiles=$composeFiles; browserUrl=$browserUrl }
+$state = [ordered]@{ mode=$Mode; bindAddress=$bindAddress; composeFiles=$composeFiles; browserUrl=$browserUrl; czeviewEnabled=$czeviewEnabled }
 [IO.File]::WriteAllText($modeFile, ($state | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
 
 $composeArgs = @()
 if (Test-Path -LiteralPath $localEnv) { $composeArgs += @('--env-file', $localEnv) }
 $composeArgs += @('--env-file', $composeEnv)
+if ($czeviewEnabled) { $composeArgs += @('--profile', 'czeview') }
 foreach ($file in $composeFiles) { $composeArgs += @('-f', $file) }
 $upArgs = @($composeArgs) + @('up', '-d', '--build', '--remove-orphans')
 Push-Location $poc
@@ -193,6 +229,7 @@ $health | Select-Object status,mediaServer,sourcesReady,sourcesExpected | Format
 if (-not $allLive) { Write-Warning 'Der Stack läuft, aber noch nicht alle Kameraquellen melden live.' }
 Write-Output "PWA: $browserUrl"
 Write-Output "Bindung: $bindAddress (Modus: $Mode)"
+Write-Output "CZEview-Brücke: $(if ($czeviewEnabled) { 'aktiviert' } else { 'nicht konfiguriert' })"
 if ($Mode -eq 'Https') {
     $projectRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
         Where-Object DisplayName -like 'PKWS-ZMODO-PWA-*')

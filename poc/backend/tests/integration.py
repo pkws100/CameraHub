@@ -485,7 +485,79 @@ try:
     with urllib.request.urlopen(internal, timeout=5) as response:
         detection = json.load(response)
     assert detection["enabled"] is False and detection["cameras"]
-    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter")
+
+    external_payload = {
+        "name": "CZEview Test", "path": "czeview-low", "sourceLabel": "CZEview P2P · bei Bedarf",
+        "codec": "h264", "manufacturer": "CZEview (Plattformmarke)",
+        "model": "API-Gerätetyp 5", "detailQuality": "2304 × 1296 · H.264 (verifiziert)",
+        "width": 2304, "height": 1296, "controlUrl": "http://czeview-bridge:8787", "ptzAxes": ["x"],
+    }
+    external_request = urllib.request.Request(
+        base + "/internal/v1/external-cameras/czeview",
+        data=json.dumps(external_payload).encode(),
+        method="PUT",
+        headers={"Authorization": f"Bearer {camera_app.INTERNAL_TOKEN}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(external_request, timeout=5) as response:
+        registered = json.load(response)
+    assert registered["registered"] and registered["path"] == "czeview-low"
+    external_camera = next(item for item in request("/api/cameras")["cameras"] if item["id"] == "czeview")
+    assert external_camera["externalSource"] and external_camera["onDemand"] and external_camera["usesCredentials"]
+    assert external_camera["features"]["ptz"] and external_camera["features"]["ptzAxes"] == ["x"]
+    external_admin = next(item for item in request("/api/admin/cameras")["cameras"] if item["id"] == "czeview")
+    assert external_admin["relayMode"] == "external-on-demand"
+    external_capabilities = request("/api/admin/cameras/czeview/capabilities")
+    assert external_capabilities["available"] and external_capabilities["profiles"][0]["token"] == "external"
+    assert external_capabilities["ptz"]["axes"] == ["x"]
+    external_ptz_calls = []
+    original_external_control = camera_app.external_control_request
+    camera_app.external_control_request = lambda _camera, action, direction=None: external_ptz_calls.append((action, direction))
+    assert request(
+        "/api/admin/cameras/czeview/ptz/move", "POST",
+        {"x": -.3, "y": 0, "zoom": 0, "profileToken": "external"}, csrf,
+    )["ok"]
+    assert request(
+        "/api/admin/cameras/czeview/ptz/stop", "POST",
+        {"profileToken": "external"}, csrf,
+    )["ok"]
+    rejected_axis = request(
+        "/api/admin/cameras/czeview/ptz/move", "POST",
+        {"x": 0, "y": .3, "zoom": 0, "profileToken": "external"}, csrf, 409,
+    )
+    assert rejected_axis["detail"] == "ptz-axis-not-supported"
+    assert external_ptz_calls == [("start", "left"), ("stop", None)]
+    camera_app.external_control_request = original_external_control
+    lease = request("/api/cameras/czeview/lease", "POST", csrf=csrf)
+    renewed = request(f"/api/cameras/czeview/lease?leaseId={lease['leaseId']}", "PUT", csrf=csrf)
+    assert renewed["expiresIn"] == 90
+    lease_request = urllib.request.Request(
+        base + "/internal/v1/external-cameras/czeview/lease",
+        headers={"Authorization": f"Bearer {camera_app.INTERNAL_TOKEN}"},
+    )
+    with urllib.request.urlopen(lease_request, timeout=5) as response:
+        lease_state = json.load(response)
+    assert lease_state["active"] and lease_state["leaseCount"] == 1
+    request(f"/api/cameras/czeview/lease?leaseId={lease['leaseId']}", "DELETE", csrf=csrf, expected=204)
+    with urllib.request.urlopen(lease_request, timeout=5) as response:
+        assert json.load(response)["active"] is False
+    original_media_paths = camera_app.media_paths
+    original_subprocess_run = camera_app.subprocess.run
+    camera_app.media_paths = lambda: ({"czeview-low": {"ready": True}}, True)
+    camera_app.subprocess.run = lambda *_args, **_kwargs: type(
+        "PreviewResult", (), {"returncode": 0, "stdout": b"\xff\xd8test-jpeg"}
+    )()
+    try:
+        preview = camera_app.preview("czeview", None)
+        assert preview.body.startswith(b"\xff\xd8")
+        assert "czeview" not in camera_app.LEASES
+    finally:
+        camera_app.subprocess.run = original_subprocess_run
+    camera_app.media_paths = lambda: ({}, True)
+    health_payload = json.loads(camera_app.healthz().body)
+    camera_app.media_paths = original_media_paths
+    assert health_payload["sourcesExpected"] == 6
+
+    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases")
 finally:
     server.should_exit = True
     thread.join(timeout=5)
