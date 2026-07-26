@@ -1,8 +1,8 @@
 (() => {
   'use strict';
-  const VERSION = '1.2.0';
+  const VERSION = '1.3.0';
   const RETRY_DELAYS = [2000, 5000, 15000];
-  const appState = { csrf:'', user:null, permissions:{}, users:[], cameras:[], adminCameras:[], cloudAccounts:[], cloudProviders:[], displayProfiles:[], profileCameraOptions:[], displayProfileId:'', renderedDisplayProfileId:'', profileDraftOrder:[], cameraRequest:0, states:new Map(), observer:null, detail:null, suspended:false, wallMode:false, wallControlsTimer:null, elevatedUntil:0, scanTimer:null, scanId:null, discoveryItems:[], discoveryResultScanId:null, discoveryDevice:null, connectionCamera:null, connectionRollout:null, connectionRequest:0, capabilityCamera:null, capabilityRequest:0, ptz:null };
+  const appState = { csrf:'', user:null, permissions:{}, users:[], cameras:[], adminCameras:[], cloudAccounts:[], cloudProviders:[], displayProfiles:[], profileCameraOptions:[], displayProfileId:'', renderedDisplayProfileId:'', profileDraftOrder:[], cameraRequest:0, states:new Map(), observer:null, detail:null, suspended:false, wallMode:false, wallControlsTimer:null, elevatedUntil:0, scanTimer:null, scanId:null, discoveryItems:[], discoveryResultScanId:null, discoveryDevice:null, connectionCamera:null, connectionRollout:null, connectionRequest:0, capabilityCamera:null, capabilityRequest:0, ptz:null, webhookTargets:[], restoreValidated:false };
   const $ = (selector, root=document) => root.querySelector(selector);
   const $$ = (selector, root=document) => [...root.querySelectorAll(selector)];
   const mediaHost = location.hostname;
@@ -37,12 +37,24 @@
   function requestReauth(){
     if(reauthPromise)return reauthPromise;
     $('#reauth-error').textContent=''; $('#reauth-password').value=''; $('#reauth-dialog').showModal();
-    reauthPromise=new Promise((resolve,reject)=>{reauthResolver=(ok)=>{reauthResolver=null;reauthPromise=null;ok?resolve():reject(new Error('reauth-cancelled'));};});
+    reauthPromise=new Promise((resolve,reject)=>{reauthResolver=(ok)=>{reauthResolver=null;reauthPromise=null;ok?resolve():reject(new ApiError(0,'reauth-cancelled'));};});
     return reauthPromise;
   }
   async function adminApi(path,options={}){
     try { return await api(path,options); }
     catch(error){ if(error.code!=='reauth-required') throw error; await requestReauth(); return api(path,options); }
+  }
+  async function ownerFetch(path,options={}){
+    const send=async()=>{
+      const method=options.method||'GET',headers=new Headers(options.headers||{});
+      if(!['GET','HEAD'].includes(method)&&appState.csrf)headers.set('X-CSRF-Token',appState.csrf);
+      if(options.body&&!((options.body) instanceof FormData)&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');
+      const response=await fetch(path,{...options,headers,credentials:'same-origin',cache:'no-store'});
+      if(response.ok)return response;
+      let data={};try{data=await response.clone().json();}catch{}
+      throw new ApiError(response.status,data.detail||`http-${response.status}`);
+    };
+    try{return await send();}catch(error){if(error.code!=='reauth-required')throw error;await requestReauth();return send();}
   }
 
   function openMenu(){
@@ -61,7 +73,7 @@
     $$('.view').forEach((view)=>{ const active=view.dataset.view===name; view.hidden=!active; view.classList.toggle('is-active',active); });
     $$('.nav-item').forEach((item)=>item.classList.toggle('is-active',item.dataset.view===name));
     closeMenu(false); history.replaceState(null,'',name==='overview'?liveHash('overview'):`#${name}`);const heading=$(`#view-${name} h2`);if(heading){heading.tabIndex=-1;heading.focus({preventScroll:true});}
-    if(name==='discover') loadCloudAccounts(); if(name==='manage') loadAdminCameras(); if(name==='zones') loadZoneCamera(); if(name==='users') loadUsers(); if(name==='system') refreshDiagnostics();
+    if(name==='discover') loadCloudAccounts(); if(name==='manage') loadAdminCameras(); if(name==='zones') loadZoneCamera(); if(name==='users') loadUsers(); if(name==='system'){refreshDiagnostics();loadOperations();}
   }
 
   function revealWallControls(){
@@ -115,8 +127,13 @@
     try{await state.video.play();}catch{mark(state,'loading','Zum Start antippen');}
   }
   function stampFrame(state){ state.lastFrameAt=new Date().toISOString(); if(state.lastFrame) state.lastFrame.textContent=relativeTime(state.lastFrameAt); }
-  function watchFrames(state,generation){ if(state.generation!==generation||!state.reader)return; state.firstFrameReceived=true; clearTimeout(state.startupTimer); stampFrame(state); mark(state,'live',state.mode==='high'?'Live · Hauptstream':'Live'); if('requestVideoFrameCallback'in state.video)state.video.requestVideoFrameCallback(()=>watchFrames(state,generation)); }
-  function scheduleRetry(state,path,mode){ if(state.retryTimer)return; if(appState.suspended||state.retryCount>=RETRY_DELAYS.length){mark(state,'offline','Erneut verbinden');return;} const delay=RETRY_DELAYS[state.retryCount++]; mark(state,'loading',`Neuer Versuch in ${delay/1000} s`); state.retryTimer=setTimeout(()=>connect(state,path,mode),delay); }
+  function reportAvailability(state,value,code='stream-unavailable'){
+    if(!state?.camera?.onDemand||state.availabilityReported===value||!appState.csrf)return;
+    state.availabilityReported=value;
+    api(`/api/cameras/${encodeURIComponent(state.camera.id)}/availability`,{method:'POST',body:JSON.stringify({state:value,code})}).catch(()=>{state.availabilityReported='';});
+  }
+  function watchFrames(state,generation){ if(state.generation!==generation||!state.reader)return; state.firstFrameReceived=true; clearTimeout(state.startupTimer); stampFrame(state); mark(state,'live',state.mode==='high'?'Live · Hauptstream':'Live'); reportAvailability(state,'recovered'); if('requestVideoFrameCallback'in state.video)state.video.requestVideoFrameCallback(()=>watchFrames(state,generation)); }
+  function scheduleRetry(state,path,mode){ if(state.retryTimer)return; if(appState.suspended||state.retryCount>=RETRY_DELAYS.length){mark(state,'offline','Erneut verbinden');reportAvailability(state,'failure');return;} const delay=RETRY_DELAYS[state.retryCount++]; mark(state,'loading',`Neuer Versuch in ${delay/1000} s`); state.retryTimer=setTimeout(()=>connect(state,path,mode),delay); }
   async function connect(state,path,mode='low',manual=false){
     closeReader(state,false); if(manual)state.retryCount=0; if(appState.suspended||!navigator.onLine){mark(state,'offline','Netzwerk offline');return;}
     if(state===appState.detail){$('#detail-video').hidden=false; $('#detail-hls').hidden=true; $('#detail-hls').removeAttribute('src');}
@@ -235,12 +252,12 @@
     const profileId=$('#profile-editor-select').value,profile=appState.displayProfiles.find(item=>item.id===profileId);if(!profile||!window.confirm(`Anzeigeprofil „${profile.name}“ löschen?`))return;
     try{await api(`/api/display-profiles/${encodeURIComponent(profileId)}`,{method:'DELETE'});const wasActive=appState.displayProfileId===profileId;await loadDisplayProfiles();$('#display-profile-dialog').close();if(wasActive)await selectDisplayProfile('');toast('Anzeigeprofil gelöscht');}catch(error){$('#display-profile-error').textContent=`Löschen fehlgeschlagen: ${error.code}`;}
   }
-  async function copyText(value){
-    try{if(navigator.clipboard&&window.isSecureContext)await navigator.clipboard.writeText(value);else{const area=document.createElement('textarea');area.value=value;area.style.position='fixed';area.style.opacity='0';document.body.append(area);area.select();document.execCommand('copy');area.remove();}toast('Profil-Link kopiert');}catch{window.prompt('Profil-Link kopieren',value);}
+  async function copyText(value,successText='In Zwischenablage kopiert',promptText='Wert kopieren'){
+    try{if(navigator.clipboard&&window.isSecureContext)await navigator.clipboard.writeText(value);else{const area=document.createElement('textarea');area.value=value;area.style.position='fixed';area.style.opacity='0';document.body.append(area);area.select();document.execCommand('copy');area.remove();}toast(successText);}catch{window.prompt(promptText,value);}
   }
   function copyProfileLink(view){
     const profileId=$('#profile-editor-select').value;if(!profileId)return;
-    copyText(`${location.origin}${location.pathname}#${view}?profile=${encodeURIComponent(profileId)}`);
+    copyText(`${location.origin}${location.pathname}#${view}?profile=${encodeURIComponent(profileId)}`,'Profil-Link kopiert','Profil-Link kopieren');
   }
   function renderCamera(camera){
     const fragment=$('#camera-template').content.cloneNode(true),card=$('.camera-card',fragment),video=$('video',fragment),snapshot=$('.card-snapshot',fragment),status=$('.card-status',fragment);
@@ -263,7 +280,7 @@
     if(!appState.cameras.length){const empty=document.createElement('div');empty.className='empty-state';empty.innerHTML='<h3>Keine Kameras in dieser Ansicht</h3><p>Wählen Sie ein anderes Profil oder bearbeiten Sie die Kamerazuordnung.</p>';$('#camera-grid').append(empty);}
     appState.renderedDisplayProfileId=appState.displayProfileId;await loadHealth();if(request===appState.cameraRequest)populateZoneSelect();return true;
   }
-  async function loadHealth(){try{const data=await api('/api/health');$('#system-state').dataset.state='live';$('#system-state span').textContent='Lokales Gateway online';data.cameras?.forEach((item)=>{const state=appState.states.get(item.camera);if(!state||state.reader||state.camera.displayMode==='snapshot')return;if(item.lastFrameAt)state.lastFrame.textContent=relativeTime(item.lastFrameAt);if(item.state!=='live')mark(state,'offline','Kamera nicht erreichbar');});}catch{$('#system-state').dataset.state='offline';$('#system-state span').textContent='Gateway nicht erreichbar';}}
+  async function loadHealth(){try{const data=await api('/api/health');$('#system-state').dataset.state='live';$('#system-state span').textContent='Lokales Gateway online';const labels={connecting:['loading','Verbindung wird aufgebaut'],sleeping:['loading','Bereit · startet beim Öffnen'],offline:['offline','Kamera nicht erreichbar'],'media-server-offline':['offline','Medienserver nicht erreichbar'],unknown:['loading','Status unbekannt']};data.cameras?.forEach((item)=>{const state=appState.states.get(item.camera);if(!state||state.reader||state.camera.displayMode==='snapshot')return;if(item.lastFrameAt)state.lastFrame.textContent=relativeTime(item.lastFrameAt);if(item.state!=='live'){const [status,text]=labels[item.state]||labels.unknown;mark(state,status,text);}});}catch{$('#system-state').dataset.state='offline';$('#system-state span').textContent='Gateway nicht erreichbar';}}
   function openDetail(id){
     const camera=appState.cameras.find(item=>item.id===id),tile=appState.states.get(id);if(!camera||!tile)return;const returnFocus=document.activeElement;closeReader(tile);$$('.view').forEach(view=>view.hidden=true);$('#detail').hidden=false;history.replaceState(null,'',`#camera/${camera.id}`);
     const highAvailable=camera.highPath!==camera.lowPath,highWebRTC=highAvailable&&camera.highWebRTCCompatible!==false,initialPath=highWebRTC?camera.highPath:camera.lowPath,mode=highWebRTC?'high':'low';
@@ -702,13 +719,63 @@
   function renderZoneList(){const list=$('#zone-list');list.replaceChildren();zoneState.zones.forEach((zone,index)=>{const row=document.createElement('div');row.className='zone-entry';row.dataset.kind=zone.kind;row.innerHTML=`<i class="zone-color"></i><span>${escapeHtml(zone.name)} · ${zone.kind==='alarm'?'Alarm':'Alarmfrei'}</span><label class="zone-enabled"><input type="checkbox" ${zone.enabled?'checked':''}> Aktiv</label><button aria-label="Zone löschen">×</button>`;$('input',row).addEventListener('change',event=>{zone.enabled=event.currentTarget.checked;drawZones();});$('button',row).addEventListener('click',()=>{zoneState.zones.splice(index,1);renderZoneList();drawZones();});list.append(row);});}
   async function saveZones(){const button=$('#zone-save');if(button.disabled)return;button.disabled=true;button.setAttribute('aria-busy','true');try{const result=await adminApi(`/api/admin/cameras/${encodeURIComponent(zoneState.cameraId)}/zones`,{method:'PUT',body:JSON.stringify({revision:zoneState.revision,zones:zoneState.zones})});zoneState.revision=result.revision;toast('Zonen wurden gespeichert');}catch(error){toast(`Speichern fehlgeschlagen: ${error.code}`);}finally{button.disabled=false;button.removeAttribute('aria-busy');}}
 
+  const EVENT_STATUS_LABELS={pending:'Wird beobachtet',open:'Offen',resolved:'Behoben'};
+  function eventTime(value){return value?new Intl.DateTimeFormat('de-DE',{dateStyle:'short',timeStyle:'short'}).format(new Date(value)):'–';}
+  function renderEvents(data){
+    const summary=data.summary||{};$('#event-summary').innerHTML=`<span><strong>${Number(summary.open||0)}</strong> offen</span><span><strong>${Number(summary.pending||0)}</strong> in Beobachtung</span><span><strong>${Number(summary.resolved||0)}</strong> behoben</span>`;
+    const list=$('#event-list');list.replaceChildren();
+    for(const event of data.events||[]){
+      const article=document.createElement('article');article.className='event-entry';article.dataset.status=event.status;
+      article.innerHTML=`<i class="event-marker" aria-hidden="true"></i><div><h4>${escapeHtml(event.title)}</h4><p>${escapeHtml(event.description)}</p><p><strong>Empfehlung:</strong> ${escapeHtml(event.recommendation)}</p><div class="event-meta"><span>Beginn ${escapeHtml(eventTime(event.startedAt))}</span><span>Zuletzt ${escapeHtml(eventTime(event.lastSeenAt))}</span>${event.cameraId?`<span>Kamera ${escapeHtml(event.cameraName||event.cameraId)}</span>`:''}${event.accountId?`<span>Cloud-Konto ${escapeHtml(event.accountLabel||event.accountId)}</span>`:''}</div></div><span class="event-state">${escapeHtml(EVENT_STATUS_LABELS[event.status]||event.status)}</span>`;
+      list.append(article);
+    }
+    if(!list.children.length)list.innerHTML='<div class="empty-state"><h3>Keine Ereignisse</h3><p>Für diesen Filter liegen keine Betriebsereignisse vor.</p></div>';
+  }
+  async function loadEvents(){try{renderEvents(await api(`/api/events?status=${encodeURIComponent($('#event-filter').value)}`));}catch(error){$('#event-list').innerHTML=`<div class="empty-state">Ereignisse konnten nicht geladen werden: ${escapeHtml(error.code)}</div>`;}}
+  function renderWebhooks(){
+    const list=$('#webhook-list');list.replaceChildren();
+    for(const target of appState.webhookTargets){
+      const article=document.createElement('article');article.className='webhook-entry';article.dataset.enabled=String(target.enabled);
+      const delivery=target.lastDeliveryStatus?`Letzte Zustellung: ${target.lastDeliveryStatus}${target.lastErrorCode?` · ${target.lastErrorCode}`:''}`:'Noch keine Zustellung';
+      article.innerHTML=`<div><h4>${escapeHtml(target.label)}</h4><code>${escapeHtml(target.url)}</code><p>${target.enabled?'Aktiv':'Deaktiviert'} · ${escapeHtml(delivery)}</p></div><div class="webhook-actions"><button data-action="test">Testen</button><button data-action="edit">Bearbeiten</button><button data-action="toggle">${target.enabled?'Deaktivieren':'Aktivieren'}</button><button data-action="rotate">Geheimnis erneuern</button><button data-action="delete">Löschen</button></div>`;
+      $('[data-action=test]',article).addEventListener('click',()=>testWebhook(target));$('[data-action=edit]',article).addEventListener('click',()=>openWebhookDialog(target));$('[data-action=toggle]',article).addEventListener('click',()=>toggleWebhook(target));$('[data-action=rotate]',article).addEventListener('click',()=>rotateWebhookSecret(target));$('[data-action=delete]',article).addEventListener('click',()=>deleteWebhook(target));list.append(article);
+    }
+    if(!list.children.length)list.innerHTML='<div class="empty-state">Noch keine Webhooks eingerichtet.</div>';
+  }
+  async function loadWebhooks(){if(!appState.permissions.manageUsers)return;try{const data=await api('/api/owner/webhooks');appState.webhookTargets=data.targets||[];renderWebhooks();}catch(error){$('#webhook-list').innerHTML=`<div class="empty-state">Webhooks konnten nicht geladen werden: ${escapeHtml(error.code)}</div>`;}}
+  function loadOperations(){loadEvents();loadWebhooks();}
+  function showWebhookSecret(secret){$('#webhook-secret').textContent=secret;$('#webhook-secret-dialog').showModal();}
+  function openWebhookDialog(target=null){
+    const form=$('#webhook-form');form.reset();form.elements.targetId.value=target?.id||'';form.elements.label.value=target?.label||'';form.elements.url.value=target?.url||'';form.elements.enabled.checked=target?.enabled??true;
+    const selected=new Set(target?.eventTypes||[]);$$('input[name=eventType]',form).forEach(input=>input.checked=!target||selected.has('*')||selected.has(input.value));$('#webhook-title').textContent=target?'Webhook bearbeiten':'Webhook hinzufügen';$('#webhook-error').textContent='';$('#webhook-dialog').showModal();
+  }
+  async function saveWebhook(event){
+    event.preventDefault();const form=event.currentTarget,targetId=form.elements.targetId.value,eventTypes=$$('input[name=eventType]:checked',form).map(input=>input.value);if(!eventTypes.length){$('#webhook-error').textContent='Bitte mindestens einen Ereignistyp auswählen.';return;}
+    const payload={label:form.elements.label.value.trim(),url:form.elements.url.value.trim(),enabled:form.elements.enabled.checked,eventTypes};
+    try{const result=await adminApi(targetId?`/api/owner/webhooks/${encodeURIComponent(targetId)}`:'/api/owner/webhooks',{method:targetId?'PATCH':'POST',body:JSON.stringify(payload)});$('#webhook-dialog').close();await loadWebhooks();toast('Webhook gespeichert');if(result.secret)showWebhookSecret(result.secret);}catch(error){if(error.code!=='reauth-cancelled')$('#webhook-error').textContent=`Speichern fehlgeschlagen: ${error.code}`;}
+  }
+  async function testWebhook(target){try{const result=await adminApi(`/api/owner/webhooks/${encodeURIComponent(target.id)}/test`,{method:'POST'});toast(result.status==='delivered'?'Testnachricht zugestellt':`Test eingeplant · ${result.errorCode||result.status}`);await loadWebhooks();}catch(error){if(error.code!=='reauth-cancelled')toast(`Webhook-Test fehlgeschlagen: ${error.code}`);}}
+  async function toggleWebhook(target){try{await adminApi(`/api/owner/webhooks/${encodeURIComponent(target.id)}`,{method:'PATCH',body:JSON.stringify({enabled:!target.enabled})});await loadWebhooks();}catch(error){if(error.code!=='reauth-cancelled')toast(`Änderung fehlgeschlagen: ${error.code}`);}}
+  async function rotateWebhookSecret(target){if(!confirm(`Webhook-Geheimnis für „${target.label}“ erneuern? Das bisherige Geheimnis wird sofort ungültig.`))return;try{const result=await adminApi(`/api/owner/webhooks/${encodeURIComponent(target.id)}/rotate-secret`,{method:'POST'});showWebhookSecret(result.secret);}catch(error){if(error.code!=='reauth-cancelled')toast(`Erneuern fehlgeschlagen: ${error.code}`);}}
+  async function deleteWebhook(target){if(!confirm(`Webhook „${target.label}“ löschen?`))return;try{await adminApi(`/api/owner/webhooks/${encodeURIComponent(target.id)}`,{method:'DELETE'});await loadWebhooks();toast('Webhook gelöscht');}catch(error){if(error.code!=='reauth-cancelled')toast(`Löschen fehlgeschlagen: ${error.code}`);}}
+  async function createBackup(event){
+    event.preventDefault();const form=event.currentTarget,passphrase=form.elements.passphrase.value;if(passphrase!==form.elements.confirmation.value){$('#backup-error').textContent='Die Passphrasen stimmen nicht überein.';return;}const submit=form.querySelector('[type=submit]');submit.disabled=true;$('#backup-error').textContent='';
+    try{const response=await ownerFetch('/api/owner/backups',{method:'POST',body:JSON.stringify({passphrase})}),blob=await response.blob(),disposition=response.headers.get('Content-Disposition')||'',match=/filename="([^"]+)"/.exec(disposition),name=match?.[1]||`camera-hub-${VERSION}.pkwsbackup`,url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=name;document.body.append(link);link.click();link.remove();URL.revokeObjectURL(url);form.reset();$('#backup-dialog').close();toast('Verschlüsselte Sicherung heruntergeladen');}catch(error){if(error.code!=='reauth-cancelled')$('#backup-error').textContent=`Sicherung fehlgeschlagen: ${error.code}`;}finally{submit.disabled=false;}
+  }
+  function restoreFormData(form){const data=new FormData();data.append('archive',form.elements.archive.files[0]);data.append('passphrase',form.elements.passphrase.value);return data;}
+  function resetRestoreValidation(){appState.restoreValidated=false;$('#restore-preview').hidden=true;$('#restore-preview').textContent='';$('#restore-submit').textContent='Archiv prüfen';}
+  async function restoreBackup(event){
+    event.preventDefault();const form=event.currentTarget,submit=$('#restore-submit');if(!form.elements.archive.files[0])return;submit.disabled=true;$('#restore-error').textContent='';
+    try{if(!appState.restoreValidated){const response=await ownerFetch('/api/owner/backups/validate',{method:'POST',body:restoreFormData(form)}),result=await response.json();$('#restore-preview').textContent=`Gültige Sicherung · Camera Hub ${result.manifest.appVersion} · Schema ${result.schemaVersion} · erstellt ${eventTime(result.manifest.createdAt)}`;$('#restore-preview').hidden=false;appState.restoreValidated=true;submit.textContent='Jetzt wiederherstellen';return;}if(!confirm('Diese Sicherung jetzt übernehmen? Alle angemeldeten Geräte werden anschließend abgemeldet.'))return;const response=await ownerFetch('/api/owner/backups/restore',{method:'POST',body:restoreFormData(form)}),result=await response.json();toast(`Wiederhergestellt · Rückfallpunkt ${result.restorePoint}`);setTimeout(()=>location.reload(),1200);}catch(error){resetRestoreValidation();if(error.code!=='reauth-cancelled')$('#restore-error').textContent=`Wiederherstellung fehlgeschlagen: ${error.code}`;}finally{submit.disabled=false;}
+  }
+
   function refreshDiagnostics(){const video=document.createElement('video');$('#diag-secure').textContent=window.isSecureContext?'Ja':'Nein';$('#diag-sw').textContent='serviceWorker'in navigator?(navigator.serviceWorker.controller?'Aktiv':'Verfügbar'):'Nicht verfügbar';$('#diag-webrtc').textContent='RTCPeerConnection'in window?'Verfügbar':'Nicht verfügbar';$('#diag-hls').textContent=video.canPlayType('application/vnd.apple.mpegurl')?'Nativ':'Gateway-Fallback';$('#diag-backend').textContent=appState.csrf?'Angemeldet':'Nicht angemeldet';$('#diag-origin').textContent=location.origin;$('#diag-version').textContent=VERSION;}
 
   function bindEvents(){
     $('#menu-button').addEventListener('click',()=>$('#app-menu').classList.contains('is-open')?closeMenu():openMenu());$('#menu-close').addEventListener('click',()=>closeMenu());$('#menu-backdrop').addEventListener('click',()=>closeMenu());$$('.nav-item').forEach(item=>item.addEventListener('click',()=>showView(item.dataset.view)));
     document.addEventListener('keydown',(event)=>{if(event.key==='Escape'&&appState.wallMode){event.preventDefault();exitWallMode();return;}if(event.key==='Escape'&&$('#app-menu').classList.contains('is-open'))closeMenu();if(event.key==='Tab'&&$('#app-menu').classList.contains('is-open')){const focusable=$$('button:not([disabled])',$('#app-menu'));const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}}});
     $$('dialog').forEach(dialog=>dialog.addEventListener('cancel',event=>{if(dialog.dataset.static==='true'){event.preventDefault();return;}if(dialog.id==='reauth-dialog')reauthResolver?.(false);}));
-    $('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const setup=$('#auth-dialog').dataset.setup==='true',body={username:$('#auth-user').value,password:$('#auth-password').value};try{const result=await api(setup?'/api/auth/setup':'/api/auth/login',{method:'POST',body:JSON.stringify(body)});applyAccess(result);$('#auth-password').value='';$('#auth-dialog').close();$('#app').hidden=false;await loadDisplayProfiles();applyDisplayProfileFromHash();await loadCameras();refreshDiagnostics();if(hashRoute().view==='wall')enterWallMode(false);}catch(error){$('#auth-error').textContent=error.code==='login-failed'?'Anmeldung fehlgeschlagen.':`Fehler: ${error.code}`;}});
+    $('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const setup=$('#auth-dialog').dataset.setup==='true',body={username:$('#auth-user').value,password:$('#auth-password').value};try{const result=await api(setup?'/api/auth/setup':'/api/auth/login',{method:'POST',body:JSON.stringify(body)});applyAccess(result);$('#auth-password').value='';$('#auth-dialog').close();$('#app').hidden=false;await loadDisplayProfiles();applyDisplayProfileFromHash();await loadCameras();refreshDiagnostics();const requestedView=hashRoute().view;if(requestedView==='wall')enterWallMode(false);else if(['discover','manage','zones','users','system'].includes(requestedView))showView(requestedView);}catch(error){$('#auth-error').textContent=error.code==='login-failed'?'Anmeldung fehlgeschlagen.':`Fehler: ${error.code}`;}});
     $('#reauth-form').addEventListener('submit',async(event)=>{event.preventDefault();try{const result=await api('/api/auth/reauth',{method:'POST',body:JSON.stringify({password:$('#reauth-password').value})});appState.elevatedUntil=result.elevatedUntil;$('#reauth-dialog').close();reauthResolver?.(true);}catch{$('#reauth-error').textContent='Passwort nicht bestätigt.';}});$$('[data-close-dialog]').forEach(button=>button.addEventListener('click',()=>{const dialog=button.closest('dialog');dialog.close();if(dialog.id==='reauth-dialog')reauthResolver?.(false);}));
     $('#logout').addEventListener('click',async()=>{clearTimeout(appState.scanTimer);appState.scanTimer=null;appState.scanId=null;exitWallMode();try{await api('/api/auth/logout',{method:'POST'});}catch{}appState.csrf='';appState.user=null;appState.permissions={};suspend();$('#app').hidden=true;showAuth(false);closeMenu(false);});
     const enterWall=$('#enter-wall-mode'),exitWall=$('#exit-wall-mode');if(enterWall&&exitWall){enterWall.addEventListener('click',()=>enterWallMode(true));exitWall.addEventListener('click',()=>exitWallMode());}document.addEventListener('pointermove',revealWallControls,{passive:true});document.addEventListener('touchstart',revealWallControls,{passive:true});document.addEventListener('fullscreenchange',()=>{if(appState.wallMode&&!document.fullscreenElement)exitWallMode({leaveFullscreen:false});});
@@ -720,6 +787,7 @@
     $('#configure-netatmo').addEventListener('click',()=>{const form=$('#netatmo-config-form');form.reset();form.elements.redirectUri.value=`${location.origin}/api/cloud/oauth/netatmo/callback`;$('#netatmo-config-error').textContent='';$('#netatmo-config-dialog').showModal();});$('#netatmo-config-form').addEventListener('submit',saveNetatmoConfig);
     $('#add-netatmo-account').addEventListener('click',()=>{$('#netatmo-account-form').reset();$('#netatmo-account-error').textContent='';$('#netatmo-account-dialog').showModal();});$('#netatmo-account-form').addEventListener('submit',authorizeNetatmo);
     $('#add-user').addEventListener('click',()=>{$('#user-form').reset();$('#user-error').textContent='';$('#user-dialog').showModal();});$('#user-form').addEventListener('submit',createUser);$('#password-form').addEventListener('submit',saveUserPassword);$('#change-own-password').addEventListener('click',()=>{$('#own-password-form').reset();$('#own-password-error').textContent='';$('#own-password-dialog').showModal();});$('#own-password-form').addEventListener('submit',changeOwnPassword);
+    $('#event-filter').addEventListener('change',loadEvents);$('#create-backup').addEventListener('click',()=>{$('#backup-form').reset();$('#backup-error').textContent='';$('#backup-dialog').showModal();});$('#backup-form').addEventListener('submit',createBackup);$('#restore-backup').addEventListener('click',()=>{$('#restore-form').reset();$('#restore-error').textContent='';resetRestoreValidation();$('#restore-dialog').showModal();});$('#restore-form').addEventListener('submit',restoreBackup);for(const name of ['input','change'])$('#restore-form').addEventListener(name,resetRestoreValidation);$('#add-webhook').addEventListener('click',()=>openWebhookDialog());$('#webhook-form').addEventListener('submit',saveWebhook);$('#copy-webhook-secret').addEventListener('click',()=>copyText($('#webhook-secret').textContent,'Geheimnis kopiert','Geheimnis kopieren'));
     document.addEventListener('visibilitychange',()=>document.hidden?suspend():resume());window.addEventListener('pagehide',suspend);window.addEventListener('pageshow',resume);window.addEventListener('focus',resume);window.addEventListener('blur',stopPTZ);window.addEventListener('offline',suspend);window.addEventListener('online',resume);window.addEventListener('hashchange',()=>applyLiveHashNavigation().catch(()=>toast('Ansicht konnte nicht gewechselt werden')));
   }
 

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import base64
 import http.cookiejar
+import hashlib
+import hmac
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from urllib.parse import parse_qs, unquote, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -878,7 +883,381 @@ try:
     finally:
         camera_app.netatmo_api_json = original_netatmo_api_json
 
-    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration personal-display-profiles profile-order profile-isolation camera-disable-retention camera-delete-cascade ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist")
+    with camera_app.connect() as conn:
+        assert conn.execute("SELECT 1 FROM schema_migrations WHERE version=8").fetchone()
+        for table in ("system_events", "webhook_targets", "webhook_deliveries"):
+            assert conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+
+    viewer_client = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+    )
+    request(
+        "/api/auth/login",
+        "POST",
+        {"username": "viewer1", "password": replacement_viewer_password},
+        opener=viewer_client,
+    )
+    assert request("/api/events", opener=viewer_client)["summary"]["open"] == 0
+    assert request("/api/owner/webhooks", expected=403, opener=viewer_client)["detail"] == "insufficient-role"
+    webhook = request(
+        "/api/owner/webhooks",
+        "POST",
+        {
+            "label": "Lokaler Test",
+            "url": "http://127.0.0.1:18099/events",
+            "enabled": True,
+            "eventTypes": ["camera.offline"],
+        },
+        csrf,
+        expected=201,
+    )
+    assert webhook["secret"] and webhook["url"].startswith("http://127.0.0.1")
+    with camera_app.connect() as conn:
+        stored_target = conn.execute(
+            "SELECT * FROM webhook_targets WHERE id=?", (webhook["id"],)
+        ).fetchone()
+        assert camera_app.decrypt_text(stored_target["secret_ct"]) == webhook["secret"]
+        assert webhook["secret"].encode() not in open(os.environ["DATABASE_PATH"], "rb").read()
+
+    incident_now = time.time()
+    assert camera_app.observe_incident(
+        "test-camera:offline",
+        True,
+        event_type="camera.offline",
+        severity="warning",
+        title="Testkamera nicht erreichbar",
+        description="Testausfall",
+        recommendation="Test prüfen",
+        camera_id="garten",
+        observed_at=incident_now,
+    ) == "pending"
+    assert camera_app.observe_incident(
+        "test-camera:offline",
+        True,
+        event_type="camera.offline",
+        severity="warning",
+        title="Testkamera nicht erreichbar",
+        description="Testausfall",
+        recommendation="Test prüfen",
+        camera_id="garten",
+        observed_at=incident_now + camera_app.INCIDENT_THRESHOLD_SECONDS - 1,
+    ) == "pending"
+    assert camera_app.observe_incident(
+        "test-camera:offline",
+        True,
+        event_type="camera.offline",
+        severity="warning",
+        title="Testkamera nicht erreichbar",
+        description="Testausfall",
+        recommendation="Test prüfen",
+        camera_id="garten",
+        observed_at=incident_now + camera_app.INCIDENT_THRESHOLD_SECONDS,
+    ) == "open"
+    with camera_app.connect() as conn:
+        event_row = conn.execute(
+            "SELECT * FROM system_events WHERE dedupe_key='test-camera:offline'"
+        ).fetchone()
+        assert event_row["status"] == "open"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM system_events WHERE dedupe_key='test-camera:offline'"
+        ).fetchone()[0] == 1
+        delivery = conn.execute(
+            "SELECT * FROM webhook_deliveries WHERE event_id=? AND event_status='open'",
+            (event_row["id"],),
+        ).fetchone()
+        assert delivery
+
+    captured_webhooks = []
+
+    class TestWebhookResponse:
+        status = 204
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class TestWebhookOpener:
+        def open(self, outgoing, timeout=0):
+            captured_webhooks.append((outgoing, timeout))
+            return TestWebhookResponse()
+
+    original_webhook_opener = camera_app.NO_REDIRECT_OPENER
+    camera_app.NO_REDIRECT_OPENER = TestWebhookOpener()
+    try:
+        assert camera_app.dispatch_due_webhooks(now_epoch=int(time.time()) + 1) == 1
+        outgoing, timeout = captured_webhooks[-1]
+        payload = outgoing.data
+        timestamp = outgoing.get_header("X-camerahub-timestamp")
+        signature = outgoing.get_header("X-camerahub-signature")
+        expected_signature = hmac.new(
+            webhook["secret"].encode(),
+            timestamp.encode() + b"." + payload,
+            hashlib.sha256,
+        ).hexdigest()
+        assert timeout == 5 and signature == f"sha256={expected_signature}"
+        assert b"password" not in payload.lower() and b"token" not in payload.lower()
+        assert camera_app.observe_incident(
+            "test-camera:offline",
+            False,
+            event_type="camera.offline",
+            severity="warning",
+            title="Testkamera wieder erreichbar",
+            description="Test behoben",
+            recommendation="Keine Aktion",
+            camera_id="garten",
+            observed_at=incident_now + camera_app.INCIDENT_THRESHOLD_SECONDS + 1,
+        ) == "resolved"
+        assert camera_app.dispatch_due_webhooks(now_epoch=int(time.time()) + 2) == 1
+        assert json.loads(captured_webhooks[-1][0].data)["status"] == "resolved"
+    finally:
+        camera_app.NO_REDIRECT_OPENER = original_webhook_opener
+
+    retry_delivery_id, retry_now = str(uuid.uuid4()), int(time.time())
+    with camera_app.connect() as conn:
+        conn.execute(
+            """INSERT INTO webhook_deliveries(
+               id,target_id,event_id,event_status,attempt,status,next_attempt_at,payload_json,
+               created_at,updated_at) VALUES(?,?,?,'test',0,'pending',?,?,?,?)""",
+            (
+                retry_delivery_id,
+                webhook["id"],
+                str(uuid.uuid4()),
+                retry_now,
+                '{"type":"system.webhook-test"}',
+                camera_app.now_iso(),
+                camera_app.now_iso(),
+            ),
+        )
+
+    class FailingWebhookOpener:
+        def open(self, *_args, **_kwargs):
+            raise OSError("test endpoint unavailable")
+
+    camera_app.NO_REDIRECT_OPENER = FailingWebhookOpener()
+    try:
+        assert camera_app.dispatch_due_webhooks(
+            now_epoch=retry_now, delivery_id=retry_delivery_id
+        ) == 0
+    finally:
+        camera_app.NO_REDIRECT_OPENER = original_webhook_opener
+    with camera_app.connect() as conn:
+        retry_delivery = conn.execute(
+            "SELECT * FROM webhook_deliveries WHERE id=?", (retry_delivery_id,)
+        ).fetchone()
+        assert retry_delivery["status"] == "pending"
+        assert retry_delivery["attempt"] == 1
+        assert retry_delivery["next_attempt_at"] == retry_now + 60
+        assert retry_delivery["claim_token"] is None
+
+    concurrent_delivery_id = str(uuid.uuid4())
+    with camera_app.connect() as conn:
+        conn.execute(
+            """INSERT INTO webhook_deliveries(
+               id,target_id,event_id,event_status,attempt,status,next_attempt_at,payload_json,
+               created_at,updated_at) VALUES(?,?,?,'test',0,'pending',?,?,?,?)""",
+            (
+                concurrent_delivery_id,
+                webhook["id"],
+                str(uuid.uuid4()),
+                retry_now,
+                '{"type":"system.webhook-concurrency-test"}',
+                camera_app.now_iso(),
+                camera_app.now_iso(),
+            ),
+        )
+    concurrent_calls = []
+    concurrent_lock = threading.Lock()
+
+    class SlowWebhookOpener:
+        def open(self, *_args, **_kwargs):
+            with concurrent_lock:
+                concurrent_calls.append(time.time())
+            time.sleep(0.1)
+            return TestWebhookResponse()
+
+    camera_app.NO_REDIRECT_OPENER = SlowWebhookOpener()
+    try:
+        dispatch_threads = [
+            threading.Thread(
+                target=camera_app.dispatch_due_webhooks,
+                kwargs={"now_epoch": retry_now, "delivery_id": concurrent_delivery_id},
+            )
+            for _ in range(2)
+        ]
+        for dispatch_thread in dispatch_threads:
+            dispatch_thread.start()
+        for dispatch_thread in dispatch_threads:
+            dispatch_thread.join(timeout=5)
+        assert len(concurrent_calls) == 1
+    finally:
+        camera_app.NO_REDIRECT_OPENER = original_webhook_opener
+
+    on_demand_row = None
+    with camera_app.connect() as conn:
+        on_demand_row = conn.execute(
+            "SELECT * FROM cameras WHERE id=?", (imported_cloud["id"],)
+        ).fetchone()
+    paths_before = camera_app.media_paths
+    camera_app.media_paths = lambda: ({}, True)
+    try:
+        monitor_result = camera_app.monitor_once(observed_at=time.time())
+        assert on_demand_row["id"] not in monitor_result
+        assert camera_app.camera_status(on_demand_row, {}, True)["state"] == "sleeping"
+    finally:
+        camera_app.media_paths = paths_before
+
+    media_incident_now = time.time()
+    for observed in (
+        media_incident_now,
+        media_incident_now + camera_app.INCIDENT_THRESHOLD_SECONDS,
+    ):
+        camera_app.observe_incident(
+            "camera:garten:offline",
+            True,
+            event_type="camera.offline",
+            severity="warning",
+            title="Garten nicht erreichbar",
+            description="Testausfall",
+            recommendation="Test prüfen",
+            camera_id="garten",
+            observed_at=observed,
+        )
+    camera_app.media_paths = lambda: ({}, False)
+    try:
+        camera_app.monitor_once(observed_at=media_incident_now + 301)
+    finally:
+        camera_app.media_paths = paths_before
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            """SELECT status FROM system_events
+               WHERE dedupe_key='camera:garten:offline' ORDER BY created_at DESC"""
+        ).fetchone()["status"] == "open"
+
+    cloud_incident_now = time.time()
+    with camera_app.connect() as conn:
+        conn.execute(
+            "UPDATE cloud_accounts SET status='reauth-required' WHERE id=?",
+            (cloud_account["id"],),
+        )
+    camera_app.monitor_once(observed_at=cloud_incident_now)
+    camera_app.monitor_once(
+        observed_at=cloud_incident_now + camera_app.INCIDENT_THRESHOLD_SECONDS
+    )
+    with camera_app.connect() as conn:
+        conn.execute(
+            "UPDATE cloud_accounts SET status='pending' WHERE id=?",
+            (cloud_account["id"],),
+        )
+    camera_app.monitor_once(observed_at=cloud_incident_now + 301)
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT status FROM system_events WHERE dedupe_key=?",
+            (f"cloud-account:{cloud_account['id']}:auth",),
+        ).fetchone()["status"] == "open"
+        conn.execute(
+            "UPDATE cloud_accounts SET status='active' WHERE id=?",
+            (cloud_account["id"],),
+        )
+    camera_app.monitor_once(observed_at=cloud_incident_now + 302)
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT status FROM system_events WHERE dedupe_key=?",
+            (f"cloud-account:{cloud_account['id']}:auth",),
+        ).fetchone()["status"] == "resolved"
+
+    backup_passphrase = "Portable-Backup-Test-42!"
+    backup_archive = camera_app.create_backup_archive(backup_passphrase)
+    assert backup_passphrase.encode() not in backup_archive
+    assert len(backup_archive) <= camera_app.BACKUP_ENVELOPE_MAX_BYTES
+    assert json.loads(backup_archive)["kdf"]["n"] == camera_app.BACKUP_SCRYPT_N
+    manifest, backup_database, source_key = camera_app.decode_backup_archive(
+        backup_archive, backup_passphrase
+    )
+    assert manifest["schemaVersion"] == 8 and manifest["appVersion"] == "1.3.0"
+    assert len(backup_database) <= camera_app.BACKUP_DATABASE_MAX_BYTES
+    assert camera_app.BACKUP_EXPANDED_MAX_BYTES > len(base64.b64encode(backup_database))
+    for invalid_archive, invalid_passphrase, expected_code in (
+        (backup_archive, "Falsche-Passphrase-42!", "backup-passphrase-or-data-invalid"),
+        (backup_archive[:-20] + b"corrupted-archive-data", backup_passphrase, "backup-passphrase-or-data-invalid"),
+        (
+            json.dumps({**json.loads(backup_archive), "version": 999}).encode(),
+            backup_passphrase,
+            "backup-version-unsupported",
+        ),
+    ):
+        try:
+            camera_app.decode_backup_archive(invalid_archive, invalid_passphrase)
+            raise AssertionError("invalid backup unexpectedly accepted")
+        except camera_app.HTTPException as error:
+            assert error.detail == expected_code
+
+    original_application_key = camera_app.AES_KEY
+    camera_app.AES_KEY = hashlib.sha256(b"portable-target-key").digest()
+    try:
+        _, portable_candidate = camera_app.validate_backup_database(
+            backup_database, source_key
+        )
+        with sqlite3.connect(portable_candidate) as portable:
+            portable.row_factory = sqlite3.Row
+            portable_account = portable.execute(
+                "SELECT auth_payload_ct FROM cloud_accounts WHERE id=?",
+                (cloud_account["id"],),
+            ).fetchone()
+            assert json.loads(
+                camera_app.crypt_text_with_key(
+                    portable_account["auth_payload_ct"],
+                    camera_app.AES_KEY,
+                    decrypt=True,
+                )
+            )["password"] == replacement_secret
+        portable_candidate.unlink(missing_ok=True)
+    finally:
+        camera_app.AES_KEY = original_application_key
+
+    with camera_app.connect() as conn:
+        original_camera_name = conn.execute(
+            "SELECT name FROM cameras WHERE id='garten'"
+        ).fetchone()["name"]
+        conn.execute("UPDATE cameras SET name='Nicht im Backup' WHERE id='garten'")
+    _, interrupted_candidate = camera_app.validate_backup_database(backup_database, source_key)
+    original_audit = camera_app.audit
+
+    def failing_restore_audit(conn, actor_id, action, target_type, target_id=None):
+        if action == "system.backup.restored":
+            raise OSError("simulated restore interruption")
+        return original_audit(conn, actor_id, action, target_type, target_id)
+
+    camera_app.audit = failing_restore_audit
+    try:
+        try:
+            camera_app.restore_backup_database(
+                interrupted_candidate, session["user"]["id"]
+            )
+            raise AssertionError("interrupted restore unexpectedly succeeded")
+        except OSError:
+            pass
+    finally:
+        camera_app.audit = original_audit
+        interrupted_candidate.unlink(missing_ok=True)
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT name FROM cameras WHERE id='garten'"
+        ).fetchone()["name"] == "Nicht im Backup"
+    _, restore_candidate = camera_app.validate_backup_database(backup_database, source_key)
+    restore_point = camera_app.restore_backup_database(restore_candidate, session["user"]["id"])
+    assert restore_point.startswith("before-restore-") and not restore_candidate.exists()
+    with camera_app.connect() as conn:
+        assert conn.execute("SELECT name FROM cameras WHERE id='garten'").fetchone()["name"] == original_camera_name
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    assert request("/api/auth/state")["authenticated"] is False
+    session = request("/api/auth/login", "POST", {"username": "owner", "password": password})
+    csrf = session["csrfToken"]
+
+    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration personal-display-profiles profile-order profile-isolation camera-disable-retention camera-delete-cascade ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist operations-schema event-threshold event-dedup event-recovery passive-on-demand-monitor hmac-webhooks backup-encryption backup-corruption backup-restore restore-session-revocation")
 finally:
     server.should_exit = True
     thread.join(timeout=5)

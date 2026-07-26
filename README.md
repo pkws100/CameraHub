@@ -7,7 +7,7 @@ proprietären Hersteller-Plug-ins. Für CZEview-Akku-Kameras und freigegebene
 Netatmo-Sicherheitskameras stehen getrennte, bedarfsgesteuerte Cloud-Adapter
 bereit.
 
-> **Version 1.2.0:** Dieser Release ist für einen selbst verwalteten
+> **Version 1.3.0:** Dieser Release ist für einen selbst verwalteten
 > privaten Docker-Host vorgesehen. Vor einer Erreichbarkeit über das Internet
 > müssen WireGuard, ein HTTPS-Reverse-Proxy und eine zusätzliche
 > Netzsegmentierung eingerichtet werden.
@@ -65,6 +65,26 @@ Die Netatmo-App-Einrichtung und die bewusst begrenzten Rechte beschreibt
 Der geprüfte Gesamtstand der Mehrkonto-Verwaltung ist in
 [CLOUD-ACCOUNT-COMPLETION-REPORT.md](CLOUD-ACCOUNT-COMPLETION-REPORT.md)
 dokumentiert.
+
+## Betriebssicherheit
+
+Unter **Systemstatus** zeigt Camera Hub dauerhafte Betriebsereignisse mit
+offenen, beobachteten und behobenen Störungen. Lokale Dauerstreams werden
+passiv über MediaMTX ausgewertet. Akku- und On-Demand-Kameras werden von der
+Überwachung nicht selbstständig geweckt; nur ein tatsächlich fehlgeschlagener,
+vom Benutzer angeforderter Zugriff erzeugt ein Signal.
+
+Eigentümer können dort portable Sicherungen herunterladen und wiederherstellen.
+Das Archiv wird mit einer mindestens zwölf Zeichen langen, ausschließlich vom
+Betreiber verwahrten Passphrase verschlüsselt. Vor der Wiederherstellung werden
+Archiv, Prüfsumme und Datenbankschema geprüft und ein lokaler Rückfallpunkt
+angelegt. Alle Sitzungen werden danach beendet.
+
+Ebenfalls im Eigentümerbereich lassen sich Webhook-Ziele verwalten. Meldungen
+werden mit HMAC-SHA-256 signiert, folgen keinen Weiterleitungen und enthalten
+keine Zugangsdaten oder internen Stream-Adressen. Einzelheiten zu Archivformat,
+Signaturprüfung und Fehlerverhalten stehen in
+[OPERATIONS.md](OPERATIONS.md).
 
 ## Zugriff über die private IP
 

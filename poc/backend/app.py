@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import hashlib
+import hmac
+import io
 import ipaddress
 import json
 import os
@@ -11,6 +14,7 @@ import secrets
 import socket
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -25,7 +29,8 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from argon2 import PasswordHasher
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import Depends, FastAPI, Header, HTTPException, Request as FastAPIRequest, Response
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request as FastAPIRequest, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -62,6 +67,24 @@ REAUTH_ATTEMPTS: dict[str, list[float]] = {}
 NETATMO_TOKEN_LOCKS: dict[str, threading.Lock] = {}
 NETATMO_STREAM_CACHE: dict[str, tuple[float, list[str]]] = {}
 CLOUD_PROBE_LEASES: dict[str, dict] = {}
+OPERATIONS_STOP = threading.Event()
+OPERATIONS_THREAD: threading.Thread | None = None
+OPERATIONS_INTERVAL_SECONDS = int(os.environ.get("OPERATIONS_INTERVAL_SECONDS", "30"))
+INCIDENT_THRESHOLD_SECONDS = int(os.environ.get("INCIDENT_THRESHOLD_SECONDS", "300"))
+BACKUP_DATABASE_MAX_BYTES = int(
+    os.environ.get("BACKUP_DATABASE_MAX_BYTES", str(64 * 1024 * 1024))
+)
+BACKUP_EXPANDED_MAX_BYTES = int(
+    os.environ.get("BACKUP_EXPANDED_MAX_BYTES", str(96 * 1024 * 1024))
+)
+BACKUP_ENVELOPE_MAX_BYTES = int(
+    os.environ.get("BACKUP_ENVELOPE_MAX_BYTES", str(128 * 1024 * 1024))
+)
+BACKUP_SCRYPT_N = 2**17
+BACKUP_LEGACY_SCRYPT_N = 2**14
+BACKUP_FORMAT = "pkws-camera-hub-backup"
+BACKUP_VERSION = 1
+APP_VERSION = "1.3.0"
 HTTP_DIAGNOSTIC_ONLY = os.environ.get("HTTP_DIAGNOSTIC_ONLY") == "1"
 ALLOW_INSECURE_LOOPBACK_MANAGEMENT = (
     os.environ.get("ALLOW_INSECURE_LOOPBACK_MANAGEMENT") == "1"
@@ -104,11 +127,35 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+class DatabaseSession:
+    """Serialize SQLite handles so an atomic restore never races an open handle."""
+
+    def __init__(self) -> None:
+        self.connection: sqlite3.Connection | None = None
+
+    def __enter__(self) -> sqlite3.Connection:
+        DB_LOCK.acquire()
+        try:
+            self.connection = sqlite3.connect(DB_PATH, timeout=10)
+            self.connection.row_factory = sqlite3.Row
+            self.connection.execute("PRAGMA foreign_keys=ON")
+            return self.connection.__enter__()
+        except Exception:
+            DB_LOCK.release()
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            assert self.connection is not None
+            return self.connection.__exit__(exc_type, exc_value, traceback)
+        finally:
+            if self.connection is not None:
+                self.connection.close()
+            DB_LOCK.release()
+
+
+def connect() -> DatabaseSession:
+    return DatabaseSession()
 
 
 def read_secret(path: Path, test_name: str) -> bytes:
@@ -268,6 +315,37 @@ CREATE TABLE IF NOT EXISTS display_profile_cameras(
 );
 CREATE INDEX IF NOT EXISTS display_profile_cameras_camera_idx
  ON display_profile_cameras(camera_id);
+CREATE TABLE IF NOT EXISTS system_events(
+ id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL, event_type TEXT NOT NULL,
+ severity TEXT NOT NULL CHECK(severity IN ('info','warning','critical')),
+ status TEXT NOT NULL CHECK(status IN ('pending','open','resolved')),
+ camera_id TEXT REFERENCES cameras(id) ON DELETE SET NULL,
+ account_id TEXT REFERENCES cloud_accounts(id) ON DELETE SET NULL,
+ started_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, opened_at TEXT, resolved_at TEXT,
+ title TEXT NOT NULL, description TEXT NOT NULL, recommendation TEXT NOT NULL,
+ details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS system_events_active_idx
+ ON system_events(dedupe_key) WHERE status IN ('pending','open');
+CREATE INDEX IF NOT EXISTS system_events_status_idx
+ ON system_events(status,updated_at);
+CREATE TABLE IF NOT EXISTS webhook_targets(
+ id TEXT PRIMARY KEY, label TEXT NOT NULL, url TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+ event_types_json TEXT NOT NULL DEFAULT '["*"]', secret_ct TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS webhook_deliveries(
+ id TEXT PRIMARY KEY, target_id TEXT NOT NULL REFERENCES webhook_targets(id) ON DELETE CASCADE,
+ event_id TEXT, event_status TEXT NOT NULL CHECK(event_status IN ('open','resolved','test')),
+ attempt INTEGER NOT NULL DEFAULT 0,
+ status TEXT NOT NULL CHECK(status IN ('pending','delivered','failed')),
+ next_attempt_at INTEGER NOT NULL, payload_json TEXT NOT NULL,
+ last_error_code TEXT, delivered_at TEXT, claim_token TEXT, claim_expires_at INTEGER,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(target_id,event_id,event_status)
+);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_due_idx
+ ON webhook_deliveries(status,next_attempt_at);
 """
 
 
@@ -323,6 +401,18 @@ def initialize_database() -> None:
                 "INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)",
                 (now_iso(),),
             )
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=8").fetchone() is None:
+            conn.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)",
+                (now_iso(),),
+            )
+        webhook_delivery_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(webhook_deliveries)")
+        }
+        if "claim_token" not in webhook_delivery_columns:
+            conn.execute("ALTER TABLE webhook_deliveries ADD COLUMN claim_token TEXT")
+        if "claim_expires_at" not in webhook_delivery_columns:
+            conn.execute("ALTER TABLE webhook_deliveries ADD COLUMN claim_expires_at INTEGER")
         if "active_connection_id" not in camera_columns:
             conn.execute("ALTER TABLE cameras ADD COLUMN active_connection_id TEXT")
         if "last_good_connection_id" not in camera_columns:
@@ -431,7 +521,7 @@ def initialize_database() -> None:
 
 
 initialize_database()
-app = FastAPI(title="PKWS Multi Camera API", version="1.2.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="PKWS Multi Camera API", version=APP_VERSION, docs_url=None, redoc_url=None)
 
 
 class LoginRequest(BaseModel):
@@ -681,6 +771,70 @@ class CloudCameraImport(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
 
 
+class BackupRequest(BaseModel):
+    passphrase: str = Field(min_length=12, max_length=256)
+
+
+class WebhookTargetInput(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    url: str = Field(min_length=1, max_length=2048)
+    enabled: bool = True
+    eventTypes: list[str] = Field(default_factory=lambda: ["*"], min_length=1, max_length=32)
+
+    @field_validator("url")
+    @classmethod
+    def valid_webhook_url(cls, value: str) -> str:
+        parsed = urlparse(value)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("invalid webhook URL") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            raise ValueError("invalid webhook URL")
+        return value
+
+    @field_validator("eventTypes")
+    @classmethod
+    def valid_event_types(cls, values: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(value.strip() for value in values if value.strip()))
+        if not cleaned or any(not re.fullmatch(r"\*|[a-z][a-z0-9.-]{1,79}", value) for value in cleaned):
+            raise ValueError("invalid event type")
+        return cleaned
+
+
+class WebhookTargetPatch(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=80)
+    url: str | None = Field(default=None, min_length=1, max_length=2048)
+    enabled: bool | None = None
+    eventTypes: list[str] | None = Field(default=None, min_length=1, max_length=32)
+
+    @field_validator("url")
+    @classmethod
+    def valid_webhook_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return WebhookTargetInput.valid_webhook_url(value)
+
+    @field_validator("eventTypes")
+    @classmethod
+    def valid_event_types(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        return WebhookTargetInput.valid_event_types(values)
+
+
+class AvailabilitySignal(BaseModel):
+    state: Literal["failure", "recovered"]
+    code: str = Field(default="stream-unavailable", min_length=1, max_length=80, pattern=r"^[a-z0-9.-]+$")
+
+
 class ConnectionActivation(BaseModel):
     revision: int = Field(ge=1)
 
@@ -906,6 +1060,616 @@ def audit(conn: sqlite3.Connection, actor_id: str | None, action: str, target_ty
         "INSERT INTO audit_log(actor_user_id,action,target_type,target_id,created_at) VALUES(?,?,?,?,?)",
         (actor_id, action, target_type, target_id, now_iso()),
     )
+
+
+def crypt_text_with_key(value: str, key: bytes, *, decrypt: bool = False) -> str:
+    if decrypt:
+        raw = base64.urlsafe_b64decode(value)
+        return AESGCM(key).decrypt(raw[:12], raw[12:], b"zmodo-camera-secret-v1").decode()
+    nonce = secrets.token_bytes(12)
+    encrypted = AESGCM(key).encrypt(nonce, value.encode(), b"zmodo-camera-secret-v1")
+    return base64.urlsafe_b64encode(nonce + encrypted).decode()
+
+
+def derive_backup_key(passphrase: str, salt: bytes, n: int = BACKUP_SCRYPT_N) -> bytes:
+    return Scrypt(salt=salt, length=32, n=n, r=8, p=1).derive(passphrase.encode("utf-8"))
+
+
+def create_backup_archive(passphrase: str) -> bytes:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(prefix=".camera-hub-backup-", suffix=".db", dir=DB_PATH.parent)
+    os.close(descriptor)
+    temp_path = Path(temp_name)
+    try:
+        with DB_LOCK, connect() as source, sqlite3.connect(temp_path) as destination:
+            source.backup(destination)
+        with sqlite3.connect(temp_path) as backup:
+            backup.execute("PRAGMA foreign_keys=ON")
+            backup.execute("DELETE FROM sessions")
+            backup.execute("DELETE FROM oauth_states")
+            backup.commit()
+            integrity = backup.execute("PRAGMA integrity_check").fetchone()[0]
+            schema_version = int(
+                backup.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0]
+            )
+        if integrity != "ok":
+            raise HTTPException(500, "backup-integrity-check-failed")
+        database = temp_path.read_bytes()
+        if len(database) > BACKUP_DATABASE_MAX_BYTES:
+            raise HTTPException(413, "backup-database-too-large")
+        stamp = now_iso()
+        payload = {
+            "manifest": {
+                "format": BACKUP_FORMAT,
+                "version": BACKUP_VERSION,
+                "appVersion": APP_VERSION,
+                "schemaVersion": schema_version,
+                "createdAt": stamp,
+                "databaseSha256": hashlib.sha256(database).hexdigest(),
+            },
+            "database": base64.b64encode(database).decode(),
+            "sourceKey": base64.b64encode(AES_KEY).decode(),
+        }
+        compressed = gzip.compress(
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+            compresslevel=9,
+        )
+        salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
+        key = derive_backup_key(passphrase, salt)
+        aad = f"{BACKUP_FORMAT}:{BACKUP_VERSION}".encode()
+        ciphertext = AESGCM(key).encrypt(nonce, compressed, aad)
+        envelope = {
+            "format": BACKUP_FORMAT,
+            "version": BACKUP_VERSION,
+            "kdf": {"name": "scrypt", "n": BACKUP_SCRYPT_N, "r": 8, "p": 1, "salt": base64.b64encode(salt).decode()},
+            "cipher": {"name": "aes-256-gcm", "nonce": base64.b64encode(nonce).decode()},
+            "ciphertext": base64.b64encode(ciphertext).decode(),
+        }
+        archive = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+        if len(archive) > BACKUP_ENVELOPE_MAX_BYTES:
+            raise HTTPException(413, "backup-archive-too-large")
+        return archive
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def decode_backup_archive(data: bytes, passphrase: str) -> tuple[dict, bytes, bytes]:
+    if len(data) > BACKUP_ENVELOPE_MAX_BYTES:
+        raise HTTPException(413, "backup-too-large")
+    try:
+        envelope = json.loads(data.decode("utf-8"))
+        if envelope.get("format") != BACKUP_FORMAT:
+            raise HTTPException(422, "backup-format-invalid")
+        if envelope.get("version") != BACKUP_VERSION:
+            raise HTTPException(422, "backup-version-unsupported")
+        kdf, cipher = envelope["kdf"], envelope["cipher"]
+        if (
+            kdf.get("name") != "scrypt"
+            or kdf.get("n") not in {BACKUP_LEGACY_SCRYPT_N, BACKUP_SCRYPT_N}
+            or (kdf.get("r"), kdf.get("p")) != (8, 1)
+            or cipher.get("name") != "aes-256-gcm"
+        ):
+            raise HTTPException(422, "backup-crypto-invalid")
+        salt = base64.b64decode(kdf["salt"], validate=True)
+        nonce = base64.b64decode(cipher["nonce"], validate=True)
+        ciphertext = base64.b64decode(envelope["ciphertext"], validate=True)
+        if len(salt) != 16 or len(nonce) != 12:
+            raise HTTPException(422, "backup-crypto-invalid")
+        key = derive_backup_key(passphrase, salt, int(kdf["n"]))
+        compressed = AESGCM(key).decrypt(
+            nonce, ciphertext, f"{BACKUP_FORMAT}:{BACKUP_VERSION}".encode()
+        )
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed), mode="rb") as compressed_file:
+            plain_payload = compressed_file.read(BACKUP_EXPANDED_MAX_BYTES + 1)
+        if len(plain_payload) > BACKUP_EXPANDED_MAX_BYTES:
+            raise HTTPException(413, "backup-expanded-data-too-large")
+        payload = json.loads(plain_payload.decode("utf-8"))
+        manifest = payload["manifest"]
+        database = base64.b64decode(payload["database"], validate=True)
+        source_key = base64.b64decode(payload["sourceKey"], validate=True)
+        if (
+            manifest.get("format") != BACKUP_FORMAT
+            or manifest.get("version") != BACKUP_VERSION
+            or len(source_key) != 32
+            or not secrets.compare_digest(
+                str(manifest.get("databaseSha256") or ""), hashlib.sha256(database).hexdigest()
+            )
+        ):
+            raise HTTPException(422, "backup-integrity-invalid")
+        if len(database) > BACKUP_DATABASE_MAX_BYTES:
+            raise HTTPException(413, "backup-database-too-large")
+        return manifest, database, source_key
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, "backup-passphrase-or-data-invalid") from exc
+
+
+def validate_backup_database(database: bytes, source_key: bytes) -> tuple[dict, Path]:
+    descriptor, temp_name = tempfile.mkstemp(prefix=".camera-hub-restore-", suffix=".db", dir=DB_PATH.parent)
+    os.close(descriptor)
+    temp_path = Path(temp_name)
+    try:
+        temp_path.write_bytes(database)
+        with sqlite3.connect(temp_path) as candidate:
+            candidate.row_factory = sqlite3.Row
+            if candidate.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise HTTPException(422, "backup-database-invalid")
+            tables = {
+                row[0] for row in candidate.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            schema_signature = {
+                "users": {"id", "username", "password_hash", "role", "enabled"},
+                "cameras": {
+                    "id", "name", "enabled", "low_path", "high_path", "on_demand",
+                    "active_connection_id", "cloud_device_id",
+                },
+                "credentials": {"id", "username_ct", "password_ct"},
+                "camera_connections": {"id", "camera_id", "state", "address", "stream_protocol"},
+                "cloud_provider_configs": {"provider", "client_id_ct", "client_secret_ct"},
+                "cloud_accounts": {"id", "provider", "label", "status", "auth_payload_ct"},
+                "cloud_devices": {"id", "account_id", "external_id_ct"},
+                "display_profiles": {"id", "user_id", "name"},
+                "display_profile_cameras": {"profile_id", "camera_id", "position"},
+                "zones": {"id", "camera_id", "points_json"},
+                "system_events": {"id", "dedupe_key", "event_type", "status"},
+                "webhook_targets": {"id", "url", "secret_ct"},
+                "webhook_deliveries": {"id", "target_id", "status", "payload_json"},
+                "schema_migrations": {"version", "applied_at"},
+            }
+            if not set(schema_signature).issubset(tables):
+                raise HTTPException(422, "backup-schema-invalid")
+            for table, required_columns in schema_signature.items():
+                columns = {
+                    row["name"] for row in candidate.execute(f"PRAGMA table_info({table})")
+                }
+                if not required_columns.issubset(columns):
+                    raise HTTPException(422, "backup-schema-invalid")
+            migrations = {
+                int(row["version"])
+                for row in candidate.execute("SELECT version FROM schema_migrations")
+            }
+            if migrations != set(range(2, 9)):
+                if any(version > 8 for version in migrations):
+                    raise HTTPException(422, "backup-schema-newer-than-application")
+                raise HTTPException(422, "backup-migrations-incomplete")
+            schema_version = max(migrations)
+            if candidate.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise HTTPException(422, "backup-foreign-keys-invalid")
+            if schema_version > 8:
+                raise HTTPException(422, "backup-schema-newer-than-application")
+            sensitive_columns = {
+                "credentials": ("username_ct", "password_ct"),
+                "cloud_provider_configs": ("client_id_ct", "client_secret_ct"),
+                "cloud_accounts": ("auth_payload_ct",),
+                "cloud_devices": ("external_id_ct", "home_id_ct"),
+                "webhook_targets": ("secret_ct",),
+            }
+            for table, columns in sensitive_columns.items():
+                if table not in tables:
+                    continue
+                available = {
+                    row["name"] for row in candidate.execute(f"PRAGMA table_info({table})")
+                }
+                for column in columns:
+                    if column not in available:
+                        continue
+                    rows = candidate.execute(
+                        f"SELECT rowid,{column} FROM {table} WHERE {column} IS NOT NULL"
+                    ).fetchall()
+                    for row in rows:
+                        plain = crypt_text_with_key(row[column], source_key, decrypt=True)
+                        candidate.execute(
+                            f"UPDATE {table} SET {column}=? WHERE rowid=?",
+                            (crypt_text_with_key(plain, AES_KEY), row["rowid"]),
+                        )
+            if "sessions" in tables:
+                candidate.execute("DELETE FROM sessions")
+            if "oauth_states" in tables:
+                candidate.execute("DELETE FROM oauth_states")
+            candidate.commit()
+            if candidate.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise HTTPException(422, "backup-foreign-keys-invalid")
+            for table in ("users", "cameras", "cloud_accounts", "display_profiles", "zones"):
+                candidate.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        return {"schemaVersion": schema_version, "tables": len(tables)}, temp_path
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def create_restore_point() -> Path:
+    directory = DB_PATH.parent / "restore-points"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / f"before-restore-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.db"
+    with connect() as source, sqlite3.connect(path) as destination:
+        source.backup(destination)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    points = sorted(directory.glob("before-restore-*.db"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for old in points[3:]:
+        old.unlink(missing_ok=True)
+    return path
+
+
+def restore_backup_database(candidate_path: Path, actor_id: str) -> str:
+    with DB_LOCK:
+        rollback_path = create_restore_point()
+        replacement = DB_PATH.with_name(f".{DB_PATH.name}.restore-{uuid.uuid4().hex}")
+        try:
+            candidate_path.replace(replacement)
+            os.replace(replacement, DB_PATH)
+            initialize_database()
+            with connect() as conn:
+                if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise RuntimeError("restored database failed integrity check")
+                if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise RuntimeError("restored database failed foreign key check")
+                conn.execute("DELETE FROM sessions")
+                audit(conn, actor_id, "system.backup.restored", "backup")
+            return rollback_path.name
+        except Exception:
+            replacement.unlink(missing_ok=True)
+            with sqlite3.connect(rollback_path) as source, sqlite3.connect(DB_PATH) as destination:
+                source.backup(destination)
+            initialize_database()
+            raise
+
+
+def webhook_target_payload(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "label": row["label"],
+        "url": row["url"],
+        "enabled": bool(row["enabled"]),
+        "eventTypes": json.loads(row["event_types_json"]),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def system_event_payload(row: sqlite3.Row) -> dict:
+    keys = set(row.keys())
+    return {
+        "id": row["id"],
+        "type": row["event_type"],
+        "severity": row["severity"],
+        "status": row["status"],
+        "cameraId": row["camera_id"],
+        "accountId": row["account_id"],
+        "cameraName": row["camera_name"] if "camera_name" in keys else None,
+        "accountLabel": row["account_label"] if "account_label" in keys else None,
+        "startedAt": row["started_at"],
+        "lastSeenAt": row["last_seen_at"],
+        "openedAt": row["opened_at"],
+        "resolvedAt": row["resolved_at"],
+        "title": row["title"],
+        "description": row["description"],
+        "recommendation": row["recommendation"],
+        "details": json.loads(row["details_json"] or "{}"),
+    }
+
+
+def webhook_event_body(event: sqlite3.Row, status: str) -> dict:
+    return {
+        "eventId": event["id"],
+        "type": event["event_type"],
+        "status": status,
+        "severity": event["severity"],
+        "timestamp": event["resolved_at"] if status == "resolved" else event["opened_at"],
+        "cameraId": event["camera_id"],
+        "accountId": event["account_id"],
+        "title": event["title"],
+        "description": event["description"],
+    }
+
+
+def enqueue_event_webhooks(conn: sqlite3.Connection, event: sqlite3.Row, status: str) -> None:
+    payload = json.dumps(webhook_event_body(event, status), separators=(",", ":"), ensure_ascii=False)
+    stamp = now_iso()
+    for target in conn.execute("SELECT * FROM webhook_targets WHERE enabled=1"):
+        event_types = json.loads(target["event_types_json"])
+        if "*" not in event_types and event["event_type"] not in event_types:
+            continue
+        conn.execute(
+            """INSERT OR IGNORE INTO webhook_deliveries(
+               id,target_id,event_id,event_status,attempt,status,next_attempt_at,payload_json,
+               created_at,updated_at) VALUES(?,?,?,?,0,'pending',?,?,?,?)""",
+            (
+                str(uuid.uuid4()), target["id"], event["id"], status, int(time.time()),
+                payload, stamp, stamp,
+            ),
+        )
+
+
+def observe_incident(
+    dedupe_key: str,
+    failed: bool,
+    *,
+    event_type: str,
+    severity: str,
+    title: str,
+    description: str,
+    recommendation: str,
+    camera_id: str | None = None,
+    account_id: str | None = None,
+    details: dict | None = None,
+    observed_at: float | None = None,
+) -> str:
+    observed_at = observed_at if observed_at is not None else time.time()
+    stamp = datetime.fromtimestamp(observed_at, timezone.utc).isoformat()
+    with DB_LOCK, connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM system_events WHERE dedupe_key=? AND status IN ('pending','open')",
+            (dedupe_key,),
+        ).fetchone()
+        if not failed:
+            if not row:
+                return "healthy"
+            conn.execute(
+                """UPDATE system_events SET status='resolved',last_seen_at=?,resolved_at=?,
+                   updated_at=? WHERE id=?""",
+                (stamp, stamp, stamp, row["id"]),
+            )
+            resolved = conn.execute("SELECT * FROM system_events WHERE id=?", (row["id"],)).fetchone()
+            if row["status"] == "open":
+                enqueue_event_webhooks(conn, resolved, "resolved")
+            return "resolved"
+        if not row:
+            event_id = str(uuid.uuid4())
+            conn.execute(
+                """INSERT INTO system_events(
+                   id,dedupe_key,event_type,severity,status,camera_id,account_id,started_at,
+                   last_seen_at,title,description,recommendation,details_json,created_at,updated_at)
+                   VALUES(?,?,?,?, 'pending',?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    event_id, dedupe_key, event_type, severity, camera_id, account_id,
+                    stamp, stamp, title, description, recommendation,
+                    json.dumps(details or {}, separators=(",", ":")), stamp, stamp,
+                ),
+            )
+            return "pending"
+        started = datetime.fromisoformat(row["started_at"]).timestamp()
+        next_status = row["status"]
+        opened_at = row["opened_at"]
+        if (
+            row["status"] == "pending"
+            and observed_at - started >= INCIDENT_THRESHOLD_SECONDS - 0.001
+        ):
+            next_status, opened_at = "open", stamp
+        conn.execute(
+            """UPDATE system_events SET status=?,last_seen_at=?,opened_at=?,description=?,
+               recommendation=?,details_json=?,updated_at=? WHERE id=?""",
+            (
+                next_status, stamp, opened_at, description, recommendation,
+                json.dumps(details or {}, separators=(",", ":")), stamp, row["id"],
+            ),
+        )
+        if row["status"] == "pending" and next_status == "open":
+            opened = conn.execute("SELECT * FROM system_events WHERE id=?", (row["id"],)).fetchone()
+            enqueue_event_webhooks(conn, opened, "open")
+        return next_status
+
+
+def monitor_once(observed_at: float | None = None) -> dict:
+    paths, media_ok = media_paths()
+    results: dict[str, str] = {}
+    active_keys = {"media-server:offline"}
+    results["media-server"] = observe_incident(
+        "media-server:offline",
+        not media_ok,
+        event_type="media-server.offline",
+        severity="critical",
+        title="Medienserver nicht erreichbar",
+        description="Der lokale Medienserver beantwortet die Statusabfrage nicht.",
+        recommendation="MediaMTX und den Camera-Hub-Containerstatus prüfen.",
+        observed_at=observed_at,
+    )
+    with connect() as conn:
+        cameras = conn.execute("SELECT * FROM cameras WHERE enabled=1 ORDER BY position").fetchall()
+        accounts = conn.execute("SELECT * FROM cloud_accounts WHERE enabled=1").fetchall()
+    for camera in cameras:
+        if camera["on_demand"]:
+            active_keys.add(f"camera:{camera['id']}:on-demand-failure")
+        elif camera["protocol"] != "snapshot":
+            active_keys.add(f"camera:{camera['id']}:offline")
+    if media_ok:
+        for camera in cameras:
+            if camera["on_demand"]:
+                with connect() as conn:
+                    active = conn.execute(
+                        """SELECT details_json FROM system_events
+                           WHERE dedupe_key=? AND status IN ('pending','open')""",
+                        (f"camera:{camera['id']}:on-demand-failure",),
+                    ).fetchone()
+                if active:
+                    details = json.loads(active["details_json"] or "{}")
+                    results[camera["id"]] = observe_incident(
+                        f"camera:{camera['id']}:on-demand-failure",
+                        True,
+                        event_type="camera.on-demand-unavailable",
+                        severity="warning",
+                        title=f"Kamera {camera['name']} reagiert nicht",
+                        description="Ein ausdrücklich angeforderter Wake- oder Streamversuch ist weiterhin nicht erfolgreich.",
+                        recommendation="Akkustand, Funkverbindung und Cloud-Anmeldung prüfen und erneut verbinden.",
+                        camera_id=camera["id"],
+                        details=details,
+                        observed_at=observed_at,
+                    )
+                continue
+            if camera["protocol"] == "snapshot":
+                continue
+            ready = bool(paths.get(camera["low_path"], {}).get("ready"))
+            results[camera["id"]] = observe_incident(
+                f"camera:{camera['id']}:offline",
+                not ready,
+                event_type="camera.offline",
+                severity="warning",
+                title=f"Kamera {camera['name']} nicht erreichbar",
+                description="Der konfigurierte Dauerstream liefert derzeit kein Livebild.",
+                recommendation="Kamera, Netzwerkverbindung und Relay-Status prüfen.",
+                camera_id=camera["id"],
+                details={"source": camera["source_label"]},
+                observed_at=observed_at,
+            )
+    for account in accounts:
+        active_keys.add(f"cloud-account:{account['id']}:auth")
+        if account["status"] == "pending":
+            continue
+        failed = account["status"] in {"reauth-required", "error"}
+        results[f"account:{account['id']}"] = observe_incident(
+            f"cloud-account:{account['id']}:auth",
+            failed,
+            event_type="cloud-account.reauth-required",
+            severity="warning",
+            title=f"Cloud-Konto {account['label']} benötigt Aufmerksamkeit",
+            description="Die Cloud-Anmeldung ist abgelaufen oder wurde vom Anbieter abgelehnt.",
+            recommendation="Das Konto in der Kamerasuche erneut verbinden.",
+            account_id=account["id"],
+            details={"provider": account["provider"], "errorCode": account["last_error_code"]},
+            observed_at=observed_at,
+        )
+    stamp = datetime.fromtimestamp(
+        observed_at if observed_at is not None else time.time(), timezone.utc
+    ).isoformat()
+    with DB_LOCK, connect() as conn:
+        stale = conn.execute(
+            """SELECT * FROM system_events
+               WHERE status IN ('pending','open')
+                 AND event_type IN (
+                   'camera.offline','camera.on-demand-unavailable',
+                   'cloud-account.reauth-required'
+                 )"""
+        ).fetchall()
+        for event in stale:
+            if event["dedupe_key"] in active_keys:
+                continue
+            conn.execute(
+                """UPDATE system_events SET status='resolved',last_seen_at=?,resolved_at=?,
+                   updated_at=? WHERE id=?""",
+                (stamp, stamp, stamp, event["id"]),
+            )
+            if event["status"] == "open":
+                resolved = conn.execute(
+                    "SELECT * FROM system_events WHERE id=?", (event["id"],)
+                ).fetchone()
+                enqueue_event_webhooks(conn, resolved, "resolved")
+    return results
+
+
+def dispatch_due_webhooks(
+    now_epoch: int | None = None,
+    limit: int = 20,
+    delivery_id: str | None = None,
+) -> int:
+    now_epoch = now_epoch if now_epoch is not None else int(time.time())
+    completed, processed = 0, 0
+    retry_delays = (60, 300, 900, 3600)
+    while processed < limit:
+        claim_token = secrets.token_urlsafe(24)
+        claim_expires_at = int(time.time()) + 30
+        with DB_LOCK, connect() as conn:
+            query = """SELECT d.id FROM webhook_deliveries d
+                       JOIN webhook_targets t ON t.id=d.target_id
+                       WHERE d.status='pending' AND t.enabled=1 AND d.next_attempt_at<=?
+                         AND (d.claim_token IS NULL OR d.claim_expires_at<=?)"""
+            values: list = [now_epoch, int(time.time())]
+            if delivery_id:
+                query += " AND d.id=?"
+                values.append(delivery_id)
+            query += " ORDER BY d.next_attempt_at LIMIT 1"
+            candidate = conn.execute(query, values).fetchone()
+            if not candidate:
+                break
+            claimed = conn.execute(
+                """UPDATE webhook_deliveries SET claim_token=?,claim_expires_at=?,updated_at=?
+                   WHERE id=? AND status='pending'
+                     AND (claim_token IS NULL OR claim_expires_at<=?)""",
+                (
+                    claim_token, claim_expires_at, now_iso(), candidate["id"],
+                    int(time.time()),
+                ),
+            )
+            if claimed.rowcount != 1:
+                continue
+            delivery = conn.execute(
+                """SELECT d.*,t.url,t.secret_ct FROM webhook_deliveries d
+                   JOIN webhook_targets t ON t.id=d.target_id
+                   WHERE d.id=? AND d.claim_token=? AND d.status='pending'
+                     AND t.enabled=1""",
+                (candidate["id"], claim_token),
+            ).fetchone()
+        if not delivery:
+            continue
+        processed += 1
+        payload = delivery["payload_json"].encode("utf-8")
+        timestamp = str(now_epoch)
+        secret = decrypt_text(delivery["secret_ct"]).encode("utf-8")
+        signature = hmac.new(secret, timestamp.encode() + b"." + payload, hashlib.sha256).hexdigest()
+        request = Request(
+            delivery["url"],
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"PKWS-Camera-Hub/{APP_VERSION}",
+                "X-CameraHub-Event": delivery["event_id"] or delivery["id"],
+                "X-CameraHub-Timestamp": timestamp,
+                "X-CameraHub-Signature": f"sha256={signature}",
+            },
+        )
+        delivered, error_code = False, None
+        try:
+            with NO_REDIRECT_OPENER.open(request, timeout=5) as response:
+                delivered = 200 <= response.status < 300
+                if not delivered:
+                    error_code = f"http-{response.status}"
+        except HTTPError as exc:
+            error_code = f"http-{exc.code}"
+        except (OSError, TimeoutError, ValueError):
+            error_code = "delivery-unavailable"
+        stamp = now_iso()
+        with DB_LOCK, connect() as conn:
+            if delivered:
+                conn.execute(
+                    """UPDATE webhook_deliveries SET status='delivered',delivered_at=?,
+                       last_error_code=NULL,claim_token=NULL,claim_expires_at=NULL,updated_at=?
+                       WHERE id=? AND status='pending' AND claim_token=?""",
+                    (stamp, stamp, delivery["id"], claim_token),
+                )
+                completed += 1
+                continue
+            next_attempt = int(delivery["attempt"]) + 1
+            if next_attempt <= len(retry_delays):
+                conn.execute(
+                    """UPDATE webhook_deliveries SET attempt=?,next_attempt_at=?,
+                       last_error_code=?,claim_token=NULL,claim_expires_at=NULL,updated_at=?
+                       WHERE id=? AND status='pending' AND claim_token=?""",
+                    (
+                        next_attempt, now_epoch + retry_delays[next_attempt - 1],
+                        error_code, stamp, delivery["id"], claim_token,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """UPDATE webhook_deliveries SET attempt=?,status='failed',
+                       last_error_code=?,claim_token=NULL,claim_expires_at=NULL,updated_at=?
+                       WHERE id=? AND status='pending' AND claim_token=?""",
+                    (next_attempt, error_code, stamp, delivery["id"], claim_token),
+                )
+    return completed
+
+
+def operations_loop() -> None:
+    while not OPERATIONS_STOP.is_set():
+        try:
+            monitor_once()
+            dispatch_due_webhooks()
+        except Exception:
+            pass
+        OPERATIONS_STOP.wait(max(5, OPERATIONS_INTERVAL_SECONDS))
 
 
 def issue_session(response: Response, request: FastAPIRequest, user: sqlite3.Row) -> dict:
@@ -1271,8 +2035,32 @@ def transient_rtsp_preview(source_uri: str) -> bytes:
 def camera_status(row: sqlite3.Row, paths: dict[str, dict], api_ok: bool) -> dict:
     path = paths.get(row["low_path"], {})
     live = bool(path.get("ready"))
+    if live:
+        state = "live"
+    elif not api_ok:
+        state = "media-server-offline"
+    elif row["on_demand"]:
+        with connect() as conn:
+            incident = conn.execute(
+                """SELECT status FROM system_events
+                   WHERE dedupe_key=? AND status IN ('pending','open')""",
+                (f"camera:{row['id']}:on-demand-failure",),
+            ).fetchone()
+        state = "offline" if incident and incident["status"] == "open" else (
+            "connecting" if incident else "sleeping"
+        )
+    elif row["protocol"] == "snapshot":
+        state = "unknown"
+    else:
+        with connect() as conn:
+            incident = conn.execute(
+                """SELECT status FROM system_events
+                   WHERE dedupe_key=? AND status IN ('pending','open')""",
+                (f"camera:{row['id']}:offline",),
+            ).fetchone()
+        state = "offline" if incident and incident["status"] == "open" else "connecting"
     return {
-        "camera": row["id"], "state": "live" if live else ("media-server-offline" if not api_ok else "offline"),
+        "camera": row["id"], "state": state,
         "source": row["source_label"], "lastFrameAt": now_iso() if live else None, "relayRunning": live,
         "webRTCOutputAvailable": live, "hlsOutputAvailable": live,
     }
@@ -1800,6 +2588,242 @@ def delete_cloud_account(account_id: str, actor: sqlite3.Row = Depends(require_o
             raise HTTPException(409, "cloud-account-has-linked-cameras")
         conn.execute("DELETE FROM cloud_accounts WHERE id=?", (account_id,))
         audit(conn, actor["user_id"], "cloud.account.deleted", "cloud-account", account_id)
+    return Response(status_code=204)
+
+
+@app.post("/api/owner/backups")
+def download_backup(
+    body: BackupRequest,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    archive = create_backup_archive(body.passphrase)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    with DB_LOCK, connect() as conn:
+        audit(conn, actor["user_id"], "system.backup.created", "backup")
+    return Response(
+        archive,
+        media_type="application/vnd.pkws.camera-hub-backup+json",
+        headers={
+            "Content-Disposition": f'attachment; filename="camera-hub-{APP_VERSION}-{stamp}.pkwsbackup"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.post("/api/owner/backups/validate")
+async def validate_backup(
+    archive: UploadFile = File(...),
+    passphrase: str = Form(min_length=12, max_length=256),
+    _: sqlite3.Row = Depends(require_owner_elevated),
+):
+    data = await archive.read(BACKUP_ENVELOPE_MAX_BYTES + 1)
+    manifest, database, source_key = decode_backup_archive(data, passphrase)
+    info, candidate = validate_backup_database(database, source_key)
+    candidate.unlink(missing_ok=True)
+    return {"valid": True, "manifest": manifest, **info}
+
+
+@app.post("/api/owner/backups/restore")
+async def restore_backup(
+    archive: UploadFile = File(...),
+    passphrase: str = Form(min_length=12, max_length=256),
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    data = await archive.read(BACKUP_ENVELOPE_MAX_BYTES + 1)
+    manifest, database, source_key = decode_backup_archive(data, passphrase)
+    _, candidate = validate_backup_database(database, source_key)
+    try:
+        restore_point = restore_backup_database(candidate, actor["user_id"])
+    finally:
+        candidate.unlink(missing_ok=True)
+    return {
+        "restored": True,
+        "manifest": manifest,
+        "restorePoint": restore_point,
+        "sessionsRevoked": True,
+    }
+
+
+@app.get("/api/events")
+def list_system_events(
+    status: Literal["active", "open", "resolved", "all"] = "active",
+    limit: int = 100,
+    _: sqlite3.Row = Depends(require_session),
+):
+    limit = max(1, min(limit, 500))
+    where = {
+        "active": "e.status IN ('pending','open')",
+        "open": "e.status='open'",
+        "resolved": "e.status='resolved'",
+        "all": "1=1",
+    }[status]
+    with connect() as conn:
+        rows = conn.execute(
+            f"""SELECT e.*,c.name AS camera_name,a.label AS account_label
+                FROM system_events e
+                LEFT JOIN cameras c ON c.id=e.camera_id
+                LEFT JOIN cloud_accounts a ON a.id=e.account_id
+                WHERE {where}
+                ORDER BY CASE e.status WHEN 'open' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                e.updated_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        counts = {
+            row["status"]: row["count"]
+            for row in conn.execute(
+                "SELECT status,COUNT(*) AS count FROM system_events GROUP BY status"
+            )
+        }
+    return {
+        "events": [system_event_payload(row) for row in rows],
+        "summary": {
+            "pending": counts.get("pending", 0),
+            "open": counts.get("open", 0),
+            "resolved": counts.get("resolved", 0),
+        },
+    }
+
+
+@app.get("/api/owner/webhooks")
+def list_webhook_targets(_: sqlite3.Row = Depends(require_owner)):
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT t.*,
+               (SELECT status FROM webhook_deliveries d WHERE d.target_id=t.id
+                ORDER BY d.created_at DESC LIMIT 1) AS last_delivery_status,
+               (SELECT last_error_code FROM webhook_deliveries d WHERE d.target_id=t.id
+                ORDER BY d.created_at DESC LIMIT 1) AS last_error_code
+               FROM webhook_targets t ORDER BY t.label COLLATE NOCASE"""
+        ).fetchall()
+    targets = []
+    for row in rows:
+        item = webhook_target_payload(row)
+        item["lastDeliveryStatus"] = row["last_delivery_status"]
+        item["lastErrorCode"] = row["last_error_code"]
+        targets.append(item)
+    return {"targets": targets}
+
+
+@app.post("/api/owner/webhooks", status_code=201)
+def create_webhook_target(
+    body: WebhookTargetInput,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    target_id, secret, stamp = str(uuid.uuid4()), secrets.token_urlsafe(32), now_iso()
+    with DB_LOCK, connect() as conn:
+        conn.execute(
+            """INSERT INTO webhook_targets(
+               id,label,url,enabled,event_types_json,secret_ct,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                target_id, body.label.strip(), body.url, int(body.enabled),
+                json.dumps(body.eventTypes, separators=(",", ":")), encrypt_text(secret), stamp, stamp,
+            ),
+        )
+        audit(conn, actor["user_id"], "webhook.created", "webhook", target_id)
+        row = conn.execute("SELECT * FROM webhook_targets WHERE id=?", (target_id,)).fetchone()
+    result = webhook_target_payload(row)
+    result["secret"] = secret
+    return result
+
+
+@app.patch("/api/owner/webhooks/{target_id}")
+def update_webhook_target(
+    target_id: str,
+    body: WebhookTargetPatch,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    values, changes = [], []
+    for field, column in (("label", "label"), ("url", "url"), ("enabled", "enabled")):
+        value = getattr(body, field)
+        if value is not None:
+            changes.append(f"{column}=?")
+            values.append(int(value) if isinstance(value, bool) else value)
+    if body.eventTypes is not None:
+        changes.append("event_types_json=?")
+        values.append(json.dumps(body.eventTypes, separators=(",", ":")))
+    if not changes:
+        raise HTTPException(400, "no-changes")
+    with DB_LOCK, connect() as conn:
+        if not conn.execute("SELECT 1 FROM webhook_targets WHERE id=?", (target_id,)).fetchone():
+            raise HTTPException(404, "webhook-not-found")
+        values.extend([now_iso(), target_id])
+        conn.execute(
+            f"UPDATE webhook_targets SET {','.join(changes)},updated_at=? WHERE id=?",
+            values,
+        )
+        audit(conn, actor["user_id"], "webhook.updated", "webhook", target_id)
+        row = conn.execute("SELECT * FROM webhook_targets WHERE id=?", (target_id,)).fetchone()
+    return webhook_target_payload(row)
+
+
+@app.post("/api/owner/webhooks/{target_id}/rotate-secret")
+def rotate_webhook_secret(
+    target_id: str,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    secret, stamp = secrets.token_urlsafe(32), now_iso()
+    with DB_LOCK, connect() as conn:
+        updated = conn.execute(
+            "UPDATE webhook_targets SET secret_ct=?,updated_at=? WHERE id=?",
+            (encrypt_text(secret), stamp, target_id),
+        )
+        if updated.rowcount != 1:
+            raise HTTPException(404, "webhook-not-found")
+        audit(conn, actor["user_id"], "webhook.secret.rotated", "webhook", target_id)
+    return {"id": target_id, "secret": secret, "updatedAt": stamp}
+
+
+@app.post("/api/owner/webhooks/{target_id}/test")
+def test_webhook_target(
+    target_id: str,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    delivery_id, event_id, stamp = str(uuid.uuid4()), str(uuid.uuid4()), now_iso()
+    payload = json.dumps(
+        {
+            "eventId": event_id,
+            "type": "system.webhook-test",
+            "status": "test",
+            "severity": "info",
+            "timestamp": stamp,
+            "cameraId": None,
+            "accountId": None,
+            "title": "Camera-Hub-Testnachricht",
+            "description": "Die signierte Webhook-Verbindung wurde getestet.",
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    with DB_LOCK, connect() as conn:
+        if not conn.execute("SELECT 1 FROM webhook_targets WHERE id=?", (target_id,)).fetchone():
+            raise HTTPException(404, "webhook-not-found")
+        conn.execute(
+            """INSERT INTO webhook_deliveries(
+               id,target_id,event_id,event_status,attempt,status,next_attempt_at,payload_json,
+               created_at,updated_at) VALUES(?,?,?,'test',0,'pending',?,?,?,?)""",
+            (delivery_id, target_id, event_id, int(time.time()), payload, stamp, stamp),
+        )
+        audit(conn, actor["user_id"], "webhook.test.requested", "webhook", target_id)
+    dispatch_due_webhooks(limit=1, delivery_id=delivery_id)
+    with connect() as conn:
+        delivery = conn.execute(
+            "SELECT status,last_error_code FROM webhook_deliveries WHERE id=?",
+            (delivery_id,),
+        ).fetchone()
+    return {"deliveryId": delivery_id, "status": delivery["status"], "errorCode": delivery["last_error_code"]}
+
+
+@app.delete("/api/owner/webhooks/{target_id}")
+def delete_webhook_target(
+    target_id: str,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    with DB_LOCK, connect() as conn:
+        deleted = conn.execute("DELETE FROM webhook_targets WHERE id=?", (target_id,))
+        if deleted.rowcount != 1:
+            raise HTTPException(404, "webhook-not-found")
+        audit(conn, actor["user_id"], "webhook.deleted", "webhook", target_id)
     return Response(status_code=204)
 
 
@@ -3772,6 +4796,35 @@ def release_lease(camera_id: str, leaseId: str | None = None, _: sqlite3.Row = D
     return Response(status_code=204)
 
 
+@app.post("/api/cameras/{camera_id}/availability")
+def report_camera_availability(
+    camera_id: str,
+    body: AvailabilitySignal,
+    _: sqlite3.Row = Depends(require_csrf),
+):
+    with connect() as conn:
+        camera = conn.execute(
+            "SELECT * FROM cameras WHERE id=? AND enabled=1",
+            (camera_id,),
+        ).fetchone()
+    if not camera:
+        raise HTTPException(404, "camera-not-found")
+    if not camera["on_demand"]:
+        raise HTTPException(409, "availability-report-not-required")
+    status = observe_incident(
+        f"camera:{camera_id}:on-demand-failure",
+        body.state == "failure",
+        event_type="camera.on-demand-unavailable",
+        severity="warning",
+        title=f"Kamera {camera['name']} reagiert nicht",
+        description="Ein ausdrücklich angeforderter Wake- oder Streamversuch ist fehlgeschlagen.",
+        recommendation="Akkustand, Funkverbindung und Cloud-Anmeldung prüfen und erneut verbinden.",
+        camera_id=camera_id,
+        details={"errorCode": body.code},
+    )
+    return {"cameraId": camera_id, "state": status}
+
+
 def require_internal(authorization: str = Header(default="")) -> None:
     expected = f"Bearer {INTERNAL_TOKEN}"
     if not secrets.compare_digest(authorization, expected):
@@ -4145,6 +5198,27 @@ def detection_config(_: None = Depends(require_internal)):
 @app.post("/internal/v1/events")
 def detection_events(_: None = Depends(require_internal)):
     raise HTTPException(503, "detection-adapter-disabled")
+
+
+@app.on_event("startup")
+def start_operations_monitor() -> None:
+    global OPERATIONS_THREAD
+    if os.environ.get("ZMODO_TESTING") == "1" or (
+        OPERATIONS_THREAD and OPERATIONS_THREAD.is_alive()
+    ):
+        return
+    OPERATIONS_STOP.clear()
+    OPERATIONS_THREAD = threading.Thread(
+        target=operations_loop,
+        name="camera-hub-operations",
+        daemon=True,
+    )
+    OPERATIONS_THREAD.start()
+
+
+@app.on_event("shutdown")
+def stop_operations_monitor() -> None:
+    OPERATIONS_STOP.set()
 
 
 class ProtectedStaticFiles(StaticFiles):
