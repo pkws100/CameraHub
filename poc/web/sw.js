@@ -1,4 +1,4 @@
-const CACHE='pkws-camera-hub-v1.1.0-cloud-accounts-1';
+const CACHE='pkws-camera-hub-v1.1.0-cloud-accounts-2';
 const STATIC=new Set(['/','/index.html','/styles.css','/discovery.css','/media-modes.css','/users.css','/camera-connections.css','/audit-fixes.css','/wall-mode.css','/auth-badges.css','/app.js','/reader.js','/manifest.webmanifest','/icons/icon-192.png','/icons/icon-512.png']);
 self.addEventListener('install',event=>{event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll([...STATIC])));self.skipWaiting();});
 self.addEventListener('activate',event=>{event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(key=>key!==CACHE).map(key=>caches.delete(key)))));self.clients.claim();});
