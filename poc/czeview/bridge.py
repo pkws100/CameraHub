@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 
 from cryptography.utils import CryptographyDeprecationWarning
 from cloudedge import CloudEdgeClient
-from cloudedge.exceptions import CloudEdgeError
+from cloudedge.exceptions import AuthenticationError, CloudEdgeError
 
 
 logging.disable(logging.CRITICAL)
@@ -38,6 +38,8 @@ CAMERA_ID = os.environ.get("CZEVIEW_CAMERA_ID", "czeview")
 STREAM_PATH = os.environ.get("CZEVIEW_STREAM_PATH", "czeview-low")
 CONTROL_PORT = int(os.environ.get("CZEVIEW_CONTROL_PORT", "8787"))
 POLL_SECONDS = 2.0
+SESSION_FAILURE_THRESHOLD = 3
+SESSION_RESET_COOLDOWN = 30 * 60
 
 stop_event = threading.Event()
 active_event = threading.Event()
@@ -81,6 +83,39 @@ def load_credentials(path: Path) -> dict[str, str]:
         raise RuntimeError("incomplete-czeview-credentials")
     values.setdefault("CZEVIEW_SOURCE_APP", "141")
     return values
+
+
+def session_cache_diagnostic(path: Path) -> tuple[str, float | None]:
+    """Return non-secret cache age information for reproducible incident logs."""
+    if not path.exists():
+        return "missing", None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        login_time = float(payload.get("loginTime") or 0)
+        if login_time <= 0:
+            return "invalid", None
+        age_hours = max(0.0, (time.time() - login_time) / 3600)
+        return ("expired" if age_hours > 24 else "fresh"), round(age_hours, 2)
+    except (OSError, TypeError, ValueError):
+        return "invalid", None
+
+
+def cloud_error_code(error: CloudEdgeError) -> str:
+    details = getattr(error, "details", None)
+    value = details.get("error_code") if isinstance(details, dict) else None
+    code = str(value or "unknown")
+    return code if re.fullmatch(r"[A-Za-z0-9._-]{1,40}", code) else "unknown"
+
+
+def session_reset_needed(
+    error: CloudEdgeError,
+    failures: int,
+    seconds_since_reset: float,
+) -> bool:
+    return (
+        isinstance(error, AuthenticationError)
+        or failures >= SESSION_FAILURE_THRESHOLD
+    ) and seconds_since_reset >= SESSION_RESET_COOLDOWN
 
 
 def token_from_path(path: Path) -> str:
@@ -469,11 +504,28 @@ def shutdown(*_args: Any) -> None:
         control_server.shutdown()
 
 
+def migrate_legacy_session(account_id: str) -> None:
+    """Reuse a still-valid legacy cache instead of forcing a second cloud login."""
+    target = SESSION_PATH.parent / "accounts" / f"{account_id}.json"
+    if target.exists() or not SESSION_PATH.exists():
+        return
+    try:
+        payload = json.loads(SESSION_PATH.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not payload.get("userToken"):
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        target.chmod(0o600)
+        log("session_cache_migrated", account=account_id)
+    except (OSError, ValueError, json.JSONDecodeError):
+        log("session_cache_migration_skipped", account=account_id)
+
+
 def import_legacy_account() -> None:
     if not CREDENTIALS_PATH.exists() or not CREDENTIALS_PATH.read_text(encoding="utf-8-sig").strip():
         return
     credentials = load_credentials(CREDENTIALS_PATH)
-    request_json(
+    account = request_json(
         "/internal/v1/providers/czeview/legacy-account",
         "POST",
         {
@@ -488,6 +540,8 @@ def import_legacy_account() -> None:
             "cameraName": credentials.get("CZEVIEW_CAMERA_NAME", ""),
         },
     )
+    if account.get("id"):
+        migrate_legacy_session(str(account["id"]))
 
 
 def lease_manager() -> None:
@@ -522,12 +576,20 @@ def account_current(account_id: str, version: str) -> bool:
 
 def account_worker(account: dict[str, Any]) -> None:
     account_id = str(account["id"])
-    version = str(account.get("updatedAt") or "")
+    version = str(account.get("authRevision") or "")
     session_path = SESSION_PATH.parent / "accounts" / f"{account_id}.json"
     session_path.parent.mkdir(parents=True, exist_ok=True)
-    last_cache_reset = -600.0
+    account_failures = 0
+    last_cache_reset = -SESSION_RESET_COOLDOWN
     while not stop_event.is_set() and account_current(account_id, version):
         try:
+            cache_state, cache_age = session_cache_diagnostic(session_path)
+            log(
+                "session_start",
+                account=account_id,
+                cache=cache_state,
+                ageHours=cache_age if cache_age is not None else "unknown",
+            )
             client = make_client(account["credentials"], session_path)
             devices = client.get_all_devices()
             inventory = []
@@ -552,6 +614,7 @@ def account_worker(account: dict[str, Any]) -> None:
                 "POST",
                 {"accountId": account_id, "status": "active", "devices": inventory},
             )
+            account_failures = 0
             log("authenticated", account=account_id, devices=len(inventory))
             HEALTH_PATH.parent.mkdir(parents=True, exist_ok=True)
             HEALTH_PATH.write_text(str(int(time.time())), encoding="ascii")
@@ -620,23 +683,41 @@ def account_worker(account: dict[str, Any]) -> None:
                     with client_lock:
                         camera_controls.pop(str(camera["cameraId"]), None)
         except CloudEdgeError as error:
-            log("degraded", account=account_id, reason=type(error).__name__)
+            account_failures += 1
+            reset_session = session_reset_needed(
+                error,
+                account_failures,
+                time.monotonic() - last_cache_reset,
+            )
+            log(
+                "degraded",
+                account=account_id,
+                reason=type(error).__name__,
+                failures=account_failures,
+                code=cloud_error_code(error),
+            )
             try:
                 request_json(
                     "/internal/v1/providers/czeview/inventory",
                     "POST",
                     {
                         "accountId": account_id,
-                        "status": "reauth-required",
-                        "errorCode": "czeview-authentication-failed",
+                        "status": "reauth-required" if reset_session else "error",
+                        "errorCode": (
+                            "czeview-authentication-failed"
+                            if reset_session
+                            else "czeview-api-temporary"
+                        ),
                         "devices": [],
                     },
                 )
             except Exception:
                 pass
-            if time.monotonic() - last_cache_reset >= 600:
+            if reset_session:
                 session_path.unlink(missing_ok=True)
                 last_cache_reset = time.monotonic()
+                account_failures = 0
+                log("session_cache_reset", account=account_id)
             stop_event.wait(30)
         except (OSError, ValueError, RuntimeError, HTTPError, URLError) as error:
             log("degraded", account=account_id, reason=type(error).__name__)
@@ -660,7 +741,7 @@ def account_manager() -> None:
                 enabled_account_ids.update(str(account["id"]) for account in accounts)
                 account_versions.clear()
                 account_versions.update(
-                    (str(account["id"]), str(account.get("updatedAt") or ""))
+                    (str(account["id"]), str(account.get("authRevision") or ""))
                     for account in accounts
                 )
             for account in accounts:

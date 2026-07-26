@@ -58,6 +58,8 @@ Bestehende CZEview-Einträge in der ignorierten `poc/.env` werden einmalig in
 den verschlüsselten Kontospeicher übernommen. Einrichtung, Sicherheitsgrenzen,
 Ein-Sitzungs-Hinweis und technische Evidenz stehen in
 [CZEVIEW-INTEGRATION.md](CZEVIEW-INTEGRATION.md).
+Die vertiefte Analyse zu Sitzungscache, Wake-up und Wiederanmeldung steht in
+[CZEVIEW-SESSION-STABILITY-REPORT.md](CZEVIEW-SESSION-STABILITY-REPORT.md).
 Die Netatmo-App-Einrichtung und die bewusst begrenzten Rechte beschreibt
 [NETATMO-INTEGRATION.md](NETATMO-INTEGRATION.md).
 Der geprüfte Gesamtstand der Mehrkonto-Verwaltung ist in

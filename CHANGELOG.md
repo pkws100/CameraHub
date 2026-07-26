@@ -42,6 +42,14 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
 ### Geändert
 
+- CZEview-Kontoprozesse reagieren nur noch auf eine eigene
+  Zugangsdatenrevision statt auf den bei jeder Inventur geänderten allgemeinen
+  Kontozeitstempel;
+- vorhandene CZEview-Sitzungscaches werden bei der einmaligen Übernahme aus
+  `poc/.env` weiterverwendet;
+- ein einzelner vorübergehender CZEview-API-Fehler löscht den Sitzungscache
+  nicht mehr. Eine kontrollierte Neuanmeldung erfolgt erst nach drei
+  aufeinanderfolgenden Kontofehlern und höchstens einmal je 30 Minuten;
 - RTSP-Frame-Tests erlauben langsamer startenden Kameras ein kontrolliertes
   Zeitfenster, ohne aggressive Wiederholungen.
 

@@ -90,7 +90,7 @@ def request(path: str, method: str = "GET", body=None, csrf: str | None = None, 
 try:
     with camera_app.connect() as conn:
         assert conn.execute(
-            "SELECT 1 FROM schema_migrations WHERE version=5"
+            "SELECT 1 FROM schema_migrations WHERE version=6"
         ).fetchone()
     state = request("/api/auth/state")
     assert state == {"setupRequired": True, "authenticated": False}
@@ -575,6 +575,11 @@ try:
     assert cloud_account["provider"] == "czeview" and "password" not in cloud_account
     assert request("/api/admin/cloud/accounts", expected=403, opener=admin_client)["detail"] == "insufficient-role"
     assert cloud_password.encode() not in open(os.environ["DATABASE_PATH"], "rb").read()
+    with camera_app.connect() as conn:
+        inventory_auth_revision = conn.execute(
+            "SELECT auth_revision FROM cloud_accounts WHERE id=?",
+            (cloud_account["id"],),
+        ).fetchone()["auth_revision"]
     inventory_request = urllib.request.Request(
         base + "/internal/v1/providers/czeview/inventory",
         data=json.dumps(
@@ -603,6 +608,10 @@ try:
         inventory = json.load(response)
     cloud_device_id = inventory["devices"][0]["deviceId"]
     with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT auth_revision FROM cloud_accounts WHERE id=?",
+            (cloud_account["id"],),
+        ).fetchone()["auth_revision"] == inventory_auth_revision
         conn.execute(
             "UPDATE cloud_devices SET stream_support='verified' WHERE id=?",
             (cloud_device_id,),
@@ -641,6 +650,11 @@ try:
     )
     assert imported_cloud["externalSource"] and imported_cloud["onDemand"]
     replacement_secret = "Cloud-Replacement-Secret-43!"
+    with camera_app.connect() as conn:
+        previous_auth_revision = conn.execute(
+            "SELECT auth_revision FROM cloud_accounts WHERE id=?",
+            (cloud_account["id"],),
+        ).fetchone()["auth_revision"]
     replaced_cloud_account = request(
         f"/api/admin/cloud/accounts/{cloud_account['id']}/czeview",
         "PUT",
@@ -657,6 +671,10 @@ try:
     )
     assert replaced_cloud_account["status"] == "pending"
     with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT auth_revision FROM cloud_accounts WHERE id=?",
+            (cloud_account["id"],),
+        ).fetchone()["auth_revision"] == previous_auth_revision + 1
         assert conn.execute(
             "SELECT 1 FROM cloud_devices WHERE id=? AND account_id=?",
             (cloud_device_id, cloud_account["id"]),

@@ -132,3 +132,7 @@ Erfolgskriterien gelten ein aktiver MediaMTX-Pfad, ein von
 WebRTC-Livebild und angenommene Links-/Rechts-/Stoppbefehle über Camera Hub.
 Aufnahmen und standortbezogene Evidence bleiben im ignorierten
 Runtime-Verzeichnis.
+
+Die vertiefte Analyse zu Sitzungscache, Wake-up, Mobil-App-Wechselwirkung und
+der behobenen Neuanmeldeschleife steht in
+[CZEVIEW-SESSION-STABILITY-REPORT.md](CZEVIEW-SESSION-STABILITY-REPORT.md).
