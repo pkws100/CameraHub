@@ -6,6 +6,14 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
 ### Hinzugefügt
 
+- verschlüsselte Mehrkonto-Verwaltung für CZEview und Netatmo direkt in der
+  Kamerasuche;
+- zusammengeführte LAN-/Cloud-Suche mit konto- und herkunftsspezifischem Status;
+- Netatmo-OAuth-Codefluss mit Einmalzustand, Token-Erneuerung und
+  Frame-geprüftem On-Demand-Relay;
+- getrennte interne Adapter-Tokens für CZEview und Netatmo;
+- mehrere parallele CZEview-Konten mit getrennten Sitzungsspeichern und
+  höchstens einem aktiven Akku-Kamerastream je Konto;
 - optionale CZEview-P2P-Brücke für die untersuchte Akku-/Solarkamera;
 - bedarfsgesteuertes Wake-on-View, erneuerbare Kamera-Leases und automatische
   Registrierung eines neutralen externen MediaMTX-Pfads;

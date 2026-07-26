@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
@@ -26,7 +26,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from argon2 import PasswordHasher
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Depends, FastAPI, Header, HTTPException, Request as FastAPIRequest, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from onvif_client import OnvifClient, OnvifError
@@ -37,6 +37,8 @@ DB_PATH = Path(os.environ.get("DATABASE_PATH", "/data/zmodo.db"))
 SEED_PATH = Path(os.environ.get("CAMERA_CONFIG", "/config/cameras.json"))
 SECRET_PATH = Path(os.environ.get("SECRET_KEY_PATH", "/run/secrets/zmodo_secret_key"))
 INTERNAL_TOKEN_PATH = Path(os.environ.get("INTERNAL_TOKEN_PATH", "/run/secrets/zmodo_internal_token"))
+CZEVIEW_ADAPTER_TOKEN_PATH = Path(os.environ.get("CZEVIEW_ADAPTER_TOKEN_PATH", "/run/secrets/czeview_adapter_token"))
+NETATMO_ADAPTER_TOKEN_PATH = Path(os.environ.get("NETATMO_ADAPTER_TOKEN_PATH", "/run/secrets/netatmo_adapter_token"))
 MEDIAMTX_API = os.environ.get("MEDIAMTX_API", "http://mediamtx:9997")
 ALLOWED_NETWORK = ipaddress.ip_network(os.environ.get("DISCOVERY_NETWORK", "192.168.1.0/24"), strict=True)
 MAX_CAMERAS = int(os.environ.get("MAX_CAMERAS", "32"))
@@ -57,6 +59,9 @@ PREVIEW_SEMAPHORE = threading.BoundedSemaphore(2)
 PREVIEW_CACHE: dict[str, tuple[float, bytes]] = {}
 DISCOVERY_PREVIEW_CACHE: dict[tuple[str, str], tuple[float, bytes]] = {}
 REAUTH_ATTEMPTS: dict[str, list[float]] = {}
+NETATMO_TOKEN_LOCKS: dict[str, threading.Lock] = {}
+NETATMO_STREAM_CACHE: dict[str, tuple[float, list[str]]] = {}
+CLOUD_PROBE_LEASES: dict[str, dict] = {}
 HTTP_DIAGNOSTIC_ONLY = os.environ.get("HTTP_DIAGNOSTIC_ONLY") == "1"
 ALLOW_INSECURE_LOOPBACK_MANAGEMENT = (
     os.environ.get("ALLOW_INSECURE_LOOPBACK_MANAGEMENT") == "1"
@@ -124,6 +129,16 @@ AES_KEY = read_secret(SECRET_PATH, "camera-encryption")
 INTERNAL_TOKEN = base64.urlsafe_b64encode(read_secret(INTERNAL_TOKEN_PATH, "internal-api")).decode().rstrip("=")
 
 
+def read_optional_service_token(path: Path, test_name: str) -> str:
+    if not path.exists() and os.environ.get("ZMODO_TESTING") != "1":
+        return ""
+    return base64.urlsafe_b64encode(read_secret(path, test_name)).decode().rstrip("=")
+
+
+CZEVIEW_ADAPTER_TOKEN = read_optional_service_token(CZEVIEW_ADAPTER_TOKEN_PATH, "czeview-adapter")
+NETATMO_ADAPTER_TOKEN = read_optional_service_token(NETATMO_ADAPTER_TOKEN_PATH, "netatmo-adapter")
+
+
 def encrypt_text(value: str) -> str:
     nonce = secrets.token_bytes(12)
     encrypted = AESGCM(AES_KEY).encrypt(nonce, value.encode(), b"zmodo-camera-secret-v1")
@@ -135,6 +150,15 @@ def decrypt_text(value: str | None) -> str:
         return ""
     raw = base64.urlsafe_b64decode(value)
     return AESGCM(AES_KEY).decrypt(raw[:12], raw[12:], b"zmodo-camera-secret-v1").decode()
+
+
+def encrypt_json(value: dict) -> str:
+    return encrypt_text(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
+
+
+def decrypt_json(value: str | None) -> dict:
+    plain = decrypt_text(value)
+    return json.loads(plain) if plain else {}
 
 
 SCHEMA = """
@@ -200,6 +224,33 @@ CREATE TABLE IF NOT EXISTS camera_profiles(
  UNIQUE(connection_id,token)
 );
 CREATE INDEX IF NOT EXISTS profiles_camera_idx ON camera_profiles(camera_id,connection_id);
+CREATE TABLE IF NOT EXISTS cloud_provider_configs(
+ provider TEXT PRIMARY KEY CHECK(provider IN ('netatmo')),
+ client_id_ct TEXT NOT NULL, client_secret_ct TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cloud_accounts(
+ id TEXT PRIMARY KEY, provider TEXT NOT NULL CHECK(provider IN ('czeview','netatmo')),
+ label TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, auth_payload_ct TEXT NOT NULL,
+ scopes_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'pending',
+ last_error_code TEXT, last_verified_at TEXT, legacy_source TEXT,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cloud_accounts_provider_idx ON cloud_accounts(provider,enabled);
+CREATE TABLE IF NOT EXISTS cloud_devices(
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES cloud_accounts(id) ON DELETE CASCADE,
+ external_id_hash TEXT NOT NULL, external_id_ct TEXT NOT NULL, home_id_ct TEXT,
+ name TEXT NOT NULL, model TEXT, manufacturer TEXT,
+ capabilities_json TEXT NOT NULL DEFAULT '{}', stream_support TEXT NOT NULL DEFAULT 'unknown',
+ last_error_code TEXT, last_seen_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(account_id,external_id_hash)
+);
+CREATE INDEX IF NOT EXISTS cloud_devices_account_idx ON cloud_devices(account_id,last_seen_at);
+CREATE TABLE IF NOT EXISTS oauth_states(
+ state_hash TEXT PRIMARY KEY, provider TEXT NOT NULL CHECK(provider IN ('netatmo')),
+ actor_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, label TEXT NOT NULL,
+ redirect_uri TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL
+);
 """
 
 
@@ -217,6 +268,17 @@ def initialize_database() -> None:
             conn.execute("ALTER TABLE cameras ADD COLUMN external_control_url TEXT")
         if "external_capabilities_json" not in camera_columns:
             conn.execute("ALTER TABLE cameras ADD COLUMN external_capabilities_json TEXT")
+        if "cloud_device_id" not in camera_columns:
+            conn.execute("ALTER TABLE cameras ADD COLUMN cloud_device_id TEXT REFERENCES cloud_devices(id) ON DELETE SET NULL")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS cameras_cloud_device_idx ON cameras(cloud_device_id) WHERE cloud_device_id IS NOT NULL")
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=4").fetchone() is None:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS cameras_cloud_device_idx ON cameras(cloud_device_id) WHERE cloud_device_id IS NOT NULL"
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(4,?)",
+                (now_iso(),),
+            )
         if "active_connection_id" not in camera_columns:
             conn.execute("ALTER TABLE cameras ADD COLUMN active_connection_id TEXT")
         if "last_good_connection_id" not in camera_columns:
@@ -325,7 +387,7 @@ def initialize_database() -> None:
 
 
 initialize_database()
-app = FastAPI(title="PKWS Multi Camera API", version="1.0.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="PKWS Multi Camera API", version="1.1.0", docs_url=None, redoc_url=None)
 
 
 class LoginRequest(BaseModel):
@@ -512,6 +574,55 @@ class ConnectionInput(BaseModel):
         return value
 
 
+class CloudAccountPatch(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=80)
+    enabled: bool | None = None
+
+
+class CzeviewAccountCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    username: str = Field(min_length=1, max_length=160)
+    email: str = Field(default="", max_length=254)
+    password: str = Field(min_length=1, max_length=256)
+    countryCode: str = Field(min_length=2, max_length=8)
+    phoneCode: str = Field(min_length=1, max_length=8)
+    sourceApp: str = Field(default="141", min_length=1, max_length=16)
+    deviceSerial: str = Field(default="", max_length=256)
+    cameraName: str = Field(default="", max_length=80)
+
+
+class NetatmoProviderConfigInput(BaseModel):
+    clientId: str = Field(min_length=1, max_length=256)
+    clientSecret: str = Field(min_length=1, max_length=512)
+    redirectUri: str = Field(min_length=1, max_length=1024)
+
+
+class NetatmoAuthorizeInput(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+
+
+class CloudInventoryDevice(BaseModel):
+    externalId: str = Field(min_length=1, max_length=512)
+    homeId: str | None = Field(default=None, max_length=512)
+    name: str = Field(min_length=1, max_length=160)
+    model: str = Field(default="", max_length=128)
+    manufacturer: str = Field(default="", max_length=128)
+    capabilities: dict = Field(default_factory=dict)
+    streamSupport: Literal["unknown", "unsupported", "candidate", "verified"] = "unknown"
+    errorCode: str | None = Field(default=None, max_length=128)
+
+
+class CloudInventoryUpdate(BaseModel):
+    accountId: str
+    status: Literal["pending", "active", "reauth-required", "error"] = "active"
+    errorCode: str | None = Field(default=None, max_length=128)
+    devices: list[CloudInventoryDevice] = Field(default_factory=list, max_length=128)
+
+
+class CloudCameraImport(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+
+
 class ConnectionActivation(BaseModel):
     revision: int = Field(ge=1)
 
@@ -664,6 +775,72 @@ def permissions_for(role: str) -> dict:
         "discoverCameras": ROLE_LEVEL.get(role, 0) >= ROLE_LEVEL["admin"],
         "manageUsers": role == "owner",
     }
+
+
+NETATMO_AUTH_URL = "https://api.netatmo.com/oauth2/authorize"
+NETATMO_TOKEN_URL = "https://api.netatmo.com/oauth2/token"
+NETATMO_SCOPES = (
+    "read_camera access_camera read_presence access_presence "
+    "read_doorbell access_doorbell read_camerapro"
+)
+
+
+def cloud_account_payload(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "provider": row["provider"],
+        "label": row["label"],
+        "enabled": bool(row["enabled"]),
+        "status": row["status"],
+        "scopes": json.loads(row["scopes_json"] or "[]"),
+        "lastErrorCode": row["last_error_code"],
+        "lastVerifiedAt": row["last_verified_at"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def validate_netatmo_redirect_uri(value: str) -> str:
+    parsed = urlparse(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or parsed.path != "/api/cloud/oauth/netatmo/callback"
+    ):
+        raise HTTPException(422, "netatmo-redirect-uri-invalid")
+    if parsed.scheme == "http":
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+            permitted = address.is_loopback or any(address in network for network in PRIVATE_HTTP_NETWORKS)
+        except ValueError:
+            permitted = parsed.hostname.lower() == "localhost"
+        if not permitted:
+            raise HTTPException(422, "netatmo-http-redirect-must-be-private")
+    return value
+
+
+def form_request_json(url: str, values: dict[str, str], timeout: float = 10) -> dict:
+    request = Request(
+        url,
+        data=urlencode(values).encode(),
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except HTTPError as error:
+        try:
+            detail = json.loads(error.read().decode("utf-8", "replace"))
+            code = str(detail.get("error") or detail.get("error_description") or "provider-request-failed")
+        except Exception:
+            code = "provider-request-failed"
+        raise HTTPException(502, code) from error
+    except (URLError, TimeoutError, ValueError) as error:
+        raise HTTPException(502, "provider-unavailable") from error
 
 
 def audit(conn: sqlite3.Connection, actor_id: str | None, action: str, target_type: str, target_id: str | None = None) -> None:
@@ -1289,6 +1466,223 @@ def remove_user(user_id: str, actor: sqlite3.Row = Depends(require_owner_elevate
     return Response(status_code=204)
 
 
+@app.get("/api/admin/cloud/providers")
+def list_cloud_providers(_: sqlite3.Row = Depends(require_owner)):
+    with connect() as conn:
+        netatmo = conn.execute(
+            "SELECT provider,redirect_uri,created_at,updated_at FROM cloud_provider_configs WHERE provider='netatmo'"
+        ).fetchone()
+    return {
+        "providers": [
+            {
+                "id": "czeview",
+                "configured": True,
+                "authentication": "credentials",
+            },
+            {
+                "id": "netatmo",
+                "configured": bool(netatmo),
+                "authentication": "oauth2",
+                "redirectUri": netatmo["redirect_uri"] if netatmo else None,
+                "updatedAt": netatmo["updated_at"] if netatmo else None,
+            },
+        ]
+    }
+
+
+@app.put("/api/admin/cloud/providers/netatmo")
+def configure_netatmo_provider(
+    body: NetatmoProviderConfigInput,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    redirect_uri = validate_netatmo_redirect_uri(body.redirectUri)
+    stamp = now_iso()
+    with DB_LOCK, connect() as conn:
+        conn.execute(
+            """INSERT INTO cloud_provider_configs(
+               provider,client_id_ct,client_secret_ct,redirect_uri,created_at,updated_at)
+               VALUES('netatmo',?,?,?,?,?)
+               ON CONFLICT(provider) DO UPDATE SET client_id_ct=excluded.client_id_ct,
+               client_secret_ct=excluded.client_secret_ct,redirect_uri=excluded.redirect_uri,
+               updated_at=excluded.updated_at""",
+            (encrypt_text(body.clientId), encrypt_text(body.clientSecret), redirect_uri, stamp, stamp),
+        )
+        audit(conn, actor["user_id"], "cloud.provider.configured", "cloud-provider", "netatmo")
+    return {"id": "netatmo", "configured": True, "redirectUri": redirect_uri, "updatedAt": stamp}
+
+
+@app.get("/api/admin/cloud/accounts")
+def list_cloud_accounts(_: sqlite3.Row = Depends(require_owner)):
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT a.*,(SELECT COUNT(*) FROM cloud_devices d WHERE d.account_id=a.id) AS device_count
+               FROM cloud_accounts a ORDER BY a.provider,a.label COLLATE NOCASE"""
+        ).fetchall()
+    accounts = []
+    for row in rows:
+        item = cloud_account_payload(row)
+        item["deviceCount"] = row["device_count"]
+        accounts.append(item)
+    return {"accounts": accounts}
+
+
+@app.post("/api/admin/cloud/accounts/czeview")
+def create_czeview_account(
+    body: CzeviewAccountCreate,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    account_id, stamp = str(uuid.uuid4()), now_iso()
+    auth = {
+        "username": body.username,
+        "email": body.email,
+        "login": body.email or body.username,
+        "password": body.password,
+        "countryCode": body.countryCode,
+        "phoneCode": body.phoneCode,
+        "sourceApp": body.sourceApp,
+        "deviceSerial": body.deviceSerial,
+        "cameraName": body.cameraName,
+    }
+    with DB_LOCK, connect() as conn:
+        conn.execute(
+            """INSERT INTO cloud_accounts(
+               id,provider,label,enabled,auth_payload_ct,scopes_json,status,created_at,updated_at)
+               VALUES(?,'czeview',?,1,?,'[]','pending',?,?)""",
+            (account_id, body.label, encrypt_json(auth), stamp, stamp),
+        )
+        audit(conn, actor["user_id"], "cloud.account.created", "cloud-account", account_id)
+        row = conn.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
+    return cloud_account_payload(row)
+
+
+@app.post("/api/admin/cloud/accounts/netatmo/authorize")
+def authorize_netatmo_account(
+    body: NetatmoAuthorizeInput,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    with DB_LOCK, connect() as conn:
+        config = conn.execute("SELECT * FROM cloud_provider_configs WHERE provider='netatmo'").fetchone()
+        if not config:
+            raise HTTPException(409, "netatmo-provider-not-configured")
+        state = secrets.token_urlsafe(32)
+        conn.execute("DELETE FROM oauth_states WHERE expires_at<=?", (int(time.time()),))
+        conn.execute(
+            """INSERT INTO oauth_states(
+               state_hash,provider,actor_user_id,label,redirect_uri,expires_at,created_at)
+               VALUES(?,'netatmo',?,?,?,?,?)""",
+            (
+                hash_token(state),
+                actor["user_id"],
+                body.label,
+                config["redirect_uri"],
+                int(time.time()) + 600,
+                now_iso(),
+            ),
+        )
+        client_id = decrypt_text(config["client_id_ct"])
+    query = urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": config["redirect_uri"],
+            "scope": NETATMO_SCOPES,
+            "state": state,
+        }
+    )
+    return {"authorizationUrl": f"{NETATMO_AUTH_URL}?{query}", "expiresIn": 600}
+
+
+@app.get("/api/cloud/oauth/netatmo/callback")
+def netatmo_oauth_callback(state: str = "", code: str = "", error: str = ""):
+    if error:
+        return RedirectResponse(url=f"/#discover?netatmo={quote(error, safe='')}", status_code=303)
+    if not state or not code:
+        raise HTTPException(400, "oauth-callback-incomplete")
+    with DB_LOCK, connect() as conn:
+        stored = conn.execute(
+            """SELECT s.*,p.client_id_ct,p.client_secret_ct
+               FROM oauth_states s JOIN cloud_provider_configs p ON p.provider=s.provider
+               WHERE s.state_hash=? AND s.provider='netatmo'""",
+            (hash_token(state),),
+        ).fetchone()
+        if not stored or stored["expires_at"] < int(time.time()):
+            if stored:
+                conn.execute("DELETE FROM oauth_states WHERE state_hash=?", (hash_token(state),))
+            raise HTTPException(400, "oauth-state-invalid")
+        conn.execute("DELETE FROM oauth_states WHERE state_hash=?", (hash_token(state),))
+    token = form_request_json(
+        NETATMO_TOKEN_URL,
+        {
+            "grant_type": "authorization_code",
+            "client_id": decrypt_text(stored["client_id_ct"]),
+            "client_secret": decrypt_text(stored["client_secret_ct"]),
+            "code": code,
+            "redirect_uri": stored["redirect_uri"],
+        },
+    )
+    if not token.get("access_token") or not token.get("refresh_token"):
+        raise HTTPException(502, "netatmo-token-response-invalid")
+    account_id, stamp = str(uuid.uuid4()), now_iso()
+    expires_at = int(time.time()) + max(60, int(token.get("expires_in") or 10800))
+    auth = {
+        "accessToken": token["access_token"],
+        "refreshToken": token["refresh_token"],
+        "expiresAt": expires_at,
+    }
+    scopes = str(token.get("scope") or NETATMO_SCOPES).split()
+    with DB_LOCK, connect() as conn:
+        conn.execute(
+            """INSERT INTO cloud_accounts(
+               id,provider,label,enabled,auth_payload_ct,scopes_json,status,last_verified_at,created_at,updated_at)
+               VALUES(?,'netatmo',?,1,?,?, 'active',?,?,?)""",
+            (account_id, stored["label"], encrypt_json(auth), json.dumps(scopes), stamp, stamp, stamp),
+        )
+        audit(conn, stored["actor_user_id"], "cloud.account.created", "cloud-account", account_id)
+    return RedirectResponse(url="/#discover?netatmo=connected", status_code=303)
+
+
+@app.patch("/api/admin/cloud/accounts/{account_id}")
+def update_cloud_account(
+    account_id: str,
+    body: CloudAccountPatch,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    changes, values = [], []
+    if body.label is not None:
+        changes.append("label=?")
+        values.append(body.label)
+    if body.enabled is not None:
+        changes.append("enabled=?")
+        values.append(int(body.enabled))
+    if not changes:
+        raise HTTPException(400, "no-changes")
+    with DB_LOCK, connect() as conn:
+        if not conn.execute("SELECT 1 FROM cloud_accounts WHERE id=?", (account_id,)).fetchone():
+            raise HTTPException(404, "cloud-account-not-found")
+        values.extend([now_iso(), account_id])
+        conn.execute(f"UPDATE cloud_accounts SET {','.join(changes)},updated_at=? WHERE id=?", values)
+        audit(conn, actor["user_id"], "cloud.account.updated", "cloud-account", account_id)
+        row = conn.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
+    return cloud_account_payload(row)
+
+
+@app.delete("/api/admin/cloud/accounts/{account_id}")
+def delete_cloud_account(account_id: str, actor: sqlite3.Row = Depends(require_owner_elevated)):
+    with DB_LOCK, connect() as conn:
+        row = conn.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "cloud-account-not-found")
+        linked = conn.execute(
+            """SELECT COUNT(*) FROM cameras c JOIN cloud_devices d ON d.id=c.cloud_device_id
+               WHERE d.account_id=?""",
+            (account_id,),
+        ).fetchone()[0]
+        if linked:
+            raise HTTPException(409, "cloud-account-has-linked-cameras")
+        conn.execute("DELETE FROM cloud_accounts WHERE id=?", (account_id,))
+        audit(conn, actor["user_id"], "cloud.account.deleted", "cloud-account", account_id)
+    return Response(status_code=204)
+
+
 @app.get("/api/cameras")
 def list_cameras(_: sqlite3.Row = Depends(require_session)):
     with connect() as conn:
@@ -1338,6 +1732,269 @@ def one_status(camera_id: str, _: sqlite3.Row = Depends(require_session)):
         raise HTTPException(404, "camera-not-found")
     paths, ok = media_paths()
     return camera_status(row, paths, ok)
+
+
+def netatmo_access_token(account_id: str) -> str:
+    lock = NETATMO_TOKEN_LOCKS.setdefault(account_id, threading.Lock())
+    with lock:
+        with connect() as conn:
+            row = conn.execute(
+                """SELECT a.*,p.client_id_ct,p.client_secret_ct FROM cloud_accounts a
+                   JOIN cloud_provider_configs p ON p.provider=a.provider
+                   WHERE a.id=? AND a.provider='netatmo' AND a.enabled=1""",
+                (account_id,),
+            ).fetchone()
+        if not row:
+            raise HTTPException(404, "netatmo-account-not-found")
+        auth = decrypt_json(row["auth_payload_ct"])
+        if auth.get("accessToken") and int(auth.get("expiresAt") or 0) > int(time.time()) + 90:
+            return str(auth["accessToken"])
+        try:
+            token = form_request_json(
+                NETATMO_TOKEN_URL,
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": str(auth.get("refreshToken") or ""),
+                    "client_id": decrypt_text(row["client_id_ct"]),
+                    "client_secret": decrypt_text(row["client_secret_ct"]),
+                },
+            )
+        except HTTPException as exc:
+            with DB_LOCK, connect() as conn:
+                conn.execute(
+                    """UPDATE cloud_accounts SET status='reauth-required',last_error_code=?,
+                       updated_at=? WHERE id=?""",
+                    (str(exc.detail)[:128], now_iso(), account_id),
+                )
+            raise
+        if not token.get("access_token"):
+            raise HTTPException(502, "netatmo-refresh-response-invalid")
+        auth["accessToken"] = token["access_token"]
+        auth["refreshToken"] = token.get("refresh_token") or auth.get("refreshToken")
+        auth["expiresAt"] = int(time.time()) + max(60, int(token.get("expires_in") or 10800))
+        with DB_LOCK, connect() as conn:
+            conn.execute(
+                """UPDATE cloud_accounts SET auth_payload_ct=?,status='active',last_error_code=NULL,
+                   last_verified_at=?,updated_at=? WHERE id=?""",
+                (encrypt_json(auth), now_iso(), now_iso(), account_id),
+            )
+        return str(auth["accessToken"])
+
+
+def netatmo_api_json(account_id: str, path: str, params: dict[str, str] | None = None) -> dict:
+    query = f"?{urlencode(params)}" if params else ""
+    request = Request(
+        f"https://api.netatmo.com/api/{path}{query}",
+        headers={
+            "Authorization": f"Bearer {netatmo_access_token(account_id)}",
+            "Accept": "application/json",
+            "User-Agent": "PKWS-CameraHub/1",
+        },
+    )
+    try:
+        with urlopen(request, timeout=12) as response:
+            result = json.load(response)
+    except HTTPError as error:
+        code = "netatmo-authentication-failed" if error.code in {401, 403} else "netatmo-api-failed"
+        with DB_LOCK, connect() as conn:
+            conn.execute(
+                "UPDATE cloud_accounts SET status=?,last_error_code=?,updated_at=? WHERE id=?",
+                ("reauth-required" if error.code == 401 else "error", code, now_iso(), account_id),
+            )
+        raise HTTPException(502, code) from error
+    except (URLError, TimeoutError, ValueError) as error:
+        raise HTTPException(502, "netatmo-unavailable") from error
+    return result.get("body") if isinstance(result.get("body"), dict) else result
+
+
+def refresh_netatmo_inventory(account_id: str) -> None:
+    body = netatmo_api_json(account_id, "homesdata")
+    homes = body.get("homes") or []
+    devices: list[CloudInventoryDevice] = []
+    for home in homes:
+        home_id = str(home.get("id") or "")
+        candidates = list(home.get("cameras") or [])
+        candidates.extend(
+            item
+            for item in (home.get("modules") or [])
+            if str(item.get("type") or "").upper() in {"NACAMERA", "NOC", "NDB", "NPC"}
+        )
+        for camera in candidates:
+            external_id = str(camera.get("id") or camera.get("mac") or "")
+            if not external_id:
+                continue
+            model = str(camera.get("type") or camera.get("module_name") or "Netatmo Kamera")
+            unsupported = model.upper() == "NPC"
+            devices.append(
+                CloudInventoryDevice(
+                    externalId=external_id,
+                    homeId=home_id or None,
+                    name=str(camera.get("name") or camera.get("module_name") or model),
+                    model=model,
+                    manufacturer="Netatmo",
+                    capabilities={"provider": "netatmo", "homeName": str(home.get("name") or "")},
+                    streamSupport="unsupported" if unsupported else "candidate",
+                    errorCode="netatmo-npc-third-party-live-unavailable" if unsupported else None,
+                )
+            )
+    update_cloud_inventory("netatmo", account_id, devices, "active", None)
+
+
+def update_cloud_inventory(
+    provider: str,
+    account_id: str,
+    devices: list[CloudInventoryDevice],
+    status: str,
+    error_code: str | None,
+) -> None:
+    stamp = now_iso()
+    with DB_LOCK, connect() as conn:
+        account = conn.execute(
+            "SELECT * FROM cloud_accounts WHERE id=? AND provider=?",
+            (account_id, provider),
+        ).fetchone()
+        if not account:
+            raise HTTPException(404, "cloud-account-not-found")
+        conn.execute(
+            """UPDATE cloud_accounts SET status=?,last_error_code=?,last_verified_at=?,
+               updated_at=? WHERE id=?""",
+            (status, error_code, stamp if status == "active" else account["last_verified_at"], stamp, account_id),
+        )
+        for device in devices:
+            external_hash = hashlib.blake2b(
+                f"{provider}:{account_id}:{device.externalId}".encode(),
+                key=AES_KEY,
+                digest_size=32,
+            ).hexdigest()
+            existing = conn.execute(
+                "SELECT id,stream_support FROM cloud_devices WHERE account_id=? AND external_id_hash=?",
+                (account_id, external_hash),
+            ).fetchone()
+            device_id = existing["id"] if existing else str(uuid.uuid4())
+            stream_support = (
+                "unsupported"
+                if device.streamSupport == "unsupported"
+                else "verified"
+                if existing and existing["stream_support"] == "verified"
+                else device.streamSupport
+            )
+            conn.execute(
+                """INSERT INTO cloud_devices(
+                   id,account_id,external_id_hash,external_id_ct,home_id_ct,name,model,manufacturer,
+                   capabilities_json,stream_support,last_error_code,last_seen_at,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(account_id,external_id_hash) DO UPDATE SET
+                   external_id_ct=excluded.external_id_ct,home_id_ct=excluded.home_id_ct,
+                   name=excluded.name,model=excluded.model,manufacturer=excluded.manufacturer,
+                   capabilities_json=excluded.capabilities_json,stream_support=excluded.stream_support,
+                   last_error_code=excluded.last_error_code,last_seen_at=excluded.last_seen_at,
+                   updated_at=excluded.updated_at""",
+                (
+                    device_id,
+                    account_id,
+                    external_hash,
+                    encrypt_text(device.externalId),
+                    encrypt_text(device.homeId) if device.homeId else None,
+                    device.name,
+                    device.model,
+                    device.manufacturer,
+                    json.dumps(device.capabilities, separators=(",", ":")),
+                    stream_support,
+                    device.errorCode,
+                    stamp,
+                    stamp,
+                    stamp,
+                ),
+            )
+
+
+def cloud_discovery_results() -> list[dict]:
+    with connect() as conn:
+        accounts = conn.execute(
+            "SELECT id FROM cloud_accounts WHERE provider='netatmo' AND enabled=1"
+        ).fetchall()
+    for account in accounts:
+        try:
+            refresh_netatmo_inventory(account["id"])
+        except HTTPException:
+            continue
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT d.*,a.provider,a.label AS account_label,a.status AS account_status,
+               c.id AS configured_camera_id,c.name AS configured_name
+               FROM cloud_devices d JOIN cloud_accounts a ON a.id=d.account_id
+               LEFT JOIN cameras c ON c.cloud_device_id=d.id
+               WHERE a.enabled=1 ORDER BY a.provider,a.label,d.name"""
+        ).fetchall()
+    return [
+        {
+            "id": str(uuid.uuid4()),
+            "origin": "cloud",
+            "provider": row["provider"],
+            "accountId": row["account_id"],
+            "accountLabel": row["account_label"],
+            "cloudDeviceId": row["id"],
+            "name": row["name"],
+            "manufacturer": row["manufacturer"] or row["provider"],
+            "model": row["model"] or "Unbekannt",
+            "streamSupport": row["stream_support"],
+            "available": row["stream_support"] != "unsupported" and row["account_status"] == "active",
+            "reason": row["last_error_code"],
+            "configuredCameraId": row["configured_camera_id"],
+            "configuredName": row["configured_name"],
+            "previewAvailable": bool(row["configured_camera_id"]),
+            "previewVerified": row["stream_support"] == "verified",
+        }
+        for row in rows
+    ]
+
+
+def safe_netatmo_stream_base(value: str) -> str | None:
+    try:
+        parsed = urlparse(value)
+        if parsed.username or parsed.password or parsed.query or parsed.fragment or not parsed.hostname:
+            return None
+        if parsed.scheme == "https":
+            hostname = parsed.hostname.lower()
+            return value.rstrip("/") if hostname.endswith((".netatmo.net", ".netatmo.com")) else None
+        if parsed.scheme != "http":
+            return None
+        address = ipaddress.ip_address(parsed.hostname)
+        return value.rstrip("/") if address.is_private or address.is_loopback else None
+    except ValueError:
+        return None
+
+
+def netatmo_stream_candidates(device_id: str) -> list[str]:
+    cached = NETATMO_STREAM_CACHE.get(device_id)
+    if cached and cached[0] > time.time():
+        return cached[1]
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT d.*,a.provider FROM cloud_devices d JOIN cloud_accounts a ON a.id=d.account_id
+               WHERE d.id=? AND a.provider='netatmo' AND a.enabled=1""",
+            (device_id,),
+        ).fetchone()
+    if not row or row["stream_support"] == "unsupported":
+        return []
+    external_id = decrypt_text(row["external_id_ct"])
+    home_id = decrypt_text(row["home_id_ct"])
+    status = netatmo_api_json(row["account_id"], "homestatus", {"home_id": home_id})
+    home = status.get("home") or {}
+    candidates = list(home.get("cameras") or []) + list(home.get("modules") or [])
+    camera = next((item for item in candidates if str(item.get("id") or item.get("mac") or "") == external_id), None)
+    base = safe_netatmo_stream_base(str((camera or {}).get("vpn_url") or ""))
+    urls = (
+        [
+            f"{base}/live/index.m3u8",
+            f"{base}/live/files/high/index.m3u8",
+            f"{base}/live/files/medium/index.m3u8",
+        ]
+        if base
+        else []
+    )
+    NETATMO_STREAM_CACHE[device_id] = (time.time() + 60, urls)
+    return urls
 
 
 def probe_port(ip: str, port: int, timeout: float = 0.35) -> bool:
@@ -1512,6 +2169,12 @@ def ws_discovery() -> set[str]:
     return found
 
 
+def discovery_sort_key(item: dict) -> tuple:
+    if item.get("origin") == "cloud":
+        return (1, item.get("provider", ""), item.get("accountLabel", ""), item.get("name", ""))
+    return (0, int(ipaddress.ip_address(item["address"])), "", "")
+
+
 def scan_network(scan_id: str) -> None:
     with SCAN_LOCK:
         try:
@@ -1544,9 +2207,10 @@ def scan_network(scan_id: str) -> None:
                         "model": row["model"] or "",
                         "profiles": saved_capabilities.get("profiles", []),
                     }
-            results = [
+            results = cloud_discovery_results() + [
                 {
                     "id": str(uuid.uuid4()),
+                    "origin": "local",
                     "address": address,
                     "manufacturer": known["manufacturer"] or "Unbekannt",
                     "model": known["model"] or "Unbekannt",
@@ -1565,7 +2229,7 @@ def scan_network(scan_id: str) -> None:
                 for address, known in configured.items()
                 if ipaddress.ip_address(address) in ALLOWED_NETWORK
             ]
-            results.sort(key=lambda candidate: ipaddress.ip_address(candidate["address"]))
+            results.sort(key=discovery_sort_key)
             SCANS[scan_id].update(results=list(results))
             # Known cameras and WS-Discovery responders are checked first. This
             # avoids starving devices that limit parallel management sockets.
@@ -1614,6 +2278,7 @@ def scan_network(scan_id: str) -> None:
                 saved_profiles = known["profiles"] if known and known["profiles"] else []
                 return {
                     "id": str(uuid.uuid4()),
+                    "origin": "local",
                     "address": ip,
                     "manufacturer": inventory["manufacturer"] or (known["manufacturer"] if known else "") or "Unbekannt",
                     "model": inventory["model"] or (known["model"] if known else "") or "Unbekannt",
@@ -1640,9 +2305,9 @@ def scan_network(scan_id: str) -> None:
                     item = future.result()
                     if item:
                         results.append(item)
-                        results.sort(key=lambda candidate: ipaddress.ip_address(candidate["address"]))
+                        results.sort(key=discovery_sort_key)
                     SCANS[scan_id].update(results=list(results), completedHosts=completed, totalHosts=len(hosts))
-            results.sort(key=lambda item: ipaddress.ip_address(item["address"]))
+            results.sort(key=discovery_sort_key)
             SCANS[scan_id].update(state="complete", completedAt=now_iso(), results=results)
         except Exception:
             SCANS[scan_id].update(state="failed", completedAt=now_iso(), error="scan-failed")
@@ -1683,11 +2348,12 @@ def discovery_item(scan_id: str, device_id: str) -> tuple[dict, dict]:
     item = next((candidate for candidate in scan.get("results", []) if candidate["id"] == device_id), None)
     if not item:
         raise HTTPException(404, "device-not-found")
-    try:
-        if ipaddress.ip_address(item["address"]) not in ALLOWED_NETWORK:
-            raise HTTPException(400, "device-outside-discovery-network")
-    except ValueError as exc:
-        raise HTTPException(400, "device-address-invalid") from exc
+    if item.get("origin") != "cloud":
+        try:
+            if ipaddress.ip_address(item["address"]) not in ALLOWED_NETWORK:
+                raise HTTPException(400, "device-outside-discovery-network")
+        except ValueError as exc:
+            raise HTTPException(400, "device-address-invalid") from exc
     return scan, item
 
 
@@ -1706,6 +2372,63 @@ def probe_discovery_streams(
     _, item = discovery_item(scan_id, device_id)
     if item.get("configuredCameraId"):
         raise HTTPException(409, "device-already-configured")
+    if item.get("origin") == "cloud":
+        if item.get("streamSupport") == "unsupported":
+            raise HTTPException(422, item.get("reason") or "cloud-device-stream-unsupported")
+        with connect() as conn:
+            device = conn.execute(
+                """SELECT d.*,a.provider FROM cloud_devices d JOIN cloud_accounts a ON a.id=d.account_id
+                   WHERE d.id=? AND a.enabled=1""",
+                (item["cloudDeviceId"],),
+            ).fetchone()
+        if not device:
+            raise HTTPException(404, "cloud-device-not-found")
+        probe_path = f"cloud-probe-{secrets.token_hex(8)}"
+        lease = {
+            "cameraId": f"probe-{device['id']}",
+            "path": probe_path,
+            "deviceId": device["id"],
+            "accountId": device["account_id"],
+            "active": True,
+        }
+        if device["provider"] == "czeview":
+            lease["externalId"] = decrypt_text(device["external_id_ct"])
+        CLOUD_PROBE_LEASES[device["id"]] = {
+            "provider": device["provider"],
+            "expiresAt": time.time() + 75,
+            "lease": lease,
+        }
+        try:
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                paths, media_ok = media_paths()
+                if media_ok and paths.get(probe_path, {}).get("ready"):
+                    try:
+                        frame = capture_rtsp_frame(probe_path, timeout=15)
+                        break
+                    except HTTPException:
+                        pass
+                time.sleep(0.75)
+            else:
+                raise HTTPException(504, f"{device['provider']}-preview-source-timeout")
+        finally:
+            CLOUD_PROBE_LEASES.pop(device["id"], None)
+        DISCOVERY_PREVIEW_CACHE[(scan_id, device_id)] = (time.time() + 5 * 60, frame)
+        with DB_LOCK, connect() as conn:
+            conn.execute(
+                """UPDATE cloud_devices SET stream_support='verified',last_error_code=NULL,
+                   updated_at=? WHERE id=?""",
+                (now_iso(), device["id"]),
+            )
+        item.update(
+            streamSupport="verified",
+            available=True,
+            reason=None,
+            previewAvailable=True,
+            previewVerified=True,
+            previewError=None,
+        )
+        return public_discovery_item(item)
     address = item["address"]
     onvif_port = item.get("onvifPort")
     if not onvif_port:
@@ -1787,6 +2510,100 @@ def probe_discovery_streams(
         previewError=None if frame else (preview_error or "preview-frame-unavailable"),
     )
     return public_discovery_item(item)
+
+
+@app.post("/api/admin/discovery/scans/{scan_id}/devices/{device_id}/import")
+def import_cloud_discovery_device(
+    scan_id: str,
+    device_id: str,
+    body: CloudCameraImport,
+    actor: sqlite3.Row = Depends(require_admin_elevated),
+):
+    _, item = discovery_item(scan_id, device_id)
+    if item.get("origin") != "cloud":
+        raise HTTPException(422, "cloud-device-required")
+    with DB_LOCK, connect() as conn:
+        device = conn.execute(
+            """SELECT d.*,a.provider FROM cloud_devices d JOIN cloud_accounts a ON a.id=d.account_id
+               WHERE d.id=? AND a.enabled=1""",
+            (item["cloudDeviceId"],),
+        ).fetchone()
+        if not device:
+            raise HTTPException(404, "cloud-device-not-found")
+        if device["stream_support"] != "verified":
+            raise HTTPException(409, "cloud-device-frame-proof-required")
+        existing = conn.execute("SELECT * FROM cameras WHERE cloud_device_id=?", (device["id"],)).fetchone()
+        if existing:
+            raise HTTPException(409, "device-already-configured")
+        if conn.execute("SELECT COUNT(*) FROM cameras").fetchone()[0] >= MAX_CAMERAS:
+            raise HTTPException(409, "camera-limit-reached")
+        camera_id = f"{device['provider']}-{device['id'].replace('-', '')[:12]}"
+        stream_path = f"{camera_id}-low"
+        stamp = now_iso()
+        capabilities = {
+            "device": {
+                "manufacturer": device["manufacturer"],
+                "model": device["model"],
+                "firmwareVersion": None,
+                "serialNumber": None,
+                "hardwareId": "cloud-adapter",
+            },
+            "profiles": [
+                {
+                    "token": "cloud",
+                    "name": "Cloud-Livebild",
+                    "codec": "h264",
+                    "width": None,
+                    "height": None,
+                    "frameRate": None,
+                    "bitrate": None,
+                    "audioCodec": None,
+                    "streamPath": stream_path,
+                }
+            ],
+            "audio": {"supported": False, "codecs": []},
+            "ptz": {
+                "supported": False,
+                "axes": [],
+                "presets": [],
+                "absoluteMove": False,
+                "relativeMove": False,
+                "continuousMove": False,
+            },
+            "snapshot": {"supported": True},
+            "imaging": False,
+            "events": False,
+            "analytics": False,
+            "deviceIo": False,
+        }
+        position = conn.execute("SELECT COALESCE(MAX(position),-1)+1 FROM cameras").fetchone()[0]
+        conn.execute(
+            """INSERT INTO cameras(
+               id,name,position,enabled,source_label,low_path,high_path,detail_quality,
+               managed,address,protocol,port,low_source_path,high_source_path,codec,
+               manufacturer,model,on_demand,external_control_url,external_capabilities_json,
+               cloud_device_id,created_at,updated_at)
+               VALUES(?,?,?,1,?,?,?,?,0,NULL,'external',NULL,NULL,NULL,'h264',?,?,1,NULL,?,?,?,?)""",
+            (
+                camera_id,
+                body.name or device["name"],
+                position,
+                f"{device['provider'].title()} Cloud · bei Bedarf",
+                stream_path,
+                stream_path,
+                "Frame-geprüfter Cloud-Stream",
+                device["manufacturer"],
+                device["model"],
+                json.dumps(capabilities, separators=(",", ":")),
+                device["id"],
+                stamp,
+                stamp,
+            ),
+        )
+        audit(conn, actor["user_id"], "camera.cloud.imported", "camera", camera_id)
+        row = conn.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
+    item.update(configuredCameraId=camera_id, configuredName=row["name"])
+    return admin_camera(row)
 
 
 @app.get("/api/admin/discovery/scans/{scan_id}/devices/{device_id}/preview")
@@ -2674,6 +3491,224 @@ def require_internal(authorization: str = Header(default="")) -> None:
     expected = f"Bearer {INTERNAL_TOKEN}"
     if not secrets.compare_digest(authorization, expected):
         raise HTTPException(401, "internal-auth-required")
+
+
+def require_czeview_adapter(authorization: str = Header(default="")) -> None:
+    if not CZEVIEW_ADAPTER_TOKEN or not secrets.compare_digest(
+        authorization, f"Bearer {CZEVIEW_ADAPTER_TOKEN}"
+    ):
+        raise HTTPException(401, "czeview-adapter-auth-required")
+
+
+def require_netatmo_adapter(authorization: str = Header(default="")) -> None:
+    if not NETATMO_ADAPTER_TOKEN or not secrets.compare_digest(
+        authorization, f"Bearer {NETATMO_ADAPTER_TOKEN}"
+    ):
+        raise HTTPException(401, "netatmo-adapter-auth-required")
+
+
+@app.post("/internal/v1/providers/czeview/legacy-account")
+def import_legacy_czeview_account(
+    body: CzeviewAccountCreate,
+    _: None = Depends(require_czeview_adapter),
+):
+    with DB_LOCK, connect() as conn:
+        existing = conn.execute(
+            "SELECT * FROM cloud_accounts WHERE provider='czeview' ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        if existing:
+            return cloud_account_payload(existing)
+        account_id, stamp = str(uuid.uuid4()), now_iso()
+        auth = {
+            "username": body.username,
+            "email": body.email,
+            "login": body.email or body.username,
+            "password": body.password,
+            "countryCode": body.countryCode,
+            "phoneCode": body.phoneCode,
+            "sourceApp": body.sourceApp,
+            "deviceSerial": body.deviceSerial,
+            "cameraName": body.cameraName,
+        }
+        conn.execute(
+            """INSERT INTO cloud_accounts(
+               id,provider,label,enabled,auth_payload_ct,scopes_json,status,legacy_source,created_at,updated_at)
+               VALUES(?,'czeview',?,1,?,'[]','pending','poc.env',?,?)""",
+            (account_id, body.label, encrypt_json(auth), stamp, stamp),
+        )
+        audit(conn, None, "cloud.account.legacy-imported", "cloud-account", account_id)
+        row = conn.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
+    return cloud_account_payload(row)
+
+
+@app.get("/internal/v1/providers/czeview/accounts")
+def czeview_adapter_accounts(_: None = Depends(require_czeview_adapter)):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM cloud_accounts WHERE provider='czeview' AND enabled=1 ORDER BY created_at"
+        ).fetchall()
+    return {
+        "accounts": [
+            {
+                "id": row["id"],
+                "label": row["label"],
+                "credentials": decrypt_json(row["auth_payload_ct"]),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/internal/v1/providers/czeview/inventory")
+def update_czeview_inventory(
+    body: CloudInventoryUpdate,
+    _: None = Depends(require_czeview_adapter),
+):
+    stamp = now_iso()
+    result = []
+    with DB_LOCK, connect() as conn:
+        account = conn.execute(
+            "SELECT * FROM cloud_accounts WHERE id=? AND provider='czeview'",
+            (body.accountId,),
+        ).fetchone()
+        if not account:
+            raise HTTPException(404, "cloud-account-not-found")
+        conn.execute(
+            """UPDATE cloud_accounts SET status=?,last_error_code=?,last_verified_at=?,
+               updated_at=? WHERE id=?""",
+            (
+                body.status,
+                body.errorCode,
+                stamp if body.status == "active" else account["last_verified_at"],
+                stamp,
+                body.accountId,
+            ),
+        )
+        for device in body.devices:
+            external_hash = hashlib.blake2b(
+                f"czeview:{body.accountId}:{device.externalId}".encode(),
+                key=AES_KEY,
+                digest_size=32,
+            ).hexdigest()
+            existing = conn.execute(
+                "SELECT id,stream_support FROM cloud_devices WHERE account_id=? AND external_id_hash=?",
+                (body.accountId, external_hash),
+            ).fetchone()
+            device_id = existing["id"] if existing else str(uuid.uuid4())
+            stream_support = (
+                "verified"
+                if existing and existing["stream_support"] == "verified"
+                else "unsupported"
+                if device.streamSupport == "unsupported"
+                else "candidate"
+            )
+            conn.execute(
+                """INSERT INTO cloud_devices(
+                   id,account_id,external_id_hash,external_id_ct,home_id_ct,name,model,manufacturer,
+                   capabilities_json,stream_support,last_error_code,last_seen_at,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(account_id,external_id_hash) DO UPDATE SET
+                   external_id_ct=excluded.external_id_ct,home_id_ct=excluded.home_id_ct,
+                   name=excluded.name,model=excluded.model,manufacturer=excluded.manufacturer,
+                   capabilities_json=excluded.capabilities_json,stream_support=excluded.stream_support,
+                   last_error_code=excluded.last_error_code,last_seen_at=excluded.last_seen_at,
+                   updated_at=excluded.updated_at""",
+                (
+                    device_id,
+                    body.accountId,
+                    external_hash,
+                    encrypt_text(device.externalId),
+                    encrypt_text(device.homeId) if device.homeId else None,
+                    device.name,
+                    device.model,
+                    device.manufacturer,
+                    json.dumps(device.capabilities, separators=(",", ":")),
+                    stream_support,
+                    device.errorCode,
+                    stamp,
+                    stamp,
+                    stamp,
+                ),
+            )
+            result.append({"externalId": device.externalId, "deviceId": device_id})
+        if account["legacy_source"] and result:
+            auth = decrypt_json(account["auth_payload_ct"])
+            preferred = str(auth.get("deviceSerial") or "")
+            selected = next(
+                (item for item in result if preferred and item["externalId"] == preferred),
+                result[0] if len(result) == 1 else None,
+            )
+            if selected:
+                conn.execute(
+                    """UPDATE cameras SET cloud_device_id=?,updated_at=?
+                       WHERE id='czeview' AND protocol='external' AND cloud_device_id IS NULL""",
+                    (selected["deviceId"], stamp),
+                )
+    return {"accountId": body.accountId, "devices": result}
+
+
+@app.get("/internal/v1/providers/czeview/leases")
+def czeview_adapter_leases(_: None = Depends(require_czeview_adapter)):
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT c.id AS camera_id,c.low_path,c.enabled,d.id AS device_id,d.external_id_ct,
+               d.account_id FROM cameras c JOIN cloud_devices d ON d.id=c.cloud_device_id
+               JOIN cloud_accounts a ON a.id=d.account_id
+               WHERE a.provider='czeview' AND a.enabled=1"""
+        ).fetchall()
+    cameras = [
+            {
+                "cameraId": row["camera_id"],
+                "path": row["low_path"],
+                "deviceId": row["device_id"],
+                "externalId": decrypt_text(row["external_id_ct"]),
+                "accountId": row["account_id"],
+                "active": bool(row["enabled"] and active_camera_leases(row["camera_id"])),
+            }
+            for row in rows
+    ]
+    now = time.time()
+    for device_id, probe in list(CLOUD_PROBE_LEASES.items()):
+        if probe["expiresAt"] <= now:
+            CLOUD_PROBE_LEASES.pop(device_id, None)
+            continue
+        if probe["provider"] == "czeview":
+            cameras.append(probe["lease"].copy())
+    return {"cameras": cameras}
+
+
+@app.get("/internal/v1/providers/netatmo/streams")
+def netatmo_adapter_streams(_: None = Depends(require_netatmo_adapter)):
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT c.id AS camera_id,c.low_path,c.enabled,d.id AS device_id,d.account_id
+               FROM cameras c JOIN cloud_devices d ON d.id=c.cloud_device_id
+               JOIN cloud_accounts a ON a.id=d.account_id
+               WHERE a.provider='netatmo' AND a.enabled=1"""
+        ).fetchall()
+    streams = []
+    for row in rows:
+        active = bool(row["enabled"] and active_camera_leases(row["camera_id"]))
+        streams.append(
+            {
+                "cameraId": row["camera_id"],
+                "path": row["low_path"],
+                "deviceId": row["device_id"],
+                "accountId": row["account_id"],
+                "active": active,
+                "streamCandidates": netatmo_stream_candidates(row["device_id"]) if active else [],
+            }
+        )
+    now = time.time()
+    for device_id, probe in list(CLOUD_PROBE_LEASES.items()):
+        if probe["expiresAt"] <= now:
+            CLOUD_PROBE_LEASES.pop(device_id, None)
+            continue
+        if probe["provider"] == "netatmo":
+            lease = probe["lease"].copy()
+            lease["streamCandidates"] = netatmo_stream_candidates(device_id)
+            streams.append(lease)
+    return {"cameras": streams}
 
 
 @app.put("/internal/v1/external-cameras/{camera_id}")

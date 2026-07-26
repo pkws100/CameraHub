@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -30,6 +31,7 @@ MEDIAMTX_API = os.environ.get("MEDIAMTX_API", "http://mediamtx:9997").rstrip("/"
 PUBLISH_URL = os.environ.get("MEDIAMTX_PUBLISH_URL", "rtsp://mediamtx:8554/czeview-low")
 CREDENTIALS_PATH = Path(os.environ.get("CZEVIEW_CREDENTIALS_PATH", "/run/secrets/czeview_credentials"))
 TOKEN_PATH = Path(os.environ.get("INTERNAL_TOKEN_PATH", "/run/secrets/zmodo_internal_token"))
+ADAPTER_TOKEN_PATH = Path(os.environ.get("CZEVIEW_ADAPTER_TOKEN_PATH", "/run/secrets/czeview_adapter_token"))
 SESSION_PATH = Path(os.environ.get("CZEVIEW_SESSION_PATH", "/data/session.json"))
 HEALTH_PATH = Path("/run/bridge-health/state")
 CAMERA_ID = os.environ.get("CZEVIEW_CAMERA_ID", "czeview")
@@ -41,6 +43,10 @@ stop_event = threading.Event()
 active_event = threading.Event()
 client_lock = threading.RLock()
 control_state: dict[str, Any] = {"client": None, "device": None, "ptz_mode": None}
+camera_controls: dict[str, dict[str, Any]] = {}
+account_leases: dict[str, list[dict[str, Any]]] = {}
+enabled_account_ids: set[str] = set()
+runtime_lock = threading.RLock()
 control_server: ThreadingHTTPServer | None = None
 
 
@@ -76,10 +82,18 @@ def load_credentials(path: Path) -> dict[str, str]:
     return values
 
 
-def internal_token() -> str:
-    encoded = TOKEN_PATH.read_text(encoding="utf-8").strip()
+def token_from_path(path: Path) -> str:
+    encoded = path.read_text(encoding="utf-8").strip()
     raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))[:32]
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def internal_token() -> str:
+    return token_from_path(TOKEN_PATH)
+
+
+def adapter_token() -> str:
+    return token_from_path(ADAPTER_TOKEN_PATH)
 
 
 def request_json(path: str, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -89,7 +103,7 @@ def request_json(path: str, method: str = "GET", payload: dict[str, Any] | None 
         data=data,
         method=method,
         headers={
-            "Authorization": f"Bearer {internal_token()}",
+            "Authorization": f"Bearer {adapter_token()}",
             "Content-Type": "application/json",
         },
     )
@@ -170,11 +184,12 @@ def ptz_parameters(ptz_mode: str, direction: str | None) -> tuple[str, str]:
     )
 
 
-def control_ptz(direction: str | None) -> None:
+def control_ptz(direction: str | None, camera_id: str = CAMERA_ID) -> None:
     with client_lock:
-        client = control_state["client"]
-        device = control_state["device"]
-        ptz_mode = control_state["ptz_mode"]
+        state = camera_controls.get(camera_id, control_state)
+        client = state["client"]
+        device = state["device"]
+        ptz_mode = state["ptz_mode"]
         if not client or not device or not ptz_mode:
             raise RuntimeError("ptz-not-ready")
         code, value = ptz_parameters(ptz_mode, direction)
@@ -207,11 +222,11 @@ class ControlHandler(BaseHTTPRequestHandler):
         if not hmac.compare_digest(self.headers.get("Authorization", ""), expected):
             self.send_json(401, {"ok": False, "error": "internal-auth-required"})
             return
-        prefix = f"/v1/cameras/{quote(CAMERA_ID, safe='')}/ptz/"
-        if not self.path.startswith(prefix):
+        match = re.fullmatch(r"/v1/cameras/([A-Za-z0-9._-]+)/ptz/(start|stop)", self.path)
+        if not match:
             self.send_json(404, {"ok": False, "error": "not-found"})
             return
-        action = self.path[len(prefix):]
+        camera_id, action = match.groups()
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError:
@@ -230,7 +245,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             if action not in {"start", "stop"}:
                 raise ValueError("unsupported-action")
             direction = str(body.get("direction") or "") if action == "start" else None
-            control_ptz(direction)
+            control_ptz(direction, camera_id)
         except (CloudEdgeError, OSError, RuntimeError, ValueError):
             self.send_json(409, {"ok": False, "error": "ptz-command-rejected"})
             return
@@ -245,10 +260,10 @@ def start_control_server() -> None:
     threading.Thread(target=control_server.serve_forever, daemon=True).start()
 
 
-def ensure_mediamtx_path() -> None:
+def ensure_mediamtx_path(path: str = STREAM_PATH) -> None:
     payload = json.dumps({"source": "publisher", "record": False}).encode()
     request = Request(
-        f"{MEDIAMTX_API}/v3/config/paths/add/{quote(STREAM_PATH, safe='')}",
+        f"{MEDIAMTX_API}/v3/config/paths/add/{quote(path, safe='')}",
         data=payload,
         method="POST",
         headers={"Content-Type": "application/json"},
@@ -259,7 +274,7 @@ def ensure_mediamtx_path() -> None:
     except HTTPError as error:
         if error.code != 400:
             raise
-    verify = Request(f"{MEDIAMTX_API}/v3/config/paths/get/{quote(STREAM_PATH, safe='')}")
+    verify = Request(f"{MEDIAMTX_API}/v3/config/paths/get/{quote(path, safe='')}")
     with urlopen(verify, timeout=5) as response:
         configured = json.load(response)
     if configured.get("source") != "publisher":
@@ -267,10 +282,11 @@ def ensure_mediamtx_path() -> None:
 
 
 class FfmpegPublisher:
-    def __init__(self) -> None:
+    def __init__(self, path: str = STREAM_PATH) -> None:
         self.process: subprocess.Popen[bytes] | None = None
         self.frames = 0
         self.bytes = 0
+        self.path = path
 
     def start(self) -> None:
         if self.process and self.process.poll() is None:
@@ -322,7 +338,7 @@ class FfmpegPublisher:
                 "rtsp",
                 "-rtsp_transport",
                 "tcp",
-                PUBLISH_URL,
+                f"rtsp://mediamtx:8554/{self.path}",
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
@@ -377,16 +393,17 @@ def lease_poller() -> None:
         stop_event.wait(POLL_SECONDS)
 
 
-def make_client(credentials: dict[str, str]) -> CloudEdgeClient:
+def make_client(credentials: dict[str, str], session_path: Path = SESSION_PATH) -> CloudEdgeClient:
+    login = credentials.get("login") or credentials.get("email") or credentials.get("username") or credentials.get("CZEVIEW_USEREMAIL", "")
     client = CloudEdgeClient(
-        credentials["CZEVIEW_USEREMAIL"],
-        credentials["CZEVIEW_PASSWORD"],
-        credentials["CZEVIEW_COUNTRY_CODE"],
-        credentials["CZEVIEW_PHONE_CODE"],
+        login,
+        credentials.get("password") or credentials["CZEVIEW_PASSWORD"],
+        credentials.get("countryCode") or credentials["CZEVIEW_COUNTRY_CODE"],
+        credentials.get("phoneCode") or credentials["CZEVIEW_PHONE_CODE"],
         debug=False,
-        session_cache_file=str(SESSION_PATH),
+        session_cache_file=str(session_path),
         enable_network_ping=False,
-        source_app=credentials["CZEVIEW_SOURCE_APP"],
+        source_app=credentials.get("sourceApp") or credentials.get("CZEVIEW_SOURCE_APP", "141"),
     )
     client.authenticate()
     return client
@@ -451,40 +468,208 @@ def shutdown(*_args: Any) -> None:
         control_server.shutdown()
 
 
-def main() -> None:
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+def import_legacy_account() -> None:
+    if not CREDENTIALS_PATH.exists() or not CREDENTIALS_PATH.read_text(encoding="utf-8-sig").strip():
+        return
     credentials = load_credentials(CREDENTIALS_PATH)
-    SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
-    poller_started = False
-    last_cache_reset = -600.0
+    request_json(
+        "/internal/v1/providers/czeview/legacy-account",
+        "POST",
+        {
+            "label": credentials.get("CZEVIEW_ACCOUNT_LABEL") or "CZEview",
+            "username": credentials.get("CZEVIEW_USERNAME", credentials["CZEVIEW_USEREMAIL"]),
+            "email": credentials["CZEVIEW_USEREMAIL"],
+            "password": credentials["CZEVIEW_PASSWORD"],
+            "countryCode": credentials["CZEVIEW_COUNTRY_CODE"],
+            "phoneCode": credentials["CZEVIEW_PHONE_CODE"],
+            "sourceApp": credentials["CZEVIEW_SOURCE_APP"],
+            "deviceSerial": credentials.get("CZEVIEW_DEVICE_SERIAL", ""),
+            "cameraName": credentials.get("CZEVIEW_CAMERA_NAME", ""),
+        },
+    )
+
+
+def lease_manager() -> None:
     while not stop_event.is_set():
         try:
-            client = make_client(credentials)
+            state = request_json("/internal/v1/providers/czeview/leases")
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for camera in state.get("cameras", []):
+                grouped.setdefault(str(camera["accountId"]), []).append(camera)
+            with runtime_lock:
+                account_leases.clear()
+                account_leases.update(grouped)
+        except (OSError, ValueError, HTTPError, URLError):
+            log("lease_inventory_unavailable")
+        stop_event.wait(POLL_SECONDS)
+
+
+def account_active_camera(account_id: str) -> dict[str, Any] | None:
+    with runtime_lock:
+        return next((item.copy() for item in account_leases.get(account_id, []) if item.get("active")), None)
+
+
+def account_enabled(account_id: str) -> bool:
+    with runtime_lock:
+        return account_id in enabled_account_ids
+
+
+def account_worker(account: dict[str, Any]) -> None:
+    account_id = str(account["id"])
+    session_path = SESSION_PATH.parent / "accounts" / f"{account_id}.json"
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    last_cache_reset = -600.0
+    while not stop_event.is_set() and account_enabled(account_id):
+        try:
+            client = make_client(account["credentials"], session_path)
             devices = client.get_all_devices()
-            device = select_device(devices, credentials.get("CZEVIEW_DEVICE_SERIAL", ""))
-            ptz_mode = detect_ptz_mode(client, device)
-            with client_lock:
-                control_state.update(client=client, device=device, ptz_mode=ptz_mode)
-            ensure_mediamtx_path()
-            register_camera(device, credentials, ptz_mode)
-            start_control_server()
+            inventory = []
+            by_serial: dict[str, dict[str, Any]] = {}
+            for device in devices:
+                serial = str(device.get("serial_number") or "")
+                if not serial:
+                    continue
+                by_serial[serial] = device
+                inventory.append(
+                    {
+                        "externalId": serial,
+                        "name": str(device.get("name") or device.get("device_name") or f"CZEview {serial[-4:]}"),
+                        "model": f"API-Gerätetyp {device.get('type_id') or 'unbekannt'}",
+                        "manufacturer": "CZEview (Plattformmarke)",
+                        "capabilities": {"provider": "czeview", "typeId": device.get("type_id")},
+                        "streamSupport": "candidate",
+                    }
+                )
+            mapping = request_json(
+                "/internal/v1/providers/czeview/inventory",
+                "POST",
+                {"accountId": account_id, "status": "active", "devices": inventory},
+            )
+            log("authenticated", account=account_id, devices=len(inventory))
+            HEALTH_PATH.parent.mkdir(parents=True, exist_ok=True)
             HEALTH_PATH.write_text(str(int(time.time())), encoding="ascii")
-            log("authenticated", devices=len(devices), ptz="horizontal" if ptz_mode else "none")
-            if not poller_started:
-                threading.Thread(target=lease_poller, daemon=True).start()
-                poller_started = True
-            serve(client, device)
-            return
+            while not stop_event.is_set() and account_enabled(account_id):
+                camera = account_active_camera(account_id)
+                if not camera:
+                    stop_event.wait(1)
+                    continue
+                device = by_serial.get(str(camera["externalId"]))
+                if not device:
+                    stop_event.wait(5)
+                    continue
+                path = str(camera["path"])
+                ensure_mediamtx_path(path)
+                publisher = FfmpegPublisher(path)
+                publisher.start()
+                ptz_mode = detect_ptz_mode(client, device)
+                with client_lock:
+                    camera_controls[str(camera["cameraId"])] = {
+                        "client": client,
+                        "device": device,
+                        "ptz_mode": ptz_mode,
+                    }
+                holder: dict[str, Any] = {}
+
+                def on_video(data: bytes) -> None:
+                    streamer = holder.get("streamer")
+                    current = account_active_camera(account_id)
+                    if (
+                        stop_event.is_set()
+                        or not current
+                        or current.get("cameraId") != camera.get("cameraId")
+                    ):
+                        if streamer:
+                            streamer.request_stop()
+                        return
+                    try:
+                        publisher.write(data)
+                    except (BrokenPipeError, OSError, ValueError):
+                        if streamer:
+                            streamer.request_stop()
+
+                try:
+                    streamer = client.create_streamer(
+                        device,
+                        on_video=on_video,
+                        remote=False,
+                        video_id=0,
+                        manage_stream_switch=True,
+                    )
+                    holder["streamer"] = streamer
+                    frames, byte_count = streamer.run_session()
+                    if frames:
+                        log(
+                            "stream_window_complete",
+                            account=account_id,
+                            camera=camera["cameraId"],
+                            frames=frames,
+                            bytes=byte_count,
+                        )
+                    else:
+                        stop_event.wait(2)
+                finally:
+                    publisher.stop()
+                    with client_lock:
+                        camera_controls.pop(str(camera["cameraId"]), None)
         except CloudEdgeError as error:
-            log("degraded", reason=type(error).__name__)
+            log("degraded", account=account_id, reason=type(error).__name__)
+            try:
+                request_json(
+                    "/internal/v1/providers/czeview/inventory",
+                    "POST",
+                    {
+                        "accountId": account_id,
+                        "status": "reauth-required",
+                        "errorCode": "czeview-authentication-failed",
+                        "devices": [],
+                    },
+                )
+            except Exception:
+                pass
             if time.monotonic() - last_cache_reset >= 600:
-                SESSION_PATH.unlink(missing_ok=True)
+                session_path.unlink(missing_ok=True)
                 last_cache_reset = time.monotonic()
             stop_event.wait(30)
         except (OSError, ValueError, RuntimeError, HTTPError, URLError) as error:
-            log("degraded", reason=type(error).__name__)
-            stop_event.wait(30)
+            log("degraded", account=account_id, reason=type(error).__name__)
+            stop_event.wait(15)
+
+
+def account_manager() -> None:
+    workers: dict[str, threading.Thread] = {}
+    imported = False
+    while not stop_event.is_set():
+        try:
+            if not imported:
+                import_legacy_account()
+                imported = True
+            response = request_json("/internal/v1/providers/czeview/accounts")
+            HEALTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+            HEALTH_PATH.write_text(str(int(time.time())), encoding="ascii")
+            accounts = response.get("accounts", [])
+            with runtime_lock:
+                enabled_account_ids.clear()
+                enabled_account_ids.update(str(account["id"]) for account in accounts)
+            for account in accounts:
+                account_id = str(account["id"])
+                worker = workers.get(account_id)
+                if worker and worker.is_alive():
+                    continue
+                worker = threading.Thread(target=account_worker, args=(account,), daemon=True)
+                workers[account_id] = worker
+                worker.start()
+        except (OSError, ValueError, RuntimeError, HTTPError, URLError):
+            log("account_inventory_unavailable")
+        stop_event.wait(10)
+
+
+def main() -> None:
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    start_control_server()
+    threading.Thread(target=lease_manager, daemon=True).start()
+    account_manager()
 
 
 if __name__ == "__main__":
