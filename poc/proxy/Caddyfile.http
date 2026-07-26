@@ -16,7 +16,9 @@ http://{$ZMODO_BIND_IP}:8090 {
 	}
 
 	handle_path /hls/* {
-		reverse_proxy mediamtx:8888
+		reverse_proxy mediamtx:8888 {
+			header_down Location ^/(.*)$ /hls/$1
+		}
 	}
 
 	handle {
