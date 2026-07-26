@@ -16,6 +16,13 @@ gespeichert.
 5. Eine neue Kamerasuche starten. Vor dem Hinzufügen muss jede Kamera über
    **Streams & Vorschau prüfen** einen echten Videoframe liefern.
 
+Weitere Netatmo-Konten werden über dieselbe Schaltfläche ergänzt und bei jeder
+Suche gemeinsam berücksichtigt. Bei einem abgelaufenen oder entzogenen Zugriff
+steht am vorhandenen Konto **Neu verbinden** zur Verfügung. Die Anmeldung
+aktualisiert dieses Konto; vorhandene Kamera-Zuordnungen bleiben bestehen und
+es wird kein doppeltes Konto angelegt. **Umbenennen**, **Deaktivieren** und
+**Aktivieren** wirken jeweils nur auf das gewählte Konto.
+
 Camera Hub fordert nur lesende Kamera- und Zugriffsrechte an:
 `read_camera`, `access_camera`, `read_presence`, `access_presence`,
 `read_doorbell`, `access_doorbell` und `read_camerapro`.

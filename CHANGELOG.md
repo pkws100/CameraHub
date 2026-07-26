@@ -6,6 +6,10 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
 ### Hinzugefügt
 
+- vollständige Cloud-Konto-Verwaltung mit Umbenennen, Aktivieren, Deaktivieren,
+  CZEview-Zugangserneuerung und Netatmo-Wiederverbindung ohne doppelte Konten;
+- reproduzierbarer Abschlussbericht und Netatmo-Abnahmeablauf für die
+  Mehrkonto-Suche;
 - verschlüsselte Mehrkonto-Verwaltung für CZEview und Netatmo direkt in der
   Kamerasuche;
 - zusammengeführte LAN-/Cloud-Suche mit konto- und herkunftsspezifischem Status;

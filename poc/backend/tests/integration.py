@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -90,7 +90,7 @@ def request(path: str, method: str = "GET", body=None, csrf: str | None = None, 
 try:
     with camera_app.connect() as conn:
         assert conn.execute(
-            "SELECT 1 FROM schema_migrations WHERE version=3"
+            "SELECT 1 FROM schema_migrations WHERE version=5"
         ).fetchone()
     state = request("/api/auth/state")
     assert state == {"setupRequired": True, "authenticated": False}
@@ -640,6 +640,32 @@ try:
         csrf,
     )
     assert imported_cloud["externalSource"] and imported_cloud["onDemand"]
+    replacement_secret = "Cloud-Replacement-Secret-43!"
+    replaced_cloud_account = request(
+        f"/api/admin/cloud/accounts/{cloud_account['id']}/czeview",
+        "PUT",
+        {
+            "label": "Testhaus aktualisiert",
+            "username": "cloud-user-new",
+            "email": "cloud-new@example.invalid",
+            "password": replacement_secret,
+            "countryCode": "DE",
+            "phoneCode": "49",
+            "sourceApp": "141",
+        },
+        csrf,
+    )
+    assert replaced_cloud_account["status"] == "pending"
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM cloud_devices WHERE id=? AND account_id=?",
+            (cloud_device_id, cloud_account["id"]),
+        ).fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM cameras WHERE cloud_device_id=?",
+            (cloud_device_id,),
+        ).fetchone()
+    assert replacement_secret.encode() not in open(os.environ["DATABASE_PATH"], "rb").read()
     assert request(
         f"/api/admin/cloud/accounts/{cloud_account['id']}",
         "DELETE",
@@ -686,6 +712,32 @@ try:
                 stamp,
             ),
         )
+    reconnect = request(
+        "/api/admin/cloud/accounts/netatmo/authorize",
+        "POST",
+        {"label": "Netatmo Test neu", "accountId": netatmo_account_id},
+        csrf,
+    )
+    reconnect_state = parse_qs(urlparse(reconnect["authorizationUrl"]).query)["state"][0]
+    original_form_request_json = camera_app.form_request_json
+    camera_app.form_request_json = lambda *_args, **_kwargs: {
+        "access_token": "replacement-access",
+        "refresh_token": "replacement-refresh",
+        "expires_in": 10800,
+        "scope": camera_app.NETATMO_SCOPES,
+    }
+    try:
+        callback = camera_app.netatmo_oauth_callback(state=reconnect_state, code="test-code")
+        assert callback.status_code == 303
+    finally:
+        camera_app.form_request_json = original_form_request_json
+    with camera_app.connect() as conn:
+        reconnected = conn.execute(
+            "SELECT * FROM cloud_accounts WHERE id=?",
+            (netatmo_account_id,),
+        ).fetchone()
+        assert reconnected["label"] == "Netatmo Test neu" and reconnected["status"] == "active"
+        assert camera_app.decrypt_json(reconnected["auth_payload_ct"])["refreshToken"] == "replacement-refresh"
     original_netatmo_api_json = camera_app.netatmo_api_json
 
     def fake_netatmo_api(_account_id, path, _params=None):
@@ -733,7 +785,7 @@ try:
     finally:
         camera_app.netatmo_api_json = original_netatmo_api_json
 
-    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-inventory-models netatmo-stream-allowlist")
+    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist")
 finally:
     server.should_exit = True
     thread.join(timeout=5)

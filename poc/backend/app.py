@@ -249,6 +249,7 @@ CREATE INDEX IF NOT EXISTS cloud_devices_account_idx ON cloud_devices(account_id
 CREATE TABLE IF NOT EXISTS oauth_states(
  state_hash TEXT PRIMARY KEY, provider TEXT NOT NULL CHECK(provider IN ('netatmo')),
  actor_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, label TEXT NOT NULL,
+ account_id TEXT REFERENCES cloud_accounts(id) ON DELETE CASCADE,
  redirect_uri TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL
 );
 """
@@ -277,6 +278,16 @@ def initialize_database() -> None:
             )
             conn.execute(
                 "INSERT INTO schema_migrations(version,applied_at) VALUES(4,?)",
+                (now_iso(),),
+            )
+        oauth_columns = {row["name"] for row in conn.execute("PRAGMA table_info(oauth_states)")}
+        if "account_id" not in oauth_columns:
+            conn.execute(
+                "ALTER TABLE oauth_states ADD COLUMN account_id TEXT REFERENCES cloud_accounts(id) ON DELETE CASCADE"
+            )
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=5").fetchone() is None:
+            conn.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(5,?)",
                 (now_iso(),),
             )
         if "active_connection_id" not in camera_columns:
@@ -599,6 +610,7 @@ class NetatmoProviderConfigInput(BaseModel):
 
 class NetatmoAuthorizeInput(BaseModel):
     label: str = Field(min_length=1, max_length=80)
+    accountId: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class CloudInventoryDevice(BaseModel):
@@ -1555,6 +1567,40 @@ def create_czeview_account(
     return cloud_account_payload(row)
 
 
+@app.put("/api/admin/cloud/accounts/{account_id}/czeview")
+def replace_czeview_account_credentials(
+    account_id: str,
+    body: CzeviewAccountCreate,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    auth = {
+        "username": body.username,
+        "email": body.email,
+        "login": body.email or body.username,
+        "password": body.password,
+        "countryCode": body.countryCode,
+        "phoneCode": body.phoneCode,
+        "sourceApp": body.sourceApp,
+        "deviceSerial": body.deviceSerial,
+        "cameraName": body.cameraName,
+    }
+    with DB_LOCK, connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM cloud_accounts WHERE id=? AND provider='czeview'",
+            (account_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "czeview-account-not-found")
+        conn.execute(
+            """UPDATE cloud_accounts SET label=?,auth_payload_ct=?,enabled=1,status='pending',
+               last_error_code=NULL,last_verified_at=NULL,updated_at=? WHERE id=?""",
+            (body.label, encrypt_json(auth), now_iso(), account_id),
+        )
+        audit(conn, actor["user_id"], "cloud.account.credentials.replaced", "cloud-account", account_id)
+        row = conn.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
+    return cloud_account_payload(row)
+
+
 @app.post("/api/admin/cloud/accounts/netatmo/authorize")
 def authorize_netatmo_account(
     body: NetatmoAuthorizeInput,
@@ -1564,16 +1610,24 @@ def authorize_netatmo_account(
         config = conn.execute("SELECT * FROM cloud_provider_configs WHERE provider='netatmo'").fetchone()
         if not config:
             raise HTTPException(409, "netatmo-provider-not-configured")
+        if body.accountId:
+            account = conn.execute(
+                "SELECT * FROM cloud_accounts WHERE id=? AND provider='netatmo'",
+                (body.accountId,),
+            ).fetchone()
+            if not account:
+                raise HTTPException(404, "netatmo-account-not-found")
         state = secrets.token_urlsafe(32)
         conn.execute("DELETE FROM oauth_states WHERE expires_at<=?", (int(time.time()),))
         conn.execute(
             """INSERT INTO oauth_states(
-               state_hash,provider,actor_user_id,label,redirect_uri,expires_at,created_at)
-               VALUES(?,'netatmo',?,?,?,?,?)""",
+               state_hash,provider,actor_user_id,label,account_id,redirect_uri,expires_at,created_at)
+               VALUES(?,'netatmo',?,?,?,?,?,?)""",
             (
                 hash_token(state),
                 actor["user_id"],
                 body.label,
+                body.accountId,
                 config["redirect_uri"],
                 int(time.time()) + 600,
                 now_iso(),
@@ -1621,7 +1675,7 @@ def netatmo_oauth_callback(state: str = "", code: str = "", error: str = ""):
     )
     if not token.get("access_token") or not token.get("refresh_token"):
         raise HTTPException(502, "netatmo-token-response-invalid")
-    account_id, stamp = str(uuid.uuid4()), now_iso()
+    account_id, stamp = stored["account_id"] or str(uuid.uuid4()), now_iso()
     expires_at = int(time.time()) + max(60, int(token.get("expires_in") or 10800))
     auth = {
         "accessToken": token["access_token"],
@@ -1630,13 +1684,32 @@ def netatmo_oauth_callback(state: str = "", code: str = "", error: str = ""):
     }
     scopes = str(token.get("scope") or NETATMO_SCOPES).split()
     with DB_LOCK, connect() as conn:
-        conn.execute(
-            """INSERT INTO cloud_accounts(
-               id,provider,label,enabled,auth_payload_ct,scopes_json,status,last_verified_at,created_at,updated_at)
-               VALUES(?,'netatmo',?,1,?,?, 'active',?,?,?)""",
-            (account_id, stored["label"], encrypt_json(auth), json.dumps(scopes), stamp, stamp, stamp),
-        )
-        audit(conn, stored["actor_user_id"], "cloud.account.created", "cloud-account", account_id)
+        if stored["account_id"]:
+            updated = conn.execute(
+                """UPDATE cloud_accounts SET label=?,enabled=1,auth_payload_ct=?,scopes_json=?,
+                   status='active',last_error_code=NULL,last_verified_at=?,updated_at=?
+                   WHERE id=? AND provider='netatmo'""",
+                (
+                    stored["label"],
+                    encrypt_json(auth),
+                    json.dumps(scopes),
+                    stamp,
+                    stamp,
+                    account_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise HTTPException(409, "netatmo-account-reconnect-failed")
+            action = "cloud.account.reconnected"
+        else:
+            conn.execute(
+                """INSERT INTO cloud_accounts(
+                   id,provider,label,enabled,auth_payload_ct,scopes_json,status,last_verified_at,created_at,updated_at)
+                   VALUES(?,'netatmo',?,1,?,?, 'active',?,?,?)""",
+                (account_id, stored["label"], encrypt_json(auth), json.dumps(scopes), stamp, stamp, stamp),
+            )
+            action = "cloud.account.created"
+        audit(conn, stored["actor_user_id"], action, "cloud-account", account_id)
     return RedirectResponse(url="/#discover?netatmo=connected", status_code=303)
 
 
@@ -3552,6 +3625,7 @@ def czeview_adapter_accounts(_: None = Depends(require_czeview_adapter)):
             {
                 "id": row["id"],
                 "label": row["label"],
+                "updatedAt": row["updated_at"],
                 "credentials": decrypt_json(row["auth_payload_ct"]),
             }
             for row in rows

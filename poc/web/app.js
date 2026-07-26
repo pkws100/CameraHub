@@ -387,7 +387,13 @@
       row.dataset.enabled=String(account.enabled);
       const provider=account.provider==='netatmo'?'Netatmo':'CZEview';
       const state={active:'Verbunden',pending:'Wird geprüft','reauth-required':'Erneute Anmeldung erforderlich',error:'Fehler'}[account.status]||account.status;
-      row.innerHTML=`<div><strong>${escapeHtml(account.label)}</strong><p>${provider} · ${escapeHtml(state)} · ${account.deviceCount||0} Gerät(e)${account.lastErrorCode?` · ${escapeHtml(account.lastErrorCode)}`:''}</p></div><div class="cloud-account-row-actions"><button type="button" data-toggle>${account.enabled?'Deaktivieren':'Aktivieren'}</button><button type="button" data-delete>Entfernen</button></div>`;
+      const reconnect=account.provider==='netatmo'
+        ?'<button type="button" data-reconnect>Neu verbinden</button>'
+        :'<button type="button" data-credentials>Zugang erneuern</button>';
+      row.innerHTML=`<div><strong>${escapeHtml(account.label)}</strong><p>${provider} · ${escapeHtml(state)} · ${account.deviceCount||0} Gerät(e)${account.lastErrorCode?` · ${escapeHtml(account.lastErrorCode)}`:''}</p></div><div class="cloud-account-row-actions"><button type="button" data-rename>Umbenennen</button>${reconnect}<button type="button" data-toggle>${account.enabled?'Deaktivieren':'Aktivieren'}</button><button type="button" data-delete>Entfernen</button></div>`;
+      $('[data-rename]',row).addEventListener('click',()=>renameCloudAccount(account));
+      $('[data-credentials]',row)?.addEventListener('click',()=>openCzeviewCredentialReplacement(account));
+      $('[data-reconnect]',row)?.addEventListener('click',()=>reconnectNetatmo(account));
       $('[data-toggle]',row).addEventListener('click',()=>updateCloudAccount(account,{enabled:!account.enabled}));
       $('[data-delete]',row).addEventListener('click',()=>deleteCloudAccount(account));
       list.append(row);
@@ -397,15 +403,32 @@
     try{await adminApi(`/api/admin/cloud/accounts/${encodeURIComponent(account.id)}`,{method:'PATCH',body:JSON.stringify(changes)});await loadCloudAccounts();toast('Cloud-Konto aktualisiert');}
     catch(error){toast(`Änderung fehlgeschlagen: ${error.code}`);}
   }
+  async function renameCloudAccount(account){
+    const label=window.prompt('Neue Bezeichnung des Cloud-Kontos',account.label);
+    if(label===null||!label.trim()||label.trim()===account.label)return;
+    await updateCloudAccount(account,{label:label.trim()});
+  }
+  function openCzeviewCredentialReplacement(account){
+    const form=$('#czeview-account-form');
+    form.reset();
+    form.elements.accountId.value=account.id;
+    form.elements.label.value=account.label;
+    form.elements.countryCode.value='DE';
+    form.elements.phoneCode.value='49';
+    form.elements.sourceApp.value='141';
+    $('#czeview-account-title').textContent=`Zugang für ${account.label} erneuern`;
+    $('#czeview-account-error').textContent='';
+    $('#czeview-account-dialog').showModal();
+  }
   async function deleteCloudAccount(account){
     if(!window.confirm(`Cloud-Konto „${account.label}“ wirklich entfernen?`))return;
     try{await adminApi(`/api/admin/cloud/accounts/${encodeURIComponent(account.id)}`,{method:'DELETE'});await loadCloudAccounts();toast('Cloud-Konto entfernt');}
     catch(error){toast(error.code==='cloud-account-has-linked-cameras'?'Das Konto wird noch von mindestens einer Kamera verwendet.':`Entfernen fehlgeschlagen: ${error.code}`);}
   }
   async function saveCzeviewAccount(event){
-    event.preventDefault();const form=event.currentTarget,payload=Object.fromEntries(new FormData(form).entries());
+    event.preventDefault();const form=event.currentTarget,payload=Object.fromEntries(new FormData(form).entries()),accountId=payload.accountId;delete payload.accountId;
     $('#czeview-account-error').textContent='';
-    try{await adminApi('/api/admin/cloud/accounts/czeview',{method:'POST',body:JSON.stringify(payload)});form.reset();form.elements.countryCode.value='DE';form.elements.phoneCode.value='49';form.elements.sourceApp.value='141';$('#czeview-account-dialog').close();await loadCloudAccounts();toast('CZEview-Konto gespeichert; die Prüfung läuft im Hintergrund');}
+    try{await adminApi(accountId?`/api/admin/cloud/accounts/${encodeURIComponent(accountId)}/czeview`:'/api/admin/cloud/accounts/czeview',{method:accountId?'PUT':'POST',body:JSON.stringify(payload)});form.reset();form.elements.countryCode.value='DE';form.elements.phoneCode.value='49';form.elements.sourceApp.value='141';$('#czeview-account-dialog').close();await loadCloudAccounts();toast(accountId?'CZEview-Zugang erneuert; die Prüfung läuft im Hintergrund':'CZEview-Konto gespeichert; die Prüfung läuft im Hintergrund');}
     catch(error){$('#czeview-account-error').textContent=`Speichern fehlgeschlagen: ${error.code}`;}
     finally{payload.password='';form.elements.password.value='';}
   }
@@ -421,6 +444,10 @@
     $('#netatmo-account-error').textContent='';
     try{const result=await adminApi('/api/admin/cloud/accounts/netatmo/authorize',{method:'POST',body:JSON.stringify({label:form.elements.label.value})});location.assign(result.authorizationUrl);}
     catch(error){$('#netatmo-account-error').textContent=`Anmeldung konnte nicht gestartet werden: ${error.code}`;}
+  }
+  async function reconnectNetatmo(account){
+    try{const result=await adminApi('/api/admin/cloud/accounts/netatmo/authorize',{method:'POST',body:JSON.stringify({label:account.label,accountId:account.id})});location.assign(result.authorizationUrl);}
+    catch(error){toast(`Netatmo-Wiederverbindung konnte nicht gestartet werden: ${error.code}`);}
   }
 
   async function startScan(){
@@ -570,7 +597,7 @@
     $('#refresh-all').addEventListener('click',loadHealth);$('#detail-back').addEventListener('click',closeDetail);$('#detail-reconnect').addEventListener('click',()=>{if(!appState.detail)return;appState.detail.camera.displayMode==='snapshot'?startSnapshot(appState.detail,true):connect(appState.detail,appState.detail.path,appState.detail.mode,true);});$('#detail-fallback').addEventListener('click',()=>{if(!appState.detail)return;$('#detail-quality').textContent='Substream';connect(appState.detail,appState.detail.camera.lowPath,'low',true);});$('#detail-hls-toggle').addEventListener('click',()=>{if(!appState.detail)return;closeReader(appState.detail,false);$('#detail-video').hidden=true;const frame=$('#detail-hls'),camera=appState.detail.camera,useHigh=camera.highPath!==camera.lowPath;frame.hidden=false;frame.src=hlsUrl(useHigh?camera.highPath:camera.lowPath);mark(appState.detail,'loading',useHigh?'HLS-Hauptstream lädt':'HLS-Fallback lädt');});$('#detail-hls').addEventListener('load',()=>{if(appState.detail)mark(appState.detail,'live','Live · HLS');});$('#detail-message').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-video').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-audio').addEventListener('click',toggleDetailAudio);$('#detail-fullscreen').addEventListener('click',()=>{const shell=$('#detail-shell'),video=$('#detail-video');if(shell.requestFullscreen)shell.requestFullscreen();else video.webkitEnterFullscreen?.();});
     $$('[data-ptz-x]').forEach(button=>{button.addEventListener('pointerdown',event=>{event.preventDefault();button.setPointerCapture?.(event.pointerId);startPTZ(button);});for(const name of ['pointerup','pointercancel','pointerleave'])button.addEventListener(name,stopPTZ);button.addEventListener('keydown',event=>{if((event.key===' '||event.key==='Enter')&&!event.repeat){event.preventDefault();startPTZ(button);}});button.addEventListener('keyup',event=>{if(event.key===' '||event.key==='Enter')stopPTZ();});button.addEventListener('blur',stopPTZ);});$('[data-ptz-stop]').addEventListener('click',stopPTZ);$('#ptz-presets').addEventListener('change',gotoPreset);
     $('#start-scan').addEventListener('click',startScan);$('#cancel-scan').addEventListener('click',cancelScan);$('#manual-add').addEventListener('click',()=>openCameraDialog());$('#discovery-auth-form').addEventListener('submit',probeDiscovery);$('#discovery-auth-dialog').addEventListener('close',()=>{const form=$('#discovery-auth-form');form.elements.username.value='';form.elements.password.value='';appState.discoveryDevice=null;});$('#test-source').addEventListener('click',testSource);$('#camera-form').addEventListener('submit',addCamera);for(const name of ['input','change'])$('#camera-form').addEventListener(name,()=>{$('#camera-form').dataset.tested='false';$('#source-test').textContent='Verbindungsdaten geändert · bitte erneut testen.';});$('#credential-mode').addEventListener('change',updateCredentialFields);$('#connection-test-button').addEventListener('click',testConnection);$('#connection-form').addEventListener('submit',saveConnection);for(const name of ['input','change'])$('#connection-form').addEventListener(name,()=>{$('#connection-form').dataset.tested='false';$('#connection-test').dataset.state='';$('#connection-test').textContent='Verbindungsdaten geändert · bitte erneut prüfen.';});$('#connection-activate').addEventListener('click',activateConnection);$('#capability-refresh').addEventListener('click',refreshCapabilities);$('#zone-camera').addEventListener('change',loadZoneCamera);$('#zone-canvas').addEventListener('pointerdown',addZonePoint);$('#zone-add-coordinate').addEventListener('click',addZoneCoordinate);$$('[data-zone-kind]').forEach(button=>button.addEventListener('click',()=>{$$('[data-zone-kind]').forEach(item=>item.classList.remove('is-active'));button.classList.add('is-active');zoneState.kind=button.dataset.zoneKind;}));$('#zone-undo').addEventListener('click',()=>{zoneState.draft.pop();drawZones();});$('#zone-complete').addEventListener('click',completeZone);$('#zone-save').addEventListener('click',saveZones);window.addEventListener('resize',resizeCanvas);
-    $('#add-czeview-account').addEventListener('click',()=>{$('#czeview-account-form').reset();$('#czeview-account-form').elements.countryCode.value='DE';$('#czeview-account-form').elements.phoneCode.value='49';$('#czeview-account-form').elements.sourceApp.value='141';$('#czeview-account-error').textContent='';$('#czeview-account-dialog').showModal();});$('#czeview-account-form').addEventListener('submit',saveCzeviewAccount);
+    $('#add-czeview-account').addEventListener('click',()=>{$('#czeview-account-form').reset();$('#czeview-account-title').textContent='CZEview-Konto hinzufügen';$('#czeview-account-form').elements.countryCode.value='DE';$('#czeview-account-form').elements.phoneCode.value='49';$('#czeview-account-form').elements.sourceApp.value='141';$('#czeview-account-error').textContent='';$('#czeview-account-dialog').showModal();});$('#czeview-account-form').addEventListener('submit',saveCzeviewAccount);
     $('#configure-netatmo').addEventListener('click',()=>{const form=$('#netatmo-config-form');form.reset();form.elements.redirectUri.value=`${location.origin}/api/cloud/oauth/netatmo/callback`;$('#netatmo-config-error').textContent='';$('#netatmo-config-dialog').showModal();});$('#netatmo-config-form').addEventListener('submit',saveNetatmoConfig);
     $('#add-netatmo-account').addEventListener('click',()=>{$('#netatmo-account-form').reset();$('#netatmo-account-error').textContent='';$('#netatmo-account-dialog').showModal();});$('#netatmo-account-form').addEventListener('submit',authorizeNetatmo);
     $('#add-user').addEventListener('click',()=>{$('#user-form').reset();$('#user-error').textContent='';$('#user-dialog').showModal();});$('#user-form').addEventListener('submit',createUser);$('#password-form').addEventListener('submit',saveUserPassword);$('#change-own-password').addEventListener('click',()=>{$('#own-password-form').reset();$('#own-password-error').textContent='';$('#own-password-dialog').showModal();});$('#own-password-form').addEventListener('submit',changeOwnPassword);

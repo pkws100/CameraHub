@@ -46,6 +46,7 @@ control_state: dict[str, Any] = {"client": None, "device": None, "ptz_mode": Non
 camera_controls: dict[str, dict[str, Any]] = {}
 account_leases: dict[str, list[dict[str, Any]]] = {}
 enabled_account_ids: set[str] = set()
+account_versions: dict[str, str] = {}
 runtime_lock = threading.RLock()
 control_server: ThreadingHTTPServer | None = None
 
@@ -514,12 +515,18 @@ def account_enabled(account_id: str) -> bool:
         return account_id in enabled_account_ids
 
 
+def account_current(account_id: str, version: str) -> bool:
+    with runtime_lock:
+        return account_id in enabled_account_ids and account_versions.get(account_id) == version
+
+
 def account_worker(account: dict[str, Any]) -> None:
     account_id = str(account["id"])
+    version = str(account.get("updatedAt") or "")
     session_path = SESSION_PATH.parent / "accounts" / f"{account_id}.json"
     session_path.parent.mkdir(parents=True, exist_ok=True)
     last_cache_reset = -600.0
-    while not stop_event.is_set() and account_enabled(account_id):
+    while not stop_event.is_set() and account_current(account_id, version):
         try:
             client = make_client(account["credentials"], session_path)
             devices = client.get_all_devices()
@@ -548,7 +555,7 @@ def account_worker(account: dict[str, Any]) -> None:
             log("authenticated", account=account_id, devices=len(inventory))
             HEALTH_PATH.parent.mkdir(parents=True, exist_ok=True)
             HEALTH_PATH.write_text(str(int(time.time())), encoding="ascii")
-            while not stop_event.is_set() and account_enabled(account_id):
+            while not stop_event.is_set() and account_current(account_id, version):
                 camera = account_active_camera(account_id)
                 if not camera:
                     stop_event.wait(1)
@@ -575,6 +582,7 @@ def account_worker(account: dict[str, Any]) -> None:
                     current = account_active_camera(account_id)
                     if (
                         stop_event.is_set()
+                        or not account_current(account_id, version)
                         or not current
                         or current.get("cameraId") != camera.get("cameraId")
                     ):
@@ -650,6 +658,11 @@ def account_manager() -> None:
             with runtime_lock:
                 enabled_account_ids.clear()
                 enabled_account_ids.update(str(account["id"]) for account in accounts)
+                account_versions.clear()
+                account_versions.update(
+                    (str(account["id"]), str(account.get("updatedAt") or ""))
+                    for account in accounts
+                )
             for account in accounts:
                 account_id = str(account["id"])
                 worker = workers.get(account_id)

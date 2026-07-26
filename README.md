@@ -49,6 +49,10 @@ Neue Konten werden als Eigentümer unter **Kameras suchen → Cloud-Konten**
 angelegt. Mehrere CZEview- und Netatmo-Konten können parallel aktiviert werden.
 Jede Cloud-Kamera muss vor dem Hinzufügen einen echten Frame-Test bestehen.
 Geräte ohne freigegebenen Livezugriff bleiben sichtbar, aber deaktiviert.
+Konten lassen sich dort umbenennen, einzeln aktivieren oder deaktivieren.
+CZEview-Zugangsdaten können erneuert und bestehende Netatmo-Konten erneut über
+den offiziellen Netatmo-Login verbunden werden, ohne Kamera-Zuordnungen oder
+Kontoduplikate zu erzeugen.
 
 Bestehende CZEview-Einträge in der ignorierten `poc/.env` werden einmalig in
 den verschlüsselten Kontospeicher übernommen. Einrichtung, Sicherheitsgrenzen,
@@ -56,6 +60,9 @@ Ein-Sitzungs-Hinweis und technische Evidenz stehen in
 [CZEVIEW-INTEGRATION.md](CZEVIEW-INTEGRATION.md).
 Die Netatmo-App-Einrichtung und die bewusst begrenzten Rechte beschreibt
 [NETATMO-INTEGRATION.md](NETATMO-INTEGRATION.md).
+Der geprüfte Gesamtstand der Mehrkonto-Verwaltung ist in
+[CLOUD-ACCOUNT-COMPLETION-REPORT.md](CLOUD-ACCOUNT-COMPLETION-REPORT.md)
+dokumentiert.
 
 ## Zugriff über die private IP
 
