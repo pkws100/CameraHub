@@ -1,8 +1,8 @@
 (() => {
   'use strict';
-  const VERSION = '1.3.1';
+  const VERSION = '1.3.2';
   const RETRY_DELAYS = [2000, 5000, 15000];
-  const appState = { csrf:'', user:null, permissions:{}, users:[], cameras:[], adminCameras:[], cloudAccounts:[], cloudProviders:[], displayProfiles:[], profileCameraOptions:[], displayProfileId:'', renderedDisplayProfileId:'', profileDraftOrder:[], cameraRequest:0, states:new Map(), observer:null, detail:null, suspended:false, wallMode:false, wallControlsTimer:null, elevatedUntil:0, scanTimer:null, scanId:null, discoveryItems:[], discoveryResultScanId:null, discoveryDevice:null, connectionCamera:null, connectionRollout:null, connectionRequest:0, capabilityCamera:null, capabilityRequest:0, ptz:null, webhookTargets:[], restoreValidated:false };
+  const appState = { csrf:'', user:null, permissions:{}, users:[], cameras:[], adminCameras:[], cloudAccounts:[], cloudProviders:[], displayProfiles:[], profileCameraOptions:[], displayProfileId:'', renderedDisplayProfileId:'', profileDraftOrder:[], cameraRequest:0, states:new Map(), observer:null, detail:null, suspended:false, wallMode:false, wallControlsTimer:null, elevatedUntil:0, scanTimer:null, scanId:null, discoveryItems:[], discoveryResultScanId:null, discoveryDevice:null, cloudImportContext:null, connectionCamera:null, connectionRollout:null, connectionRequest:0, capabilityCamera:null, capabilityRequest:0, ptz:null, webhookTargets:[], restoreValidated:false };
   const $ = (selector, root=document) => root.querySelector(selector);
   const $$ = (selector, root=document) => [...root.querySelectorAll(selector)];
   const mediaHost = location.hostname;
@@ -40,9 +40,9 @@
     reauthPromise=new Promise((resolve,reject)=>{reauthResolver=(ok)=>{reauthResolver=null;reauthPromise=null;ok?resolve():reject(new ApiError(0,'reauth-cancelled'));};});
     return reauthPromise;
   }
-  async function adminApi(path,options={}){
+  async function adminApi(path,options={},reauthTransition={}){
     try { return await api(path,options); }
-    catch(error){ if(error.code!=='reauth-required') throw error; await requestReauth(); return api(path,options); }
+    catch(error){ if(error.code!=='reauth-required') throw error; reauthTransition.before?.(); await requestReauth(); reauthTransition.after?.(); return api(path,options); }
   }
   async function ownerFetch(path,options={}){
     const send=async()=>{
@@ -629,22 +629,53 @@
         window.setTimeout(()=>{image.src=image.src.replace(/([?&])t=\d+/,`$1t=${Date.now()}`);},3000);
       });
       $('[data-probe]',row)?.addEventListener('click',()=>openDiscoveryProbe(item,scanId));
-      $('[data-select]',row).addEventListener('click',()=>configured?(cloud?toast('Diese Cloud-Kamera ist bereits in Camera Hub enthalten'):openConfiguredDiscovery(item)):(cloud?importCloudCamera(item,scanId):openCameraDialog(item)));
+      $('[data-select]',row).addEventListener('click',()=>configured?(cloud?toast('Diese Cloud-Kamera ist bereits in Camera Hub enthalten'):openConfiguredDiscovery(item)):(cloud?openCloudImportDialog(item,scanId):openCameraDialog(item)));
       list.append(row);
     });
   }
-  async function importCloudCamera(item,scanId){
+  function openCloudImportDialog(item,scanId){
     const suggested=item.name||item.model||'Cloud-Kamera';
-    const name=window.prompt('Anzeigename der Kamera',suggested);
-    if(name===null)return;
+    const form=$('#cloud-import-form');
+    appState.cloudImportContext={item,scanId};
+    form.reset();
+    form.elements.name.value=suggested;
+    $('#cloud-import-target').textContent=`${item.manufacturer} ${item.model} · ${item.accountLabel}`;
+    $('#cloud-import-error').textContent='';
+    $('#cloud-import-dialog').showModal();
+  }
+  async function importCloudCamera(event){
+    event.preventDefault();
+    const context=appState.cloudImportContext;
+    if(!context)return;
+    const {item,scanId}=context;
+    const form=event.currentTarget,submit=form.querySelector('[type=submit]'),cancel=form.querySelector('[data-close-dialog]');
+    const suggested=item.name||item.model||'Cloud-Kamera';
+    const name=form.elements.name.value.trim()||suggested;
+    submit.disabled=true;
+    cancel.disabled=true;
+    form.setAttribute('aria-busy','true');
+    $('#cloud-import-error').textContent='';
     try{
-      await adminApi(`/api/admin/discovery/scans/${encodeURIComponent(scanId)}/devices/${encodeURIComponent(item.id)}/import`,{method:'POST',body:JSON.stringify({name:name.trim()||suggested})});
-      item.configuredCameraId='imported';item.configuredName=name.trim()||suggested;
+      await adminApi(
+        `/api/admin/discovery/scans/${encodeURIComponent(scanId)}/devices/${encodeURIComponent(item.id)}/import`,
+        {method:'POST',body:JSON.stringify({name:name.trim()||suggested})},
+        {
+          before:()=>{$('#cloud-import-dialog').close();appState.cloudImportContext=context;},
+          after:()=>{if(!$('#cloud-import-dialog').open)$('#cloud-import-dialog').showModal();}
+        }
+      );
+      item.configuredCameraId='imported';item.configuredName=name;
       renderDiscovery(appState.discoveryItems,scanId,false);
+      if($('#cloud-import-dialog').open)$('#cloud-import-dialog').close();
+      appState.cloudImportContext=null;
       await loadAdminCameras();
       await loadCameras();
       toast('Cloud-Kamera hinzugefügt');
-    }catch(error){toast(`Hinzufügen fehlgeschlagen: ${error.code}`);}
+    }catch(error){
+      appState.cloudImportContext=context;
+      if(!$('#cloud-import-dialog').open)$('#cloud-import-dialog').showModal();
+      if(error.code!=='reauth-cancelled')$('#cloud-import-error').textContent=`Hinzufügen fehlgeschlagen: ${error.code}`;
+    }finally{submit.disabled=false;cancel.disabled=false;form.removeAttribute('aria-busy');}
   }
   function openDiscoveryProbe(item,scanId){
     const form=$('#discovery-auth-form');
@@ -664,25 +695,40 @@
     if(!context)return;
     const form=event.currentTarget;
     const submit=$('button[type="submit"]',form);
+    const cancel=$('[data-close-dialog]',form);
     submit.disabled=true;
+    cancel.disabled=true;
+    form.setAttribute('aria-busy','true');
     $('#discovery-auth-state').textContent=context.item.origin==='cloud'?'Cloud-Stream und echte Videoframes werden geprüft …':'ONVIF-Profile und echte Videoframes werden geprüft …';
     $('#discovery-auth-error').textContent='';
     const payload={username:form.elements.username.value,password:form.elements.password.value};
     try{
-      const item=await adminApi(`/api/admin/discovery/scans/${encodeURIComponent(context.scanId)}/devices/${encodeURIComponent(context.item.id)}/probe`,{method:'POST',body:JSON.stringify(payload)});
+      const item=await adminApi(
+        `/api/admin/discovery/scans/${encodeURIComponent(context.scanId)}/devices/${encodeURIComponent(context.item.id)}/probe`,
+        {method:'POST',body:JSON.stringify(payload)},
+        {
+          before:()=>{$('#discovery-auth-dialog').close();appState.discoveryDevice=context;},
+          after:()=>{if(!$('#discovery-auth-dialog').open)$('#discovery-auth-dialog').showModal();}
+        }
+      );
       const index=appState.discoveryItems.findIndex(candidate=>candidate.id===item.id);
       if(index>=0)appState.discoveryItems[index]=item;
       renderDiscovery(appState.discoveryItems,context.scanId,false);
-      $('#discovery-auth-dialog').close();
+      if($('#discovery-auth-dialog').open)$('#discovery-auth-dialog').close();
+      appState.discoveryDevice=null;
       toast(item.previewAvailable?'Streams erkannt · echte Vorschau bestätigt':'Streamprofile erkannt · Vorschau nicht verfügbar');
     }catch(error){
+      appState.discoveryDevice=context;
+      if(!$('#discovery-auth-dialog').open)$('#discovery-auth-dialog').showModal();
       $('#discovery-auth-state').textContent='Prüfung nicht erfolgreich.';
-      $('#discovery-auth-error').textContent=error.code==='onvif-authentication-failed'?'Anmeldung an der Kamera fehlgeschlagen.':`Prüfung fehlgeschlagen: ${error.code}`;
+      $('#discovery-auth-error').textContent=error.code==='reauth-cancelled'?'Sicherheitsbestätigung abgebrochen.':error.code==='onvif-authentication-failed'?'Anmeldung an der Kamera fehlgeschlagen.':`Prüfung fehlgeschlagen: ${error.code}`;
     }finally{
       payload.username='';
       payload.password='';
       form.elements.password.value='';
       submit.disabled=false;
+      cancel.disabled=false;
+      form.removeAttribute('aria-busy');
     }
   }
   function openCameraDialog(item={}){
@@ -772,19 +818,29 @@
 
   function refreshDiagnostics(){const video=document.createElement('video');$('#diag-secure').textContent=window.isSecureContext?'Ja':'Nein';$('#diag-sw').textContent='serviceWorker'in navigator?(navigator.serviceWorker.controller?'Aktiv':'Verfügbar'):'Nicht verfügbar';$('#diag-webrtc').textContent='RTCPeerConnection'in window?'Verfügbar':'Nicht verfügbar';$('#diag-hls').textContent=video.canPlayType('application/vnd.apple.mpegurl')?'Nativ':'Gateway-Fallback';$('#diag-backend').textContent=appState.csrf?'Angemeldet':'Nicht angemeldet';$('#diag-origin').textContent=location.origin;$('#diag-version').textContent=VERSION;}
 
+  function clearTransientDialogState(dialog){
+    if(dialog.id==='cloud-import-dialog')appState.cloudImportContext=null;
+    if(dialog.id==='discovery-auth-dialog'){
+      const form=$('#discovery-auth-form');
+      form.elements.username.value='';
+      form.elements.password.value='';
+      appState.discoveryDevice=null;
+    }
+  }
+
   function bindEvents(){
     $('#menu-button').addEventListener('click',()=>$('#app-menu').classList.contains('is-open')?closeMenu():openMenu());$('#menu-close').addEventListener('click',()=>closeMenu());$('#menu-backdrop').addEventListener('click',()=>closeMenu());$$('.nav-item').forEach(item=>item.addEventListener('click',()=>showView(item.dataset.view)));
     document.addEventListener('keydown',(event)=>{if(event.key==='Escape'&&appState.wallMode){event.preventDefault();exitWallMode();return;}if(event.key==='Escape'&&$('#app-menu').classList.contains('is-open'))closeMenu();if(event.key==='Tab'&&$('#app-menu').classList.contains('is-open')){const focusable=$$('button:not([disabled])',$('#app-menu'));const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}}});
-    $$('dialog').forEach(dialog=>dialog.addEventListener('cancel',event=>{if(dialog.dataset.static==='true'){event.preventDefault();return;}if(dialog.id==='reauth-dialog')reauthResolver?.(false);}));
+    $$('dialog').forEach(dialog=>dialog.addEventListener('cancel',event=>{if(dialog.dataset.static==='true'||dialog.querySelector('form[aria-busy="true"]')){event.preventDefault();return;}clearTransientDialogState(dialog);if(dialog.id==='reauth-dialog')reauthResolver?.(false);}));
     $('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const setup=$('#auth-dialog').dataset.setup==='true',body={username:$('#auth-user').value,password:$('#auth-password').value};try{const result=await api(setup?'/api/auth/setup':'/api/auth/login',{method:'POST',body:JSON.stringify(body)});applyAccess(result);$('#auth-password').value='';$('#auth-dialog').close();$('#app').hidden=false;await loadDisplayProfiles();applyDisplayProfileFromHash();await loadCameras();refreshDiagnostics();const requestedView=hashRoute().view;if(requestedView==='wall')enterWallMode(false);else if(['discover','manage','zones','users','system'].includes(requestedView))showView(requestedView);}catch(error){$('#auth-error').textContent=error.code==='login-failed'?'Anmeldung fehlgeschlagen.':`Fehler: ${error.code}`;}});
-    $('#reauth-form').addEventListener('submit',async(event)=>{event.preventDefault();try{const result=await api('/api/auth/reauth',{method:'POST',body:JSON.stringify({password:$('#reauth-password').value})});appState.elevatedUntil=result.elevatedUntil;$('#reauth-dialog').close();reauthResolver?.(true);}catch{$('#reauth-error').textContent='Passwort nicht bestätigt.';}});$$('[data-close-dialog]').forEach(button=>button.addEventListener('click',()=>{const dialog=button.closest('dialog');dialog.close();if(dialog.id==='reauth-dialog')reauthResolver?.(false);}));
+    $('#reauth-form').addEventListener('submit',async(event)=>{event.preventDefault();try{const result=await api('/api/auth/reauth',{method:'POST',body:JSON.stringify({password:$('#reauth-password').value})});appState.elevatedUntil=result.elevatedUntil;$('#reauth-dialog').close();reauthResolver?.(true);}catch{$('#reauth-error').textContent='Passwort nicht bestätigt.';}});$$('[data-close-dialog]').forEach(button=>button.addEventListener('click',()=>{const dialog=button.closest('dialog');if(dialog.querySelector('form[aria-busy="true"]'))return;clearTransientDialogState(dialog);dialog.close();if(dialog.id==='reauth-dialog')reauthResolver?.(false);}));
     $('#logout').addEventListener('click',async()=>{clearTimeout(appState.scanTimer);appState.scanTimer=null;appState.scanId=null;exitWallMode();try{await api('/api/auth/logout',{method:'POST'});}catch{}appState.csrf='';appState.user=null;appState.permissions={};suspend();$('#app').hidden=true;showAuth(false);closeMenu(false);});
     const enterWall=$('#enter-wall-mode'),exitWall=$('#exit-wall-mode');if(enterWall&&exitWall){enterWall.addEventListener('click',()=>enterWallMode(true));exitWall.addEventListener('click',()=>exitWallMode());}document.addEventListener('pointermove',revealWallControls,{passive:true});document.addEventListener('touchstart',revealWallControls,{passive:true});document.addEventListener('fullscreenchange',()=>{if(appState.wallMode&&!document.fullscreenElement)exitWallMode({leaveFullscreen:false});});
     $('#display-profile-select').addEventListener('change',event=>selectDisplayProfile(event.currentTarget.value));$('#wall-profile-select').addEventListener('change',event=>selectDisplayProfile(event.currentTarget.value));$('#manage-display-profiles').addEventListener('click',openDisplayProfileDialog);$('#profile-editor-select').addEventListener('change',event=>renderProfileEditor(event.currentTarget.value));$('#display-profile-form').addEventListener('submit',saveDisplayProfile);$('#delete-display-profile').addEventListener('click',deleteDisplayProfile);$('#copy-profile-live').addEventListener('click',()=>copyProfileLink('overview'));$('#copy-profile-wall').addEventListener('click',()=>copyProfileLink('wall'));
     $('#refresh-all').addEventListener('click',loadHealth);$('#detail-back').addEventListener('click',closeDetail);$('#detail-reconnect').addEventListener('click',()=>{if(!appState.detail)return;appState.detail.camera.displayMode==='snapshot'?startSnapshot(appState.detail,true):connect(appState.detail,appState.detail.path,appState.detail.mode,true);});$('#detail-fallback').addEventListener('click',()=>{if(!appState.detail)return;$('#detail-quality').textContent='Substream';connect(appState.detail,appState.detail.camera.lowPath,'low',true);});$('#detail-hls-toggle').addEventListener('click',()=>{if(!appState.detail)return;closeReader(appState.detail,false);$('#detail-video').hidden=true;const frame=$('#detail-hls'),camera=appState.detail.camera,useHigh=camera.highPath!==camera.lowPath;frame.hidden=false;frame.src=hlsUrl(useHigh?camera.highPath:camera.lowPath);mark(appState.detail,'loading',useHigh?'HLS-Hauptstream lädt':'HLS-Fallback lädt');});$('#detail-hls').addEventListener('load',()=>{if(appState.detail)mark(appState.detail,'live','Live · HLS');});$('#detail-message').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-video').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-audio').addEventListener('click',toggleDetailAudio);$('#detail-fullscreen').addEventListener('click',()=>{const shell=$('#detail-shell'),video=$('#detail-video');if(shell.requestFullscreen)shell.requestFullscreen();else video.webkitEnterFullscreen?.();});
     $$('[data-ptz-x]').forEach(button=>{button.addEventListener('pointerdown',event=>{event.preventDefault();button.setPointerCapture?.(event.pointerId);startPTZ(button);});for(const name of ['pointerup','pointercancel','pointerleave'])button.addEventListener(name,stopPTZ);button.addEventListener('keydown',event=>{if((event.key===' '||event.key==='Enter')&&!event.repeat){event.preventDefault();startPTZ(button);}});button.addEventListener('keyup',event=>{if(event.key===' '||event.key==='Enter')stopPTZ();});button.addEventListener('blur',stopPTZ);});$('[data-ptz-stop]').addEventListener('click',stopPTZ);$('#ptz-presets').addEventListener('change',gotoPreset);
-    $('#start-scan').addEventListener('click',startScan);$('#cancel-scan').addEventListener('click',cancelScan);$('#manual-add').addEventListener('click',()=>openCameraDialog());$('#discovery-auth-form').addEventListener('submit',probeDiscovery);$('#discovery-auth-dialog').addEventListener('close',()=>{const form=$('#discovery-auth-form');form.elements.username.value='';form.elements.password.value='';appState.discoveryDevice=null;});$('#test-source').addEventListener('click',testSource);$('#camera-form').addEventListener('submit',addCamera);for(const name of ['input','change'])$('#camera-form').addEventListener(name,()=>{$('#camera-form').dataset.tested='false';$('#source-test').textContent='Verbindungsdaten geändert · bitte erneut testen.';});$('#credential-mode').addEventListener('change',updateCredentialFields);$('#connection-test-button').addEventListener('click',testConnection);$('#connection-form').addEventListener('submit',saveConnection);for(const name of ['input','change'])$('#connection-form').addEventListener(name,()=>{$('#connection-form').dataset.tested='false';$('#connection-test').dataset.state='';$('#connection-test').textContent='Verbindungsdaten geändert · bitte erneut prüfen.';});$('#connection-activate').addEventListener('click',activateConnection);$('#capability-refresh').addEventListener('click',refreshCapabilities);$('#zone-camera').addEventListener('change',loadZoneCamera);$('#zone-canvas').addEventListener('pointerdown',addZonePoint);$('#zone-add-coordinate').addEventListener('click',addZoneCoordinate);$$('[data-zone-kind]').forEach(button=>button.addEventListener('click',()=>{$$('[data-zone-kind]').forEach(item=>item.classList.remove('is-active'));button.classList.add('is-active');zoneState.kind=button.dataset.zoneKind;}));$('#zone-undo').addEventListener('click',()=>{zoneState.draft.pop();drawZones();});$('#zone-complete').addEventListener('click',completeZone);$('#zone-save').addEventListener('click',saveZones);window.addEventListener('resize',resizeCanvas);
-    $('#add-czeview-account').addEventListener('click',()=>{$('#czeview-account-form').reset();$('#czeview-account-title').textContent='CZEview-Konto hinzufügen';$('#czeview-account-form').elements.countryCode.value='DE';$('#czeview-account-form').elements.phoneCode.value='49';$('#czeview-account-form').elements.sourceApp.value='141';$('#czeview-account-error').textContent='';$('#czeview-account-dialog').showModal();});$('#czeview-account-form').addEventListener('submit',saveCzeviewAccount);
+    $('#start-scan').addEventListener('click',startScan);$('#cancel-scan').addEventListener('click',cancelScan);$('#manual-add').addEventListener('click',()=>openCameraDialog());$('#discovery-auth-form').addEventListener('submit',probeDiscovery);$('#test-source').addEventListener('click',testSource);$('#camera-form').addEventListener('submit',addCamera);for(const name of ['input','change'])$('#camera-form').addEventListener(name,()=>{$('#camera-form').dataset.tested='false';$('#source-test').textContent='Verbindungsdaten geändert · bitte erneut testen.';});$('#credential-mode').addEventListener('change',updateCredentialFields);$('#connection-test-button').addEventListener('click',testConnection);$('#connection-form').addEventListener('submit',saveConnection);for(const name of ['input','change'])$('#connection-form').addEventListener(name,()=>{$('#connection-form').dataset.tested='false';$('#connection-test').dataset.state='';$('#connection-test').textContent='Verbindungsdaten geändert · bitte erneut prüfen.';});$('#connection-activate').addEventListener('click',activateConnection);$('#capability-refresh').addEventListener('click',refreshCapabilities);$('#zone-camera').addEventListener('change',loadZoneCamera);$('#zone-canvas').addEventListener('pointerdown',addZonePoint);$('#zone-add-coordinate').addEventListener('click',addZoneCoordinate);$$('[data-zone-kind]').forEach(button=>button.addEventListener('click',()=>{$$('[data-zone-kind]').forEach(item=>item.classList.remove('is-active'));button.classList.add('is-active');zoneState.kind=button.dataset.zoneKind;}));$('#zone-undo').addEventListener('click',()=>{zoneState.draft.pop();drawZones();});$('#zone-complete').addEventListener('click',completeZone);$('#zone-save').addEventListener('click',saveZones);window.addEventListener('resize',resizeCanvas);
+    $('#add-czeview-account').addEventListener('click',()=>{$('#czeview-account-form').reset();$('#czeview-account-title').textContent='CZEview-Konto hinzufügen';$('#czeview-account-form').elements.countryCode.value='DE';$('#czeview-account-form').elements.phoneCode.value='49';$('#czeview-account-form').elements.sourceApp.value='141';$('#czeview-account-error').textContent='';$('#czeview-account-dialog').showModal();});$('#czeview-account-form').addEventListener('submit',saveCzeviewAccount);$('#cloud-import-form').addEventListener('submit',importCloudCamera);
     $('#configure-netatmo').addEventListener('click',()=>{const form=$('#netatmo-config-form');form.reset();form.elements.redirectUri.value=`${location.origin}/api/cloud/oauth/netatmo/callback`;$('#netatmo-config-error').textContent='';$('#netatmo-config-dialog').showModal();});$('#netatmo-config-form').addEventListener('submit',saveNetatmoConfig);
     $('#add-netatmo-account').addEventListener('click',()=>{$('#netatmo-account-form').reset();$('#netatmo-account-error').textContent='';$('#netatmo-account-dialog').showModal();});$('#netatmo-account-form').addEventListener('submit',authorizeNetatmo);
     $('#add-user').addEventListener('click',()=>{$('#user-form').reset();$('#user-error').textContent='';$('#user-dialog').showModal();});$('#user-form').addEventListener('submit',createUser);$('#password-form').addEventListener('submit',saveUserPassword);$('#change-own-password').addEventListener('click',()=>{$('#own-password-form').reset();$('#own-password-error').textContent='';$('#own-password-dialog').showModal();});$('#own-password-form').addEventListener('submit',changeOwnPassword);

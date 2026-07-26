@@ -2,6 +2,17 @@
 
 Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
+## [1.3.2] – 2026-07-26
+
+### Behoben
+
+- Technisch geprüfte Netatmo- und CZEview-Kameras werden über einen regulären,
+  barrierearmen Dialog benannt und importiert; der nicht überall unterstützte
+  Browser-Prompt entfällt.
+- Läuft die Sicherheitsfreigabe während Import oder Streamprüfung ab, bleibt
+  der Arbeitsstand erhalten und die Passwortbestätigung wird eindeutig
+  vorgeschaltet.
+
 ## [1.3.1] – 2026-07-26
 
 ### Verbessert
@@ -145,6 +156,7 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 - standardmäßige Loopback-Bindung und eng begrenzbare private
   LAN-/VPN-Freigabe.
 
+[1.3.2]: https://github.com/pkws100/CameraHub/releases/tag/v1.3.2
 [1.3.1]: https://github.com/pkws100/CameraHub/releases/tag/v1.3.1
 [1.3.0]: https://github.com/pkws100/CameraHub/releases/tag/v1.3.0
 [1.2.0]: https://github.com/pkws100/CameraHub/releases/tag/v1.2.0
