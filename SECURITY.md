@@ -60,6 +60,19 @@
   Containeradressen umleiten.
 - ONVIF-Fähigkeiten und PTZ-Profile müssen exakt zur aktiven
   Verbindungsrevision gehören. Ein Revisionswechsel invalidiert alte Tokens.
+- Portable Sicherungen sind außen mit einer per Scrypt (`N=2^17`, `r=8`,
+  `p=1`) abgeleiteten
+  AES-256-GCM-Schlüsselung geschützt. Die Passphrase wird nicht gespeichert.
+  Laufzeitsitzungen und OAuth-Einmalzustände werden nicht exportiert.
+- Eine Wiederherstellung verlangt Eigentümerrolle, CSRF-Schutz und aktuelle
+  Passwortbestätigung. Archiv, Prüfsumme, SQLite-Integrität und Schemaversion
+  werden vor jeder Änderung geprüft; Geheimnisse werden mit dem Schlüssel der
+  Zielinstallation neu verschlüsselt.
+- Webhooks akzeptieren ausschließlich HTTP-/HTTPS-Ziele, folgen keinen
+  Weiterleitungen und signieren Zeitstempel und unveränderte JSON-Nutzlast mit
+  HMAC-SHA-256. Private LAN-Ziele sind für den lokalen Betrieb ausdrücklich
+  zulässig. Webhook-Nutzdaten enthalten keine Zugangsdaten, Token oder
+  Stream-URIs.
 
 ## Medien und Alarmvorbereitung
 

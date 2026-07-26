@@ -6,6 +6,31 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
 ### Hinzugefügt
 
+- portable, mit einer Betreiber-Passphrase verschlüsselte Sicherungen für
+  Benutzer, Kameras, Verbindungen, Cloud-Konten, Profile, Zonen und
+  Betriebseinstellungen;
+- vollständige Archivprüfung, Neuverschlüsselung für die Zielinstallation,
+  lokaler Rückfallpunkt und Sitzungswiderruf bei der Wiederherstellung;
+- dauerhafte, deduplizierte Betriebsereignisse mit fünfminütiger
+  Störungsschwelle, Entwarnung und verständlichen Handlungsempfehlungen;
+- passive Überwachung lokaler Dauerstreams und Cloud-Kontozustände, ohne
+  Akku- oder On-Demand-Kameras periodisch zu wecken;
+- HMAC-SHA-256-signierte Webhooks mit Ereignisfilter, Testnachricht,
+  Geheimnisrotation und Wiederholungen nach 1, 5, 15 und 60 Minuten;
+- Eigentümeroberfläche für Sicherungen und Webhooks sowie eine rollenlesbare
+  Ereignisübersicht auf der Systemseite.
+
+### Sicherheit
+
+- Sicherungsarchive verwenden Scrypt und AES-256-GCM, enthalten keine
+  Laufzeitsitzungen und werden vor jeder Übernahme vollständig validiert;
+- Webhook-Nutzdaten enthalten weder Passwörter, Zugriffstoken, Stream-Adressen
+  noch interne Servicetoken und folgen keinen HTTP-Weiterleitungen.
+
+## [1.2.0] – 2026-07-26
+
+### Hinzugefügt
+
 - persönliche Anzeigeprofile je Benutzer mit eigener Kameraauswahl und
   Kachelreihenfolge für Live- und Leitstellenansicht;
 - geschützte Startlinks für Tablets und Fernseher, die nach der normalen
@@ -112,4 +137,6 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 - standardmäßige Loopback-Bindung und eng begrenzbare private
   LAN-/VPN-Freigabe.
 
+[1.3.0]: https://github.com/pkws100/CameraHub/releases/tag/v1.3.0
+[1.2.0]: https://github.com/pkws100/CameraHub/releases/tag/v1.2.0
 [1.0.0]: https://github.com/pkws100/CameraHub/releases/tag/v1.0.0
