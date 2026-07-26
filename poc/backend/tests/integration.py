@@ -90,7 +90,7 @@ def request(path: str, method: str = "GET", body=None, csrf: str | None = None, 
 try:
     with camera_app.connect() as conn:
         assert conn.execute(
-            "SELECT 1 FROM schema_migrations WHERE version=6"
+            "SELECT 1 FROM schema_migrations WHERE version=7"
         ).fetchone()
     state = request("/api/auth/state")
     assert state == {"setupRequired": True, "authenticated": False}
@@ -174,7 +174,8 @@ try:
     request(f"/api/admin/users/{viewer['id']}/password", "POST", {"password": replacement_viewer_password}, csrf)
     assert request("/api/auth/state", opener=viewer_client)["authenticated"] is False
     replacement_client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-    assert request("/api/auth/login", "POST", {"username": "viewer1", "password": replacement_viewer_password}, opener=replacement_client)["user"]["role"] == "viewer"
+    replacement_session = request("/api/auth/login", "POST", {"username": "viewer1", "password": replacement_viewer_password}, opener=replacement_client)
+    assert replacement_session["user"]["role"] == "viewer"
 
     cameras = request("/api/cameras")["cameras"]
     assert [item["id"] for item in cameras] == ["garten", "eingang", "serverraum", "rueckseite", "einfahrt", "garage"]
@@ -184,6 +185,73 @@ try:
     ciphertext = camera_app.encrypt_text("camera-secret")
     assert "camera-secret" not in ciphertext and camera_app.decrypt_text(ciphertext) == "camera-secret"
     assert 2020 in camera_app.SCAN_PORTS
+
+    owner_profile = request(
+        "/api/display-profiles",
+        "POST",
+        {"name": "Eingänge", "cameraIds": ["eingang", "garten"]},
+        csrf,
+        expected=201,
+    )
+    assert owner_profile["cameraIds"] == ["eingang", "garten"]
+    assert [item["id"] for item in request(f"/api/cameras?profileId={owner_profile['id']}")["cameras"]] == ["eingang", "garten"]
+    assert request(
+        "/api/display-profiles",
+        "POST",
+        {"name": "EINGÄNGE", "cameraIds": []},
+        csrf,
+        expected=409,
+    )["detail"] == "display-profile-name-exists"
+    assert request(
+        "/api/display-profiles",
+        "POST",
+        {"name": "Ungültig", "cameraIds": ["nicht-vorhanden"]},
+        csrf,
+        expected=400,
+    )["detail"] == "invalid-camera-selection"
+    viewer_profile = request(
+        "/api/display-profiles",
+        "POST",
+        {"name": "Tablet", "cameraIds": ["garage"]},
+        replacement_session["csrfToken"],
+        expected=201,
+        opener=replacement_client,
+    )
+    viewer_profiles = request("/api/display-profiles", opener=replacement_client)
+    assert [item["id"] for item in viewer_profiles["profiles"]] == [viewer_profile["id"]]
+    assert any(item["id"] == "garten" and item["enabled"] for item in viewer_profiles["cameraOptions"])
+    assert request(
+        f"/api/cameras?profileId={owner_profile['id']}",
+        expected=404,
+        opener=replacement_client,
+    )["detail"] == "display-profile-not-found"
+    assert request(
+        f"/api/display-profiles/{viewer_profile['id']}",
+        "PUT",
+        {"name": "Fremd", "cameraIds": []},
+        csrf,
+        expected=404,
+    )["detail"] == "display-profile-not-found"
+    request("/api/admin/cameras/garten", "PATCH", {"enabled": False}, csrf)
+    assert [item["id"] for item in request(f"/api/cameras?profileId={owner_profile['id']}")["cameras"]] == ["eingang"]
+    assert request("/api/display-profiles")["profiles"][0]["cameraIds"] == ["eingang", "garten"]
+    request("/api/admin/cameras/garten", "PATCH", {"enabled": True}, csrf)
+    updated_profile = request(
+        f"/api/display-profiles/{owner_profile['id']}",
+        "PUT",
+        {"name": "Eingänge", "cameraIds": ["garten", "eingang"]},
+        csrf,
+    )
+    assert updated_profile["cameraIds"] == ["garten", "eingang"]
+    assert [item["id"] for item in request(f"/api/cameras?profileId={owner_profile['id']}")["cameras"]] == ["garten", "eingang"]
+    request(
+        f"/api/display-profiles/{viewer_profile['id']}",
+        "DELETE",
+        csrf=replacement_session["csrfToken"],
+        expected=204,
+        opener=replacement_client,
+    )
+    assert request("/api/display-profiles", opener=replacement_client)["profiles"] == []
 
     denied = request("/api/admin/cameras/order", "PUT", {"cameraIds": [item["id"] for item in cameras]}, expected=403)
     assert denied["detail"] == "csrf-invalid"
@@ -231,6 +299,12 @@ try:
     assert viewer_camera["displayMode"] == "snapshot" and viewer_camera["snapshotPath"].endswith("/snapshot")
     assert viewer_camera["usesCredentials"] is True
     assert "192.168.50.220" not in json.dumps(viewer_camera) and vendor_secret not in json.dumps(viewer_camera)
+    request(
+        f"/api/display-profiles/{owner_profile['id']}",
+        "PUT",
+        {"name": "Eingänge", "cameraIds": [added["id"], "garten", "eingang"]},
+        csrf,
+    )
     with camera_app.connect() as conn:
         stored = conn.execute("SELECT username_ct,password_ct FROM credentials").fetchone()
         stored_connection = conn.execute(
@@ -248,6 +322,7 @@ try:
     request(f"/api/admin/cameras/{added['id']}", "DELETE", csrf=csrf, expected=204)
     camera_app.ffprobe_uri = original_ffprobe
     assert all(item["id"] != added["id"] for item in request("/api/cameras")["cameras"])
+    assert request("/api/display-profiles")["profiles"][0]["cameraIds"] == ["garten", "eingang"]
 
     invalid = {"name": "Outside", "address": "8.8.8.8", "protocol": "rtsp", "port": 554, "lowSourcePath": "/live", "codec": "h264"}
     assert request("/api/admin/cameras/test-source", "POST", invalid, csrf, expected=422)["detail"]
@@ -803,7 +878,7 @@ try:
     finally:
         camera_app.netatmo_api_json = original_netatmo_api_json
 
-    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist")
+    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration personal-display-profiles profile-order profile-isolation camera-disable-retention camera-delete-cascade ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist")
 finally:
     server.should_exit = True
     thread.join(timeout=5)
