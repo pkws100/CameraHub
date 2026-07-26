@@ -968,6 +968,12 @@ try:
             (event_row["id"],),
         ).fetchone()
         assert delivery
+    event_api = request("/api/events?status=open")
+    api_incident = next(
+        item for item in event_api["events"] if item["id"] == event_row["id"]
+    )
+    assert api_incident["durationSeconds"] == camera_app.INCIDENT_THRESHOLD_SECONDS
+    assert api_incident["cameraName"] == "Garten"
 
     captured_webhooks = []
 
@@ -1143,6 +1149,10 @@ try:
             "UPDATE cloud_accounts SET status='reauth-required' WHERE id=?",
             (cloud_account["id"],),
         )
+        cloud_camera_row = conn.execute(
+            "SELECT * FROM cameras WHERE id=?", (imported_cloud["id"],)
+        ).fetchone()
+    assert camera_app.camera_status(cloud_camera_row, {}, True)["state"] == "cloud-auth-required"
     camera_app.monitor_once(observed_at=cloud_incident_now)
     camera_app.monitor_once(
         observed_at=cloud_incident_now + camera_app.INCIDENT_THRESHOLD_SECONDS
@@ -1177,7 +1187,7 @@ try:
     manifest, backup_database, source_key = camera_app.decode_backup_archive(
         backup_archive, backup_passphrase
     )
-    assert manifest["schemaVersion"] == 8 and manifest["appVersion"] == "1.3.0"
+    assert manifest["schemaVersion"] == 8 and manifest["appVersion"] == "1.3.1"
     assert len(backup_database) <= camera_app.BACKUP_DATABASE_MAX_BYTES
     assert camera_app.BACKUP_EXPANDED_MAX_BYTES > len(base64.b64encode(backup_database))
     for invalid_archive, invalid_passphrase, expected_code in (

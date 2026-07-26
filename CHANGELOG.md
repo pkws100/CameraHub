@@ -2,7 +2,15 @@
 
 Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
-## [Unveröffentlicht]
+## [1.3.1] – 2026-07-26
+
+### Verbessert
+
+- Ereignisse zeigen ihre berechnete Dauer ausdrücklich an.
+- Cloud-Kameras unterscheiden eine erforderliche Neuanmeldung nun auch im
+  Kamera- und Verbindungsstatus.
+
+## [1.3.0] – 2026-07-26
 
 ### Hinzugefügt
 
@@ -137,6 +145,7 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 - standardmäßige Loopback-Bindung und eng begrenzbare private
   LAN-/VPN-Freigabe.
 
+[1.3.1]: https://github.com/pkws100/CameraHub/releases/tag/v1.3.1
 [1.3.0]: https://github.com/pkws100/CameraHub/releases/tag/v1.3.0
 [1.2.0]: https://github.com/pkws100/CameraHub/releases/tag/v1.2.0
 [1.0.0]: https://github.com/pkws100/CameraHub/releases/tag/v1.0.0
