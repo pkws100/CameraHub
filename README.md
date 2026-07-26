@@ -7,7 +7,7 @@ proprietären Hersteller-Plug-ins. Für CZEview-Akku-Kameras und freigegebene
 Netatmo-Sicherheitskameras stehen getrennte, bedarfsgesteuerte Cloud-Adapter
 bereit.
 
-> **Version 1.3.0:** Dieser Release ist für einen selbst verwalteten
+> **Version 1.3.1:** Dieser Release ist für einen selbst verwalteten
 > privaten Docker-Host vorgesehen. Vor einer Erreichbarkeit über das Internet
 > müssen WireGuard, ein HTTPS-Reverse-Proxy und eine zusätzliche
 > Netzsegmentierung eingerichtet werden.

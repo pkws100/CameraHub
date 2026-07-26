@@ -84,7 +84,7 @@ BACKUP_SCRYPT_N = 2**17
 BACKUP_LEGACY_SCRYPT_N = 2**14
 BACKUP_FORMAT = "pkws-camera-hub-backup"
 BACKUP_VERSION = 1
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 HTTP_DIAGNOSTIC_ONLY = os.environ.get("HTTP_DIAGNOSTIC_ONLY") == "1"
 ALLOW_INSECURE_LOOPBACK_MANAGEMENT = (
     os.environ.get("ALLOW_INSECURE_LOOPBACK_MANAGEMENT") == "1"
@@ -1332,6 +1332,8 @@ def webhook_target_payload(row: sqlite3.Row) -> dict:
 
 def system_event_payload(row: sqlite3.Row) -> dict:
     keys = set(row.keys())
+    started = datetime.fromisoformat(row["started_at"])
+    ended = datetime.fromisoformat(row["resolved_at"] or row["last_seen_at"])
     return {
         "id": row["id"],
         "type": row["event_type"],
@@ -1345,6 +1347,7 @@ def system_event_payload(row: sqlite3.Row) -> dict:
         "lastSeenAt": row["last_seen_at"],
         "openedAt": row["opened_at"],
         "resolvedAt": row["resolved_at"],
+        "durationSeconds": max(0, int(round((ended - started).total_seconds()))),
         "title": row["title"],
         "description": row["description"],
         "recommendation": row["recommendation"],
@@ -1782,7 +1785,15 @@ def admin_camera(row: sqlite3.Row, paths: dict[str, dict] | None = None, media_a
         "relayMode": "dynamic" if row["managed"] else ("external-on-demand" if external_source else "static-rollback"),
         "liveAccess": {
             "ready": live_ready,
-            "state": "live" if live_ready else ("media-server-offline" if not media_api_ok else "offline"),
+            "state": (
+                "live"
+                if live_ready
+                else "media-server-offline"
+                if not media_api_ok
+                else "cloud-auth-required"
+                if camera_cloud_auth_required(row)
+                else "offline"
+            ),
             "usesActiveRevision": uses_active_revision,
             "credentialSource": credential_source,
             "authenticationConfigured": live_auth_configured,
@@ -2032,6 +2043,18 @@ def transient_rtsp_preview(source_uri: str) -> bytes:
             pass
 
 
+def camera_cloud_auth_required(row: sqlite3.Row) -> bool:
+    if not row["cloud_device_id"]:
+        return False
+    with connect() as conn:
+        account = conn.execute(
+            """SELECT a.status FROM cloud_devices d
+               JOIN cloud_accounts a ON a.id=d.account_id WHERE d.id=?""",
+            (row["cloud_device_id"],),
+        ).fetchone()
+    return bool(account and account["status"] in {"reauth-required", "error"})
+
+
 def camera_status(row: sqlite3.Row, paths: dict[str, dict], api_ok: bool) -> dict:
     path = paths.get(row["low_path"], {})
     live = bool(path.get("ready"))
@@ -2039,6 +2062,8 @@ def camera_status(row: sqlite3.Row, paths: dict[str, dict], api_ok: bool) -> dic
         state = "live"
     elif not api_ok:
         state = "media-server-offline"
+    elif camera_cloud_auth_required(row):
+        state = "cloud-auth-required"
     elif row["on_demand"]:
         with connect() as conn:
             incident = conn.execute(

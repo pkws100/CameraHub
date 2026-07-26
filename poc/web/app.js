@@ -1,6 +1,6 @@
 (() => {
   'use strict';
-  const VERSION = '1.3.0';
+  const VERSION = '1.3.1';
   const RETRY_DELAYS = [2000, 5000, 15000];
   const appState = { csrf:'', user:null, permissions:{}, users:[], cameras:[], adminCameras:[], cloudAccounts:[], cloudProviders:[], displayProfiles:[], profileCameraOptions:[], displayProfileId:'', renderedDisplayProfileId:'', profileDraftOrder:[], cameraRequest:0, states:new Map(), observer:null, detail:null, suspended:false, wallMode:false, wallControlsTimer:null, elevatedUntil:0, scanTimer:null, scanId:null, discoveryItems:[], discoveryResultScanId:null, discoveryDevice:null, connectionCamera:null, connectionRollout:null, connectionRequest:0, capabilityCamera:null, capabilityRequest:0, ptz:null, webhookTargets:[], restoreValidated:false };
   const $ = (selector, root=document) => root.querySelector(selector);
@@ -280,7 +280,7 @@
     if(!appState.cameras.length){const empty=document.createElement('div');empty.className='empty-state';empty.innerHTML='<h3>Keine Kameras in dieser Ansicht</h3><p>Wählen Sie ein anderes Profil oder bearbeiten Sie die Kamerazuordnung.</p>';$('#camera-grid').append(empty);}
     appState.renderedDisplayProfileId=appState.displayProfileId;await loadHealth();if(request===appState.cameraRequest)populateZoneSelect();return true;
   }
-  async function loadHealth(){try{const data=await api('/api/health');$('#system-state').dataset.state='live';$('#system-state span').textContent='Lokales Gateway online';const labels={connecting:['loading','Verbindung wird aufgebaut'],sleeping:['loading','Bereit · startet beim Öffnen'],offline:['offline','Kamera nicht erreichbar'],'media-server-offline':['offline','Medienserver nicht erreichbar'],unknown:['loading','Status unbekannt']};data.cameras?.forEach((item)=>{const state=appState.states.get(item.camera);if(!state||state.reader||state.camera.displayMode==='snapshot')return;if(item.lastFrameAt)state.lastFrame.textContent=relativeTime(item.lastFrameAt);if(item.state!=='live'){const [status,text]=labels[item.state]||labels.unknown;mark(state,status,text);}});}catch{$('#system-state').dataset.state='offline';$('#system-state span').textContent='Gateway nicht erreichbar';}}
+  async function loadHealth(){try{const data=await api('/api/health');$('#system-state').dataset.state='live';$('#system-state span').textContent='Lokales Gateway online';const labels={connecting:['loading','Verbindung wird aufgebaut'],sleeping:['loading','Bereit · startet beim Öffnen'],offline:['offline','Kamera nicht erreichbar'],'cloud-auth-required':['offline','Cloud-Anmeldung erforderlich'],'media-server-offline':['offline','Medienserver nicht erreichbar'],unknown:['loading','Status unbekannt']};data.cameras?.forEach((item)=>{const state=appState.states.get(item.camera),detail=appState.detail?.camera.id===item.camera?appState.detail:null;if(item.state==='cloud-auth-required'){for(const target of new Set([state,detail].filter(Boolean))){closeReader(target);mark(target,'offline','Cloud-Anmeldung erforderlich');}return;}if(!state||state.reader||state.camera.displayMode==='snapshot')return;if(item.lastFrameAt)state.lastFrame.textContent=relativeTime(item.lastFrameAt);if(item.state!=='live'){const [status,text]=labels[item.state]||labels.unknown;mark(state,status,text);}});}catch{$('#system-state').dataset.state='offline';$('#system-state span').textContent='Gateway nicht erreichbar';}}
   function openDetail(id){
     const camera=appState.cameras.find(item=>item.id===id),tile=appState.states.get(id);if(!camera||!tile)return;const returnFocus=document.activeElement;closeReader(tile);$$('.view').forEach(view=>view.hidden=true);$('#detail').hidden=false;history.replaceState(null,'',`#camera/${camera.id}`);
     const highAvailable=camera.highPath!==camera.lowPath,highWebRTC=highAvailable&&camera.highWebRTCCompatible!==false,initialPath=highWebRTC?camera.highPath:camera.lowPath,mode=highWebRTC?'high':'low';
@@ -366,7 +366,7 @@
     }else if(live.ready){
       badges.push('<span class="connection-badge live-ready" data-state="live">Live · ohne Anmeldung</span>');
     }else{
-      badges.push(`<span class="connection-badge" data-state="offline">${live.state==='media-server-offline'?'Medienserver nicht erreichbar':'Livequelle offline'}</span>`);
+      badges.push(`<span class="connection-badge" data-state="offline">${live.state==='media-server-offline'?'Medienserver nicht erreichbar':live.state==='cloud-auth-required'?'Cloud-Anmeldung erforderlich':'Livequelle offline'}</span>`);
     }
     if(camera.draftRevision&&draftHasAuth&&!live.usesActiveRevision){
       badges.push('<span class="connection-note">Geprüfter Entwurf ist noch nicht die Livequelle.</span>');
@@ -721,12 +721,13 @@
 
   const EVENT_STATUS_LABELS={pending:'Wird beobachtet',open:'Offen',resolved:'Behoben'};
   function eventTime(value){return value?new Intl.DateTimeFormat('de-DE',{dateStyle:'short',timeStyle:'short'}).format(new Date(value)):'–';}
+  function eventDuration(value){let seconds=Math.max(0,Number(value)||0);const days=Math.floor(seconds/86400);seconds%=86400;const hours=Math.floor(seconds/3600);seconds%=3600;const minutes=Math.floor(seconds/60);if(days)return`${days} T ${hours} Std`;if(hours)return`${hours} Std ${minutes} Min`;return`${minutes} Min`;}
   function renderEvents(data){
     const summary=data.summary||{};$('#event-summary').innerHTML=`<span><strong>${Number(summary.open||0)}</strong> offen</span><span><strong>${Number(summary.pending||0)}</strong> in Beobachtung</span><span><strong>${Number(summary.resolved||0)}</strong> behoben</span>`;
     const list=$('#event-list');list.replaceChildren();
     for(const event of data.events||[]){
       const article=document.createElement('article');article.className='event-entry';article.dataset.status=event.status;
-      article.innerHTML=`<i class="event-marker" aria-hidden="true"></i><div><h4>${escapeHtml(event.title)}</h4><p>${escapeHtml(event.description)}</p><p><strong>Empfehlung:</strong> ${escapeHtml(event.recommendation)}</p><div class="event-meta"><span>Beginn ${escapeHtml(eventTime(event.startedAt))}</span><span>Zuletzt ${escapeHtml(eventTime(event.lastSeenAt))}</span>${event.cameraId?`<span>Kamera ${escapeHtml(event.cameraName||event.cameraId)}</span>`:''}${event.accountId?`<span>Cloud-Konto ${escapeHtml(event.accountLabel||event.accountId)}</span>`:''}</div></div><span class="event-state">${escapeHtml(EVENT_STATUS_LABELS[event.status]||event.status)}</span>`;
+      article.innerHTML=`<i class="event-marker" aria-hidden="true"></i><div><h4>${escapeHtml(event.title)}</h4><p>${escapeHtml(event.description)}</p><p><strong>Empfehlung:</strong> ${escapeHtml(event.recommendation)}</p><div class="event-meta"><span>Beginn ${escapeHtml(eventTime(event.startedAt))}</span><span>Dauer ${escapeHtml(eventDuration(event.durationSeconds))}</span><span>Zuletzt ${escapeHtml(eventTime(event.lastSeenAt))}</span>${event.cameraId?`<span>Kamera ${escapeHtml(event.cameraName||event.cameraId)}</span>`:''}${event.accountId?`<span>Cloud-Konto ${escapeHtml(event.accountLabel||event.accountId)}</span>`:''}</div></div><span class="event-state">${escapeHtml(EVENT_STATUS_LABELS[event.status]||event.status)}</span>`;
       list.append(article);
     }
     if(!list.children.length)list.innerHTML='<div class="empty-state"><h3>Keine Ereignisse</h3><p>Für diesen Filter liegen keine Betriebsereignisse vor.</p></div>';

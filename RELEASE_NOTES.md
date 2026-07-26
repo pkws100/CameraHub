@@ -1,6 +1,6 @@
-# Camera Hub 1.3.0
+# Camera Hub 1.3.1
 
-Camera Hub 1.3.0 macht den bestehenden Multi-Kamera-Hub für den dauerhaften
+Camera Hub 1.3.1 macht den bestehenden Multi-Kamera-Hub für den dauerhaften
 privaten Betrieb besser nachvollziehbar und wiederherstellbar.
 
 ## Höhepunkte
@@ -16,6 +16,8 @@ privaten Betrieb besser nachvollziehbar und wiederherstellbar.
   Geheimnisrotation und begrenzten Wiederholungen;
 - neue Eigentümerfunktionen auf der Systemseite, ohne Änderungen an den
   bestehenden Kamera-, Cloud-, Benutzer-, Profil- oder Lease-Abläufen.
+- ausdrücklich berechnete Ereignisdauer und ein eigener Kamerastatus für
+  erforderliche Cloud-Neuanmeldungen.
 
 ## Wichtige Hinweise
 
