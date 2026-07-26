@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS cloud_provider_configs(
 CREATE TABLE IF NOT EXISTS cloud_accounts(
  id TEXT PRIMARY KEY, provider TEXT NOT NULL CHECK(provider IN ('czeview','netatmo')),
  label TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, auth_payload_ct TEXT NOT NULL,
+ auth_revision INTEGER NOT NULL DEFAULT 1,
  scopes_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'pending',
  last_error_code TEXT, last_verified_at TEXT, legacy_source TEXT,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -288,6 +289,18 @@ def initialize_database() -> None:
         if conn.execute("SELECT 1 FROM schema_migrations WHERE version=5").fetchone() is None:
             conn.execute(
                 "INSERT INTO schema_migrations(version,applied_at) VALUES(5,?)",
+                (now_iso(),),
+            )
+        cloud_account_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(cloud_accounts)")
+        }
+        if "auth_revision" not in cloud_account_columns:
+            conn.execute(
+                "ALTER TABLE cloud_accounts ADD COLUMN auth_revision INTEGER NOT NULL DEFAULT 1"
+            )
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=6").fetchone() is None:
+            conn.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(6,?)",
                 (now_iso(),),
             )
         if "active_connection_id" not in camera_columns:
@@ -1592,7 +1605,8 @@ def replace_czeview_account_credentials(
         if not row:
             raise HTTPException(404, "czeview-account-not-found")
         conn.execute(
-            """UPDATE cloud_accounts SET label=?,auth_payload_ct=?,enabled=1,status='pending',
+            """UPDATE cloud_accounts SET label=?,auth_payload_ct=?,auth_revision=auth_revision+1,
+               enabled=1,status='pending',
                last_error_code=NULL,last_verified_at=NULL,updated_at=? WHERE id=?""",
             (body.label, encrypt_json(auth), now_iso(), account_id),
         )
@@ -3625,7 +3639,7 @@ def czeview_adapter_accounts(_: None = Depends(require_czeview_adapter)):
             {
                 "id": row["id"],
                 "label": row["label"],
-                "updatedAt": row["updated_at"],
+                "authRevision": row["auth_revision"],
                 "credentials": decrypt_json(row["auth_payload_ct"]),
             }
             for row in rows

@@ -126,7 +126,7 @@ Eine Suche erzeugt eine gemeinsame Ergebnisliste:
 
 Der Backend-Integrationstest deckt unter anderem ab:
 
-- Schema-Migration bis Version 5,
+- Schema-Migration bis Version 6,
 - Verschlüsselung der Cloud-Geheimnisse,
 - mehrere Provider und Kontentrennung,
 - Ersetzen von CZEview-Zugangsdaten ohne Verlust von Gerät oder Kamera,
