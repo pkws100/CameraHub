@@ -103,7 +103,7 @@
         <article><span>WebRTC</span><strong id="diag-webrtc">–</strong></article>
         <article><span>HLS</span><strong id="diag-hls">–</strong></article>
         <article><span>Backend</span><strong id="diag-backend">–</strong></article>
-        <article><span>App-Version</span><strong id="diag-version">1.3.1</strong></article>
+        <article><span>App-Version</span><strong id="diag-version">1.3.2</strong></article>
         <article class="span-two"><span>Origin</span><strong id="diag-origin">–</strong></article>
       </div>
       <section class="operations-section" aria-labelledby="events-title">
@@ -273,6 +273,14 @@
     <label>Bezeichnung<input name="label" required maxlength="80" placeholder="Haus oder Standort"></label>
     <p class="form-error" id="netatmo-account-error" role="alert"></p>
     <div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Bei Netatmo anmelden</button></div>
+  </form></dialog>
+
+  <dialog id="cloud-import-dialog" class="modal" aria-labelledby="cloud-import-title"><form id="cloud-import-form">
+    <p class="kicker">Geprüfte Cloud-Kamera</p><h2 id="cloud-import-title">Kamera hinzufügen</h2>
+    <p id="cloud-import-target"></p>
+    <label>Anzeigename<input name="name" required maxlength="80"></label>
+    <p class="form-error" id="cloud-import-error" role="alert"></p>
+    <div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Kamera hinzufügen</button></div>
   </form></dialog>
 
   <dialog id="camera-dialog" class="modal camera-modal" aria-labelledby="camera-title"><form id="camera-form"><p class="kicker">Neue Quelle</p><h2 id="camera-title">Kamera hinzufügen</h2><div class="form-grid">

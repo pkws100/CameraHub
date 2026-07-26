@@ -692,10 +692,6 @@ try:
             "SELECT auth_revision FROM cloud_accounts WHERE id=?",
             (cloud_account["id"],),
         ).fetchone()["auth_revision"] == inventory_auth_revision
-        conn.execute(
-            "UPDATE cloud_devices SET stream_support='verified' WHERE id=?",
-            (cloud_device_id,),
-        )
     cloud_scan_id, cloud_scan_device_id = "cloud-scan", "cloud-result"
     camera_app.SCANS[cloud_scan_id] = {
         "id": cloud_scan_id,
@@ -713,15 +709,52 @@ try:
                 "name": "Cloud Kamera",
                 "manufacturer": "CZEview (Plattformmarke)",
                 "model": "API-Gerätetyp 5",
-                "streamSupport": "verified",
-                "available": True,
-                "previewAvailable": True,
-                "previewVerified": True,
+                "streamSupport": "candidate",
+                "available": False,
+                "previewAvailable": False,
+                "previewVerified": False,
                 "configuredCameraId": None,
                 "configuredName": None,
             }
         ],
     }
+    original_media_paths = camera_app.media_paths
+    original_capture_frame = camera_app.capture_rtsp_frame
+    observed_cloud_probe = {}
+
+    def cloud_probe_media_paths():
+        probe = camera_app.CLOUD_PROBE_LEASES.get(cloud_device_id)
+        assert probe and probe["lease"]["active"] is True
+        observed_cloud_probe["path"] = probe["lease"]["path"]
+        return ({probe["lease"]["path"]: {"ready": True}}, True)
+
+    def cloud_probe_frame(path, timeout=0):
+        assert path == observed_cloud_probe["path"] and timeout == 15
+        return b"\xff\xd8cloud-frame\xff\xd9"
+
+    camera_app.media_paths = cloud_probe_media_paths
+    camera_app.capture_rtsp_frame = cloud_probe_frame
+    try:
+        probed_cloud = request(
+            f"/api/admin/discovery/scans/{cloud_scan_id}/devices/{cloud_scan_device_id}/probe",
+            "POST",
+            {},
+            csrf,
+        )
+    finally:
+        camera_app.media_paths = original_media_paths
+        camera_app.capture_rtsp_frame = original_capture_frame
+    assert probed_cloud["streamSupport"] == "verified"
+    assert probed_cloud["previewVerified"] is True
+    assert cloud_device_id not in camera_app.CLOUD_PROBE_LEASES
+    assert camera_app.DISCOVERY_PREVIEW_CACHE[
+        (cloud_scan_id, cloud_scan_device_id)
+    ][1].startswith(b"\xff\xd8")
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT stream_support FROM cloud_devices WHERE id=?",
+            (cloud_device_id,),
+        ).fetchone()["stream_support"] == "verified"
     imported_cloud = request(
         f"/api/admin/discovery/scans/{cloud_scan_id}/devices/{cloud_scan_device_id}/import",
         "POST",
@@ -1187,7 +1220,7 @@ try:
     manifest, backup_database, source_key = camera_app.decode_backup_archive(
         backup_archive, backup_passphrase
     )
-    assert manifest["schemaVersion"] == 8 and manifest["appVersion"] == "1.3.1"
+    assert manifest["schemaVersion"] == 8 and manifest["appVersion"] == "1.3.2"
     assert len(backup_database) <= camera_app.BACKUP_DATABASE_MAX_BYTES
     assert camera_app.BACKUP_EXPANDED_MAX_BYTES > len(base64.b64encode(backup_database))
     for invalid_archive, invalid_passphrase, expected_code in (
