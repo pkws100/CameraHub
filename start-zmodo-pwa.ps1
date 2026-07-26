@@ -69,6 +69,8 @@ function Get-IPv4NetworkCidr([string]$Address, [int]$PrefixLength) {
 }
 Initialize-LocalSecret (Join-Path $secretDirectory 'zmodo_secret_key')
 Initialize-LocalSecret (Join-Path $secretDirectory 'zmodo_internal_token')
+Initialize-LocalSecret (Join-Path $secretDirectory 'czeview_adapter_token')
+Initialize-LocalSecret (Join-Path $secretDirectory 'netatmo_adapter_token')
 
 docker info --format '{{.ServerVersion}}' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Docker Desktop ist nicht erreichbar.' }
@@ -168,7 +170,7 @@ if (Test-Path -LiteralPath $localEnv) {
     ).Count -eq 0
     if ($czeviewEnabled) {
         $czeviewSecret = [ordered]@{}
-        foreach ($key in $czeviewRequired + @('CZEVIEW_DEVICE_SERIAL', 'CZEVIEW_CAMERA_NAME')) {
+        foreach ($key in $czeviewRequired + @('CZEVIEW_USERNAME', 'CZEVIEW_DEVICE_SERIAL', 'CZEVIEW_CAMERA_NAME')) {
             $value = [string]$localValues[$key]
             if (-not [string]::IsNullOrWhiteSpace($value)) {
                 $czeviewSecret[$key] = $value.Trim().Trim('"').Trim("'")
@@ -195,7 +197,7 @@ $state = [ordered]@{ mode=$Mode; bindAddress=$bindAddress; composeFiles=$compose
 $composeArgs = @()
 if (Test-Path -LiteralPath $localEnv) { $composeArgs += @('--env-file', $localEnv) }
 $composeArgs += @('--env-file', $composeEnv)
-if ($czeviewEnabled) { $composeArgs += @('--profile', 'czeview') }
+$composeArgs += @('--profile', 'czeview')
 foreach ($file in $composeFiles) { $composeArgs += @('-f', $file) }
 $upArgs = @($composeArgs) + @('up', '-d', '--build', '--remove-orphans')
 Push-Location $poc
@@ -229,7 +231,7 @@ $health | Select-Object status,mediaServer,sourcesReady,sourcesExpected | Format
 if (-not $allLive) { Write-Warning 'Der Stack läuft, aber noch nicht alle Kameraquellen melden live.' }
 Write-Output "PWA: $browserUrl"
 Write-Output "Bindung: $bindAddress (Modus: $Mode)"
-Write-Output "CZEview-Brücke: $(if ($czeviewEnabled) { 'aktiviert' } else { 'nicht konfiguriert' })"
+Write-Output "CZEview-Brücke: aktiv (Konten werden in Camera Hub verwaltet)"
 if ($Mode -eq 'Https') {
     $projectRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
         Where-Object DisplayName -like 'PKWS-ZMODO-PWA-*')

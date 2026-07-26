@@ -3,11 +3,11 @@
 Lokales, herstellerneutrales Multi-Kamera-Gateway für ONVIF-, RTSP-, HLS-,
 Snapshot- und MJPEG-Kameras. Camera Hub verbindet standardisierte Kameras mit
 einer geschützten PWA und WebRTC/HLS-Ausgabe. Der Kern benötigt keine
-proprietären Hersteller-Plug-ins oder Cloud-Dienste. Für CZEview-Akku-Kameras
-steht zusätzlich eine ausdrücklich optionale, cloud-unterstützte P2P-Brücke
+proprietären Hersteller-Plug-ins. Für CZEview-Akku-Kameras und freigegebene
+Netatmo-Sicherheitskameras stehen getrennte, bedarfsgesteuerte Cloud-Adapter
 bereit.
 
-> **Version 1.0.0:** Dieser erste Release ist für einen selbst verwalteten
+> **Version 1.1.0:** Dieser Release ist für einen selbst verwalteten
 > privaten Docker-Host vorgesehen. Vor einer Erreichbarkeit über das Internet
 > müssen WireGuard, ein HTTPS-Reverse-Proxy und eine zusätzliche
 > Netzsegmentierung eingerichtet werden.
@@ -37,7 +37,7 @@ Stoppen und Status:
 .\status-zmodo-pwa.ps1
 ```
 
-## Optionale CZEview-Akku-Kamera
+## Cloud-Konten und Akku-Kameras
 
 Die untersuchte CZEview-Kamera besitzt keinen nachgewiesenen lokalen
 RTSP-/ONVIF-Dienst. Camera Hub kann ihr bestätigtes H.264-Livebild stattdessen
@@ -45,10 +45,17 @@ RTSP-/ONVIF-Dienst. Camera Hub kann ihr bestätigtes H.264-Livebild stattdessen
 erst beim Öffnen der Ansicht geweckt und nach Freigabe des Leases nicht
 dauerhaft wach gehalten.
 
-Einrichtung, Sicherheitsgrenzen, Ein-Sitzungs-Hinweis und technische Evidenz
-stehen in [CZEVIEW-INTEGRATION.md](CZEVIEW-INTEGRATION.md). Ohne vollständige
-CZEview-Einträge in der ignorierten `poc/.env` wird die Brücke nicht gestartet;
-alle bisherigen Kamerawege bleiben unverändert.
+Neue Konten werden als Eigentümer unter **Kameras suchen → Cloud-Konten**
+angelegt. Mehrere CZEview- und Netatmo-Konten können parallel aktiviert werden.
+Jede Cloud-Kamera muss vor dem Hinzufügen einen echten Frame-Test bestehen.
+Geräte ohne freigegebenen Livezugriff bleiben sichtbar, aber deaktiviert.
+
+Bestehende CZEview-Einträge in der ignorierten `poc/.env` werden einmalig in
+den verschlüsselten Kontospeicher übernommen. Einrichtung, Sicherheitsgrenzen,
+Ein-Sitzungs-Hinweis und technische Evidenz stehen in
+[CZEVIEW-INTEGRATION.md](CZEVIEW-INTEGRATION.md).
+Die Netatmo-App-Einrichtung und die bewusst begrenzten Rechte beschreibt
+[NETATMO-INTEGRATION.md](NETATMO-INTEGRATION.md).
 
 ## Zugriff über die private IP
 
@@ -121,6 +128,10 @@ Dieser Modus besitzt transportbedingt keinen Secure Context und sollte nicht
 - H.264-Stream-Copy, bedarfsgesteuerter H.265-/MJPEG-Kompatibilitätsweg;
 - optionale CZEview-P2P-Brücke mit Wake-on-View, erneuerbarem Lease und
   nachgewiesenem horizontalem Schwenk;
+- mehrere verschlüsselte CZEview- und Netatmo-Konten in einer gemeinsamen
+  LAN-/Cloud-Suche;
+- Netatmo-OAuth ohne Speicherung des Netatmo-Passworts und ein
+  bedarfsgesteuerter, intern isolierter HLS-Adapter;
 - dynamischer Relay-Manager ohne Docker-Socket;
 - Detection-Adaptervertrag, standardmäßig deaktiviert;
 - Service Worker ausschließlich für statische App-Dateien.

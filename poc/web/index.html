@@ -39,7 +39,7 @@
     <button class="nav-item" data-view="zones" data-permission="manageZones"><span>04</span>Alarmzonen</button>
     <button class="nav-item" data-view="users" data-permission="manageUsers"><span>05</span>Benutzer</button>
     <button class="nav-item" data-view="system"><span>06</span>Systemstatus</button>
-    <div class="menu-foot"><div><strong id="current-user">–</strong><p id="current-role">Offene Standards · Keine Cloud</p><a href="https://github.com/pkws100/CameraHub" target="_blank" rel="noopener noreferrer">Quellcode · AGPL-3.0 · Ohne Gewähr</a></div><button type="button" id="logout">Abmelden</button></div>
+    <div class="menu-foot"><div><strong id="current-user">–</strong><p id="current-role">Offene Standards · optionale Cloud-Adapter</p><a href="https://github.com/pkws100/CameraHub" target="_blank" rel="noopener noreferrer">Quellcode · AGPL-3.0 · Ohne Gewähr</a></div><button type="button" id="logout">Abmelden</button></div>
   </nav>
 
   <main id="app" hidden>
@@ -50,8 +50,12 @@
     </section>
 
     <section class="view" id="view-discover" data-view="discover" hidden>
-      <div class="section-head"><div><p class="kicker">Offene Standards</p><h2>Kameras im Heimnetz finden</h2></div><div class="scan-actions"><button class="primary" id="start-scan">Suche starten</button><button id="cancel-scan" hidden>Suche beenden</button></div></div>
-      <div class="notice"><strong>Sicherer Suchbereich</strong><span>Nur das serverseitig freigegebene private Subnetz · ONVIF, RTSP und lesende Prüfungen · keine Geräteänderung</span></div>
+      <div class="section-head"><div><p class="kicker">Heimnetz und verbundene Konten</p><h2>Kameras finden</h2></div><div class="scan-actions"><button class="primary" id="start-scan">Suche starten</button><button id="cancel-scan" hidden>Suche beenden</button></div></div>
+      <section class="cloud-accounts" id="cloud-accounts" hidden>
+        <div class="cloud-account-head"><div><h3>Cloud-Konten</h3><p>Camera Hub verwendet alle aktivierten Konten bei jeder Suche.</p></div><div class="cloud-account-actions"><button type="button" id="add-czeview-account">CZEview-Konto</button><button type="button" id="configure-netatmo">Netatmo einrichten</button><button type="button" id="add-netatmo-account">Netatmo-Konto</button></div></div>
+        <div class="cloud-account-list" id="cloud-account-list"></div>
+      </section>
+      <div class="notice"><strong>Sicherer Suchbereich</strong><span>Freigegebenes privates Subnetz und aktivierte Cloud-Konten · nur lesende Prüfungen · keine Geräteänderung</span></div>
       <div class="scan-progress" id="scan-progress" hidden><i></i><span>Netzwerk wird kontrolliert durchsucht …</span></div>
       <div class="discovery-list" id="discovery-list"><div class="empty-state"><h3>Noch keine Suche ausgeführt</h3><p>Gefundene Geräte erscheinen hier mit Hersteller, Protokollen und – wenn möglich – einer Vorschau.</p></div></div>
       <button class="text-button" id="manual-add">Kamera über RTSP oder MJPEG manuell hinzufügen</button>
@@ -97,7 +101,7 @@
         <article><span>WebRTC</span><strong id="diag-webrtc">–</strong></article>
         <article><span>HLS</span><strong id="diag-hls">–</strong></article>
         <article><span>Backend</span><strong id="diag-backend">–</strong></article>
-        <article><span>App-Version</span><strong id="diag-version">1.0.0</strong></article>
+        <article><span>App-Version</span><strong id="diag-version">1.1.0</strong></article>
         <article class="span-two"><span>Origin</span><strong id="diag-origin">–</strong></article>
       </div>
       <p class="privacy-note">Die Erkennungs-Adapter-API ist vorbereitet, aber standardmäßig deaktiviert.</p>
@@ -145,6 +149,37 @@
     <div class="test-result" id="discovery-auth-state" role="status" aria-live="polite">Noch nicht geprüft.</div>
     <p class="form-error" id="discovery-auth-error" role="alert"></p>
     <div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Streams & Vorschau prüfen</button></div>
+  </form></dialog>
+
+  <dialog id="czeview-account-dialog" class="modal" aria-labelledby="czeview-account-title"><form id="czeview-account-form">
+    <p class="kicker">Cloud-Konto</p><h2 id="czeview-account-title">CZEview-Konto hinzufügen</h2>
+    <p>Die Angaben werden verschlüsselt gespeichert und ausschließlich vom CZEview-Adapter verwendet.</p>
+    <label>Bezeichnung<input name="label" required maxlength="80" placeholder="Haus oder Standort"></label>
+    <label>Benutzername<input name="username" required maxlength="160" autocomplete="off"></label>
+    <label>E-Mail-Adresse<input name="email" type="email" maxlength="254" autocomplete="off"></label>
+    <label>Passwort<input name="password" type="password" required maxlength="256" autocomplete="new-password"></label>
+    <div class="form-grid"><label>Ländercode<input name="countryCode" value="DE" required maxlength="8"></label><label>Telefonvorwahl<input name="phoneCode" value="49" required maxlength="8"></label></div>
+    <input name="sourceApp" type="hidden" value="141">
+    <p class="form-error" id="czeview-account-error" role="alert"></p>
+    <div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Konto speichern</button></div>
+  </form></dialog>
+
+  <dialog id="netatmo-config-dialog" class="modal" aria-labelledby="netatmo-config-title"><form id="netatmo-config-form">
+    <p class="kicker">Eigentümerbereich</p><h2 id="netatmo-config-title">Netatmo-App verbinden</h2>
+    <p>Tragen Sie die Client-ID und das Client-Geheimnis Ihrer Netatmo-Connect-App ein. Camera Hub speichert beides verschlüsselt.</p>
+    <label>Client-ID<input name="clientId" required maxlength="256" autocomplete="off"></label>
+    <label>Client-Geheimnis<input name="clientSecret" type="password" required maxlength="512" autocomplete="new-password"></label>
+    <label>Exakte Rücksprungadresse<input name="redirectUri" required maxlength="1024"></label>
+    <p class="form-error" id="netatmo-config-error" role="alert"></p>
+    <div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Konfiguration speichern</button></div>
+  </form></dialog>
+
+  <dialog id="netatmo-account-dialog" class="modal" aria-labelledby="netatmo-account-title"><form id="netatmo-account-form">
+    <p class="kicker">OAuth-Anmeldung</p><h2 id="netatmo-account-title">Netatmo-Konto hinzufügen</h2>
+    <p>Sie werden zur offiziellen Netatmo-Anmeldung weitergeleitet. Camera Hub erhält niemals Ihr Netatmo-Passwort.</p>
+    <label>Bezeichnung<input name="label" required maxlength="80" placeholder="Haus oder Standort"></label>
+    <p class="form-error" id="netatmo-account-error" role="alert"></p>
+    <div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Bei Netatmo anmelden</button></div>
   </form></dialog>
 
   <dialog id="camera-dialog" class="modal camera-modal" aria-labelledby="camera-title"><form id="camera-form"><p class="kicker">Neue Quelle</p><h2 id="camera-title">Kamera hinzufügen</h2><div class="form-grid">

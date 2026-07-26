@@ -557,7 +557,183 @@ try:
     camera_app.media_paths = original_media_paths
     assert health_payload["sourcesExpected"] == 6
 
-    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases")
+    cloud_password = "Cloud-Secret-42!"
+    cloud_account = request(
+        "/api/admin/cloud/accounts/czeview",
+        "POST",
+        {
+            "label": "Testhaus",
+            "username": "cloud-user",
+            "email": "cloud@example.invalid",
+            "password": cloud_password,
+            "countryCode": "DE",
+            "phoneCode": "49",
+            "sourceApp": "141",
+        },
+        csrf,
+    )
+    assert cloud_account["provider"] == "czeview" and "password" not in cloud_account
+    assert request("/api/admin/cloud/accounts", expected=403, opener=admin_client)["detail"] == "insufficient-role"
+    assert cloud_password.encode() not in open(os.environ["DATABASE_PATH"], "rb").read()
+    inventory_request = urllib.request.Request(
+        base + "/internal/v1/providers/czeview/inventory",
+        data=json.dumps(
+            {
+                "accountId": cloud_account["id"],
+                "status": "active",
+                "devices": [
+                    {
+                        "externalId": "serial-cloud-test",
+                        "name": "Cloud Kamera",
+                        "model": "API-Gerätetyp 5",
+                        "manufacturer": "CZEview (Plattformmarke)",
+                        "capabilities": {"provider": "czeview"},
+                        "streamSupport": "candidate",
+                    }
+                ],
+            }
+        ).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {camera_app.CZEVIEW_ADAPTER_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(inventory_request, timeout=5) as response:
+        inventory = json.load(response)
+    cloud_device_id = inventory["devices"][0]["deviceId"]
+    with camera_app.connect() as conn:
+        conn.execute(
+            "UPDATE cloud_devices SET stream_support='verified' WHERE id=?",
+            (cloud_device_id,),
+        )
+    cloud_scan_id, cloud_scan_device_id = "cloud-scan", "cloud-result"
+    camera_app.SCANS[cloud_scan_id] = {
+        "id": cloud_scan_id,
+        "state": "complete",
+        "createdAt": camera_app.now_iso(),
+        "createdEpoch": time.time(),
+        "results": [
+            {
+                "id": cloud_scan_device_id,
+                "origin": "cloud",
+                "provider": "czeview",
+                "accountId": cloud_account["id"],
+                "accountLabel": "Testhaus",
+                "cloudDeviceId": cloud_device_id,
+                "name": "Cloud Kamera",
+                "manufacturer": "CZEview (Plattformmarke)",
+                "model": "API-Gerätetyp 5",
+                "streamSupport": "verified",
+                "available": True,
+                "previewAvailable": True,
+                "previewVerified": True,
+                "configuredCameraId": None,
+                "configuredName": None,
+            }
+        ],
+    }
+    imported_cloud = request(
+        f"/api/admin/discovery/scans/{cloud_scan_id}/devices/{cloud_scan_device_id}/import",
+        "POST",
+        {"name": "Cloud Kamera"},
+        csrf,
+    )
+    assert imported_cloud["externalSource"] and imported_cloud["onDemand"]
+    assert request(
+        f"/api/admin/cloud/accounts/{cloud_account['id']}",
+        "DELETE",
+        csrf=csrf,
+        expected=409,
+    )["detail"] == "cloud-account-has-linked-cameras"
+    assert request(
+        "/api/admin/cloud/providers/netatmo",
+        "PUT",
+        {
+            "clientId": "client",
+            "clientSecret": "secret",
+            "redirectUri": "http://example.com/api/cloud/oauth/netatmo/callback",
+        },
+        csrf,
+        expected=422,
+    )["detail"] == "netatmo-http-redirect-must-be-private"
+    assert camera_app.safe_netatmo_stream_base("https://prodvpn-eu-2.netatmo.net/example")
+    assert camera_app.safe_netatmo_stream_base("https://attacker.invalid/example") is None
+    assert camera_app.safe_netatmo_stream_base("http://192.168.50.42/example")
+    request(
+        "/api/admin/cloud/providers/netatmo",
+        "PUT",
+        {
+            "clientId": "client",
+            "clientSecret": "secret",
+            "redirectUri": "http://127.0.0.1/api/cloud/oauth/netatmo/callback",
+        },
+        csrf,
+    )
+    netatmo_account_id = "netatmo-test-account"
+    with camera_app.connect() as conn:
+        stamp = camera_app.now_iso()
+        conn.execute(
+            """INSERT INTO cloud_accounts(
+               id,provider,label,enabled,auth_payload_ct,scopes_json,status,created_at,updated_at)
+               VALUES(?,'netatmo','Netatmo Test',1,?,'[]','active',?,?)""",
+            (
+                netatmo_account_id,
+                camera_app.encrypt_json(
+                    {"accessToken": "test-access", "refreshToken": "test-refresh", "expiresAt": int(time.time()) + 3600}
+                ),
+                stamp,
+                stamp,
+            ),
+        )
+    original_netatmo_api_json = camera_app.netatmo_api_json
+
+    def fake_netatmo_api(_account_id, path, _params=None):
+        if path == "homesdata":
+            return {
+                "homes": [
+                    {
+                        "id": "home-1",
+                        "name": "Haus",
+                        "modules": [
+                            {"id": "noc-1", "type": "NOC", "name": "Außen"},
+                            {"id": "npc-1", "type": "NPC", "name": "Advance"},
+                        ],
+                    }
+                ]
+            }
+        return {
+            "home": {
+                "modules": [
+                    {
+                        "id": "noc-1",
+                        "type": "NOC",
+                        "vpn_url": "https://prodvpn-eu-2.netatmo.net/example/noc-1",
+                    }
+                ]
+            }
+        }
+
+    camera_app.netatmo_api_json = fake_netatmo_api
+    try:
+        camera_app.refresh_netatmo_inventory(netatmo_account_id)
+        with camera_app.connect() as conn:
+            netatmo_devices = conn.execute(
+                "SELECT id,model,stream_support,last_error_code FROM cloud_devices WHERE account_id=? ORDER BY model",
+                (netatmo_account_id,),
+            ).fetchall()
+        assert {row["model"]: row["stream_support"] for row in netatmo_devices} == {
+            "NOC": "candidate",
+            "NPC": "unsupported",
+        }
+        noc_device = next(row for row in netatmo_devices if row["model"] == "NOC")
+        npc_device = next(row for row in netatmo_devices if row["model"] == "NPC")
+        assert camera_app.netatmo_stream_candidates(noc_device["id"])[0].endswith("/live/index.m3u8")
+        assert camera_app.netatmo_stream_candidates(npc_device["id"]) == []
+    finally:
+        camera_app.netatmo_api_json = original_netatmo_api_json
+
+    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-inventory-models netatmo-stream-allowlist")
 finally:
     server.should_exit = True
     thread.join(timeout=5)

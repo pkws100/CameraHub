@@ -1,8 +1,8 @@
 (() => {
   'use strict';
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const RETRY_DELAYS = [2000, 5000, 15000];
-  const appState = { csrf:'', user:null, permissions:{}, users:[], cameras:[], adminCameras:[], states:new Map(), observer:null, detail:null, suspended:false, wallMode:false, wallControlsTimer:null, elevatedUntil:0, scanTimer:null, scanId:null, discoveryItems:[], discoveryResultScanId:null, discoveryDevice:null, connectionCamera:null, connectionRollout:null, connectionRequest:0, capabilityCamera:null, capabilityRequest:0, ptz:null };
+  const appState = { csrf:'', user:null, permissions:{}, users:[], cameras:[], adminCameras:[], cloudAccounts:[], cloudProviders:[], states:new Map(), observer:null, detail:null, suspended:false, wallMode:false, wallControlsTimer:null, elevatedUntil:0, scanTimer:null, scanId:null, discoveryItems:[], discoveryResultScanId:null, discoveryDevice:null, connectionCamera:null, connectionRollout:null, connectionRequest:0, capabilityCamera:null, capabilityRequest:0, ptz:null };
   const $ = (selector, root=document) => root.querySelector(selector);
   const $$ = (selector, root=document) => [...root.querySelectorAll(selector)];
   const mediaHost = location.hostname;
@@ -53,7 +53,7 @@
     $$('.view').forEach((view)=>{ const active=view.dataset.view===name; view.hidden=!active; view.classList.toggle('is-active',active); });
     $$('.nav-item').forEach((item)=>item.classList.toggle('is-active',item.dataset.view===name));
     closeMenu(false); history.replaceState(null,'',`#${name}`);const heading=$(`#view-${name} h2`);if(heading){heading.tabIndex=-1;heading.focus({preventScroll:true});}
-    if(name==='manage') loadAdminCameras(); if(name==='zones') loadZoneCamera(); if(name==='users') loadUsers(); if(name==='system') refreshDiagnostics();
+    if(name==='discover') loadCloudAccounts(); if(name==='manage') loadAdminCameras(); if(name==='zones') loadZoneCamera(); if(name==='users') loadUsers(); if(name==='system') refreshDiagnostics();
   }
 
   function revealWallControls(){
@@ -363,6 +363,66 @@
   async function saveUserPassword(event){event.preventDefault();const form=event.currentTarget;if(form.elements.password.value!==form.elements.confirmation.value){$('#password-error').textContent='Die Passwörter stimmen nicht überein.';return;}try{await adminApi(`/api/admin/users/${encodeURIComponent(form.elements.userId.value)}/password`,{method:'POST',body:JSON.stringify({password:form.elements.password.value})});form.reset();$('#password-dialog').close();toast('Passwort gespeichert; bestehende Sitzungen wurden beendet');}catch(error){$('#password-error').textContent=`Speichern fehlgeschlagen: ${error.code}`;}}
   async function changeOwnPassword(event){event.preventDefault();const form=event.currentTarget;if(form.elements.newPassword.value!==form.elements.confirmation.value){$('#own-password-error').textContent='Die Passwörter stimmen nicht überein.';return;}try{await api('/api/auth/change-password',{method:'POST',body:JSON.stringify({currentPassword:form.elements.currentPassword.value,newPassword:form.elements.newPassword.value})});form.reset();$('#own-password-dialog').close();toast('Ihr Passwort wurde geändert');}catch(error){$('#own-password-error').textContent=error.code==='current-password-invalid'?'Das aktuelle Passwort ist nicht korrekt.':`Änderung fehlgeschlagen: ${error.code}`;}}
 
+  async function loadCloudAccounts(){
+    const panel=$('#cloud-accounts');
+    if(appState.user?.role!=='owner'){panel.hidden=true;return;}
+    panel.hidden=false;
+    try{
+      const [accounts,providers]=await Promise.all([api('/api/admin/cloud/accounts'),api('/api/admin/cloud/providers')]);
+      appState.cloudAccounts=accounts.accounts||[];
+      appState.cloudProviders=providers.providers||[];
+      renderCloudAccounts();
+    }catch(error){toast(`Cloud-Konten konnten nicht geladen werden: ${error.code}`);}
+  }
+  function renderCloudAccounts(){
+    const list=$('#cloud-account-list');
+    list.replaceChildren();
+    const netatmo=appState.cloudProviders.find(provider=>provider.id==='netatmo');
+    $('#add-netatmo-account').disabled=!netatmo?.configured;
+    $('#configure-netatmo').textContent=netatmo?.configured?'Netatmo-App ändern':'Netatmo einrichten';
+    if(!appState.cloudAccounts.length){list.innerHTML='<div class="empty-state"><h3>Noch kein Cloud-Konto</h3><p>CZEview- oder Netatmo-Konten können hier sicher verbunden werden.</p></div>';return;}
+    appState.cloudAccounts.forEach(account=>{
+      const row=document.createElement('article');
+      row.className='cloud-account-row';
+      row.dataset.enabled=String(account.enabled);
+      const provider=account.provider==='netatmo'?'Netatmo':'CZEview';
+      const state={active:'Verbunden',pending:'Wird geprüft','reauth-required':'Erneute Anmeldung erforderlich',error:'Fehler'}[account.status]||account.status;
+      row.innerHTML=`<div><strong>${escapeHtml(account.label)}</strong><p>${provider} · ${escapeHtml(state)} · ${account.deviceCount||0} Gerät(e)${account.lastErrorCode?` · ${escapeHtml(account.lastErrorCode)}`:''}</p></div><div class="cloud-account-row-actions"><button type="button" data-toggle>${account.enabled?'Deaktivieren':'Aktivieren'}</button><button type="button" data-delete>Entfernen</button></div>`;
+      $('[data-toggle]',row).addEventListener('click',()=>updateCloudAccount(account,{enabled:!account.enabled}));
+      $('[data-delete]',row).addEventListener('click',()=>deleteCloudAccount(account));
+      list.append(row);
+    });
+  }
+  async function updateCloudAccount(account,changes){
+    try{await adminApi(`/api/admin/cloud/accounts/${encodeURIComponent(account.id)}`,{method:'PATCH',body:JSON.stringify(changes)});await loadCloudAccounts();toast('Cloud-Konto aktualisiert');}
+    catch(error){toast(`Änderung fehlgeschlagen: ${error.code}`);}
+  }
+  async function deleteCloudAccount(account){
+    if(!window.confirm(`Cloud-Konto „${account.label}“ wirklich entfernen?`))return;
+    try{await adminApi(`/api/admin/cloud/accounts/${encodeURIComponent(account.id)}`,{method:'DELETE'});await loadCloudAccounts();toast('Cloud-Konto entfernt');}
+    catch(error){toast(error.code==='cloud-account-has-linked-cameras'?'Das Konto wird noch von mindestens einer Kamera verwendet.':`Entfernen fehlgeschlagen: ${error.code}`);}
+  }
+  async function saveCzeviewAccount(event){
+    event.preventDefault();const form=event.currentTarget,payload=Object.fromEntries(new FormData(form).entries());
+    $('#czeview-account-error').textContent='';
+    try{await adminApi('/api/admin/cloud/accounts/czeview',{method:'POST',body:JSON.stringify(payload)});form.reset();form.elements.countryCode.value='DE';form.elements.phoneCode.value='49';form.elements.sourceApp.value='141';$('#czeview-account-dialog').close();await loadCloudAccounts();toast('CZEview-Konto gespeichert; die Prüfung läuft im Hintergrund');}
+    catch(error){$('#czeview-account-error').textContent=`Speichern fehlgeschlagen: ${error.code}`;}
+    finally{payload.password='';form.elements.password.value='';}
+  }
+  async function saveNetatmoConfig(event){
+    event.preventDefault();const form=event.currentTarget,payload=Object.fromEntries(new FormData(form).entries());
+    $('#netatmo-config-error').textContent='';
+    try{await adminApi('/api/admin/cloud/providers/netatmo',{method:'PUT',body:JSON.stringify(payload)});form.reset();$('#netatmo-config-dialog').close();await loadCloudAccounts();toast('Netatmo-App gespeichert');}
+    catch(error){$('#netatmo-config-error').textContent=`Speichern fehlgeschlagen: ${error.code}`;}
+    finally{payload.clientSecret='';form.elements.clientSecret.value='';}
+  }
+  async function authorizeNetatmo(event){
+    event.preventDefault();const form=event.currentTarget;
+    $('#netatmo-account-error').textContent='';
+    try{const result=await adminApi('/api/admin/cloud/accounts/netatmo/authorize',{method:'POST',body:JSON.stringify({label:form.elements.label.value})});location.assign(result.authorizationUrl);}
+    catch(error){$('#netatmo-account-error').textContent=`Anmeldung konnte nicht gestartet werden: ${error.code}`;}
+  }
+
   async function startScan(){
     $('#scan-progress').hidden=false;$('#start-scan').disabled=true;$('#discovery-list').replaceChildren();
     try{const scan=await adminApi('/api/admin/discovery/scans',{method:'POST'});appState.scanId=scan.id;$('#cancel-scan').hidden=false;pollScan(scan.id);}catch(error){$('#scan-progress').hidden=true;$('#start-scan').disabled=false;toast(`Suche nicht gestartet: ${error.code}`);}
@@ -389,13 +449,19 @@
     items.forEach(item=>{
       const row=document.createElement('article');
       row.className='device-row';
-      const protocols=[item.onvif?'ONVIF':'',item.rtsp?'RTSP':''].filter(Boolean);
+      const cloud=item.origin==='cloud';
+      const protocols=cloud?[`${item.provider==='netatmo'?'Netatmo':'CZEview'} Cloud`]:[item.onvif?'ONVIF':'',item.rtsp?'RTSP':''].filter(Boolean);
       const configured=Boolean(item.configuredCameraId);
-      const canProbe=!configured&&(item.onvif||item.onvifPort||item.openPorts?.some(port=>[80,443,2020,8000,8080,8899,10080].includes(port)));
+      const canProbe=!configured&&(cloud?item.streamSupport!=='unsupported':(item.onvif||item.onvifPort||item.openPorts?.some(port=>[80,443,2020,8000,8080,8899,10080].includes(port))));
       const preview=item.previewAvailable
         ?`<img class="device-preview" src="/api/admin/discovery/scans/${encodeURIComponent(scanId)}/devices/${encodeURIComponent(item.id)}/preview?t=${Date.now()}" alt="Vorschau ${escapeHtml(item.model)}">`
         :`<div class="device-preview is-empty">${item.previewError?'Stream erkannt, aber kein Frame':'Keine Vorschau'}</div>`;
-      row.innerHTML=`${preview}<div class="device-description"><h3>${escapeHtml(item.manufacturer)} ${escapeHtml(item.model)}</h3><div class="device-meta"><span>${escapeHtml(item.address)}</span>${protocols.map(value=>`<span class="protocol-pill">${value}</span>`).join('')}<span>${escapeHtml(profileSummary(item.profiles))}</span><span>Ports: ${item.openPorts.join(', ')}</span>${item.previewVerified?'<span class="connection-badge">Echte Videoframes bestätigt</span>':''}${configured?`<span class="connection-badge">Bereits hinzugefügt: ${escapeHtml(item.configuredName||'Kamera')}</span>`:''}</div></div><div class="discovery-actions">${canProbe?'<button type="button" data-probe>Streams & Vorschau prüfen</button>':''}<button type="button" class="primary" data-select>${configured?'Verbindung bearbeiten':'Auswählen'}</button></div>`;
+      const locationText=cloud?`${item.accountLabel} · ${item.name}`:item.address;
+      const details=cloud
+        ?`<span>${item.streamSupport==='verified'?'Livebild bestätigt':item.streamSupport==='unsupported'?'Kein freigegebener Livezugriff':'Livebild noch prüfen'}</span>${item.reason?`<span>${escapeHtml(item.reason)}</span>`:''}`
+        :`<span>${escapeHtml(profileSummary(item.profiles))}</span><span>Ports: ${(item.openPorts||[]).join(', ')}</span>`;
+      const selectLabel=configured?'Bereits hinzugefügt':cloud?(item.previewVerified?'Hinzufügen':'Erst prüfen'):'Auswählen';
+      row.innerHTML=`${preview}<div class="device-description"><h3>${escapeHtml(item.manufacturer)} ${escapeHtml(item.model)}</h3><div class="device-meta"><span>${escapeHtml(locationText)}</span>${protocols.map(value=>`<span class="protocol-pill">${value}</span>`).join('')}${details}${item.previewVerified?'<span class="connection-badge">Echte Videoframes bestätigt</span>':''}${configured?`<span class="connection-badge">Bereits hinzugefügt: ${escapeHtml(item.configuredName||'Kamera')}</span>`:''}</div></div><div class="discovery-actions">${canProbe?'<button type="button" data-probe>Streams & Vorschau prüfen</button>':''}<button type="button" class="primary" data-select ${cloud&&!configured&&!item.previewVerified?'disabled':''}>${selectLabel}</button></div>`;
       const image=$('img.device-preview',row);
       image?.addEventListener('error',()=>{
         if(image.dataset.retried==='true')return;
@@ -403,16 +469,31 @@
         window.setTimeout(()=>{image.src=image.src.replace(/([?&])t=\d+/,`$1t=${Date.now()}`);},3000);
       });
       $('[data-probe]',row)?.addEventListener('click',()=>openDiscoveryProbe(item,scanId));
-      $('[data-select]',row).addEventListener('click',()=>configured?openConfiguredDiscovery(item):openCameraDialog(item));
+      $('[data-select]',row).addEventListener('click',()=>configured?(cloud?toast('Diese Cloud-Kamera ist bereits in Camera Hub enthalten'):openConfiguredDiscovery(item)):(cloud?importCloudCamera(item,scanId):openCameraDialog(item)));
       list.append(row);
     });
+  }
+  async function importCloudCamera(item,scanId){
+    const suggested=item.name||item.model||'Cloud-Kamera';
+    const name=window.prompt('Anzeigename der Kamera',suggested);
+    if(name===null)return;
+    try{
+      await adminApi(`/api/admin/discovery/scans/${encodeURIComponent(scanId)}/devices/${encodeURIComponent(item.id)}/import`,{method:'POST',body:JSON.stringify({name:name.trim()||suggested})});
+      item.configuredCameraId='imported';item.configuredName=name.trim()||suggested;
+      renderDiscovery(appState.discoveryItems,scanId,false);
+      await loadCameras();
+      toast('Cloud-Kamera hinzugefügt');
+    }catch(error){toast(`Hinzufügen fehlgeschlagen: ${error.code}`);}
   }
   function openDiscoveryProbe(item,scanId){
     const form=$('#discovery-auth-form');
     form.reset();
     appState.discoveryDevice={item,scanId};
-    $('#discovery-auth-target').textContent=`${item.manufacturer} ${item.model} · ${item.address}`;
-    $('#discovery-auth-state').textContent='Zugangsdaten werden nur für diese Prüfung verwendet.';
+    const cloud=item.origin==='cloud';
+    $('#discovery-auth-target').textContent=`${item.manufacturer} ${item.model} · ${cloud?item.accountLabel:item.address}`;
+    form.elements.username.closest('label').hidden=cloud;
+    form.elements.password.closest('label').hidden=cloud;
+    $('#discovery-auth-state').textContent=cloud?'Camera Hub fordert kurzzeitig einen Live-Stream an und speichert genau ein Prüfbild.':'Zugangsdaten werden nur für diese Prüfung verwendet.';
     $('#discovery-auth-error').textContent='';
     $('#discovery-auth-dialog').showModal();
   }
@@ -423,7 +504,7 @@
     const form=event.currentTarget;
     const submit=$('button[type="submit"]',form);
     submit.disabled=true;
-    $('#discovery-auth-state').textContent='ONVIF-Profile und echte Videoframes werden geprüft …';
+    $('#discovery-auth-state').textContent=context.item.origin==='cloud'?'Cloud-Stream und echte Videoframes werden geprüft …':'ONVIF-Profile und echte Videoframes werden geprüft …';
     $('#discovery-auth-error').textContent='';
     const payload={username:form.elements.username.value,password:form.elements.password.value};
     try{
@@ -489,6 +570,9 @@
     $('#refresh-all').addEventListener('click',loadHealth);$('#detail-back').addEventListener('click',closeDetail);$('#detail-reconnect').addEventListener('click',()=>{if(!appState.detail)return;appState.detail.camera.displayMode==='snapshot'?startSnapshot(appState.detail,true):connect(appState.detail,appState.detail.path,appState.detail.mode,true);});$('#detail-fallback').addEventListener('click',()=>{if(!appState.detail)return;$('#detail-quality').textContent='Substream';connect(appState.detail,appState.detail.camera.lowPath,'low',true);});$('#detail-hls-toggle').addEventListener('click',()=>{if(!appState.detail)return;closeReader(appState.detail,false);$('#detail-video').hidden=true;const frame=$('#detail-hls'),camera=appState.detail.camera,useHigh=camera.highPath!==camera.lowPath;frame.hidden=false;frame.src=hlsUrl(useHigh?camera.highPath:camera.lowPath);mark(appState.detail,'loading',useHigh?'HLS-Hauptstream lädt':'HLS-Fallback lädt');});$('#detail-hls').addEventListener('load',()=>{if(appState.detail)mark(appState.detail,'live','Live · HLS');});$('#detail-message').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-video').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-audio').addEventListener('click',toggleDetailAudio);$('#detail-fullscreen').addEventListener('click',()=>{const shell=$('#detail-shell'),video=$('#detail-video');if(shell.requestFullscreen)shell.requestFullscreen();else video.webkitEnterFullscreen?.();});
     $$('[data-ptz-x]').forEach(button=>{button.addEventListener('pointerdown',event=>{event.preventDefault();button.setPointerCapture?.(event.pointerId);startPTZ(button);});for(const name of ['pointerup','pointercancel','pointerleave'])button.addEventListener(name,stopPTZ);button.addEventListener('keydown',event=>{if((event.key===' '||event.key==='Enter')&&!event.repeat){event.preventDefault();startPTZ(button);}});button.addEventListener('keyup',event=>{if(event.key===' '||event.key==='Enter')stopPTZ();});button.addEventListener('blur',stopPTZ);});$('[data-ptz-stop]').addEventListener('click',stopPTZ);$('#ptz-presets').addEventListener('change',gotoPreset);
     $('#start-scan').addEventListener('click',startScan);$('#cancel-scan').addEventListener('click',cancelScan);$('#manual-add').addEventListener('click',()=>openCameraDialog());$('#discovery-auth-form').addEventListener('submit',probeDiscovery);$('#discovery-auth-dialog').addEventListener('close',()=>{const form=$('#discovery-auth-form');form.elements.username.value='';form.elements.password.value='';appState.discoveryDevice=null;});$('#test-source').addEventListener('click',testSource);$('#camera-form').addEventListener('submit',addCamera);for(const name of ['input','change'])$('#camera-form').addEventListener(name,()=>{$('#camera-form').dataset.tested='false';$('#source-test').textContent='Verbindungsdaten geändert · bitte erneut testen.';});$('#credential-mode').addEventListener('change',updateCredentialFields);$('#connection-test-button').addEventListener('click',testConnection);$('#connection-form').addEventListener('submit',saveConnection);for(const name of ['input','change'])$('#connection-form').addEventListener(name,()=>{$('#connection-form').dataset.tested='false';$('#connection-test').dataset.state='';$('#connection-test').textContent='Verbindungsdaten geändert · bitte erneut prüfen.';});$('#connection-activate').addEventListener('click',activateConnection);$('#capability-refresh').addEventListener('click',refreshCapabilities);$('#zone-camera').addEventListener('change',loadZoneCamera);$('#zone-canvas').addEventListener('pointerdown',addZonePoint);$('#zone-add-coordinate').addEventListener('click',addZoneCoordinate);$$('[data-zone-kind]').forEach(button=>button.addEventListener('click',()=>{$$('[data-zone-kind]').forEach(item=>item.classList.remove('is-active'));button.classList.add('is-active');zoneState.kind=button.dataset.zoneKind;}));$('#zone-undo').addEventListener('click',()=>{zoneState.draft.pop();drawZones();});$('#zone-complete').addEventListener('click',completeZone);$('#zone-save').addEventListener('click',saveZones);window.addEventListener('resize',resizeCanvas);
+    $('#add-czeview-account').addEventListener('click',()=>{$('#czeview-account-form').reset();$('#czeview-account-form').elements.countryCode.value='DE';$('#czeview-account-form').elements.phoneCode.value='49';$('#czeview-account-form').elements.sourceApp.value='141';$('#czeview-account-error').textContent='';$('#czeview-account-dialog').showModal();});$('#czeview-account-form').addEventListener('submit',saveCzeviewAccount);
+    $('#configure-netatmo').addEventListener('click',()=>{const form=$('#netatmo-config-form');form.reset();form.elements.redirectUri.value=`${location.origin}/api/cloud/oauth/netatmo/callback`;$('#netatmo-config-error').textContent='';$('#netatmo-config-dialog').showModal();});$('#netatmo-config-form').addEventListener('submit',saveNetatmoConfig);
+    $('#add-netatmo-account').addEventListener('click',()=>{$('#netatmo-account-form').reset();$('#netatmo-account-error').textContent='';$('#netatmo-account-dialog').showModal();});$('#netatmo-account-form').addEventListener('submit',authorizeNetatmo);
     $('#add-user').addEventListener('click',()=>{$('#user-form').reset();$('#user-error').textContent='';$('#user-dialog').showModal();});$('#user-form').addEventListener('submit',createUser);$('#password-form').addEventListener('submit',saveUserPassword);$('#change-own-password').addEventListener('click',()=>{$('#own-password-form').reset();$('#own-password-error').textContent='';$('#own-password-dialog').showModal();});$('#own-password-form').addEventListener('submit',changeOwnPassword);
     document.addEventListener('visibilitychange',()=>document.hidden?suspend():resume());window.addEventListener('pagehide',suspend);window.addEventListener('pageshow',resume);window.addEventListener('focus',resume);window.addEventListener('blur',stopPTZ);window.addEventListener('offline',suspend);window.addEventListener('online',resume);
   }
@@ -497,6 +581,6 @@
     bindEvents();refreshDiagnostics();appState.observer=new IntersectionObserver(entries=>entries.forEach(entry=>{const state=appState.states.get(entry.target.dataset.cameraId);if(!state)return;state.visible=entry.isIntersecting;if(appState.detail)return;if(state.visible)state.camera.displayMode==='snapshot'?startSnapshot(state,true):connect(state,state.camera.lowPath,'low',true);else closeReader(state);}),{threshold:.2,rootMargin:'100px'});
     try{await initializeAuth();}catch{showAuth(false);}
     if('serviceWorker'in navigator){let reloadingForUpdate=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(reloadingForUpdate)return;reloadingForUpdate=true;location.reload();});navigator.serviceWorker.register('./sw.js').then(refreshDiagnostics).catch(()=>{});}
-    const initial=location.hash.slice(1);if(initial==='wall'&&appState.csrf)enterWallMode(false);else if(['discover','manage','zones','users','system'].includes(initial)&&appState.csrf)showView(initial);
+    const initial=location.hash.slice(1),initialView=initial.split('?',1)[0];if(initialView==='wall'&&appState.csrf)enterWallMode(false);else if(['discover','manage','zones','users','system'].includes(initialView)&&appState.csrf){showView(initialView);if(initial.includes('netatmo=connected'))toast('Netatmo-Konto wurde verbunden');}
   });
 })();
