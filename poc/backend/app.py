@@ -253,6 +253,21 @@ CREATE TABLE IF NOT EXISTS oauth_states(
  account_id TEXT REFERENCES cloud_accounts(id) ON DELETE CASCADE,
  redirect_uri TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS display_profiles(
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, name_key TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS display_profiles_user_name_idx
+ ON display_profiles(user_id,name_key);
+CREATE TABLE IF NOT EXISTS display_profile_cameras(
+ profile_id TEXT NOT NULL REFERENCES display_profiles(id) ON DELETE CASCADE,
+ camera_id TEXT NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
+ position INTEGER NOT NULL,
+ PRIMARY KEY(profile_id,camera_id),
+ UNIQUE(profile_id,position)
+);
+CREATE INDEX IF NOT EXISTS display_profile_cameras_camera_idx
+ ON display_profile_cameras(camera_id);
 """
 
 
@@ -301,6 +316,11 @@ def initialize_database() -> None:
         if conn.execute("SELECT 1 FROM schema_migrations WHERE version=6").fetchone() is None:
             conn.execute(
                 "INSERT INTO schema_migrations(version,applied_at) VALUES(6,?)",
+                (now_iso(),),
+            )
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=7").fetchone() is None:
+            conn.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)",
                 (now_iso(),),
             )
         if "active_connection_id" not in camera_columns:
@@ -411,7 +431,7 @@ def initialize_database() -> None:
 
 
 initialize_database()
-app = FastAPI(title="PKWS Multi Camera API", version="1.1.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="PKWS Multi Camera API", version="1.2.0", docs_url=None, redoc_url=None)
 
 
 class LoginRequest(BaseModel):
@@ -518,6 +538,19 @@ class CameraPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     enabled: bool | None = None
     sourceLabel: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class DisplayProfileInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    cameraIds: list[str] = Field(default_factory=list, max_length=MAX_CAMERAS)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("profile name must not be blank")
+        return value
 
 
 class ExternalCameraInput(BaseModel):
@@ -1770,10 +1803,175 @@ def delete_cloud_account(account_id: str, actor: sqlite3.Row = Depends(require_o
     return Response(status_code=204)
 
 
-@app.get("/api/cameras")
-def list_cameras(_: sqlite3.Row = Depends(require_session)):
+def display_profile_payload(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    camera_ids = [
+        item["camera_id"]
+        for item in conn.execute(
+            "SELECT camera_id FROM display_profile_cameras WHERE profile_id=? ORDER BY position",
+            (row["id"],),
+        )
+    ]
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "cameraIds": camera_ids,
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def validate_display_profile_cameras(conn: sqlite3.Connection, camera_ids: list[str]) -> None:
+    if len(set(camera_ids)) != len(camera_ids):
+        raise HTTPException(400, "duplicate-camera-id")
+    if not camera_ids:
+        return
+    placeholders = ",".join("?" for _ in camera_ids)
+    existing = {
+        row["id"]
+        for row in conn.execute(
+            f"SELECT id FROM cameras WHERE id IN ({placeholders})",
+            camera_ids,
+        )
+    }
+    if existing != set(camera_ids):
+        raise HTTPException(400, "invalid-camera-selection")
+
+
+def replace_display_profile_cameras(
+    conn: sqlite3.Connection, profile_id: str, camera_ids: list[str]
+) -> None:
+    conn.execute("DELETE FROM display_profile_cameras WHERE profile_id=?", (profile_id,))
+    conn.executemany(
+        "INSERT INTO display_profile_cameras(profile_id,camera_id,position) VALUES(?,?,?)",
+        [(profile_id, camera_id, position) for position, camera_id in enumerate(camera_ids)],
+    )
+
+
+@app.get("/api/display-profiles")
+def list_display_profiles(current: sqlite3.Row = Depends(require_session)):
     with connect() as conn:
-        rows = conn.execute("SELECT * FROM cameras WHERE enabled=1 ORDER BY position").fetchall()
+        profiles = conn.execute(
+            "SELECT * FROM display_profiles WHERE user_id=? ORDER BY name COLLATE NOCASE,id",
+            (current["user_id"],),
+        ).fetchall()
+        cameras = conn.execute(
+            "SELECT id,name,enabled,position FROM cameras ORDER BY position"
+        ).fetchall()
+        payloads = [display_profile_payload(conn, row) for row in profiles]
+    return {
+        "profiles": payloads,
+        "cameraOptions": [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "enabled": bool(row["enabled"]),
+                "position": row["position"],
+            }
+            for row in cameras
+        ],
+    }
+
+
+@app.post("/api/display-profiles", status_code=201)
+def create_display_profile(
+    body: DisplayProfileInput, current: sqlite3.Row = Depends(require_csrf)
+):
+    profile_id, stamp = str(uuid.uuid4()), now_iso()
+    try:
+        with DB_LOCK, connect() as conn:
+            validate_display_profile_cameras(conn, body.cameraIds)
+            conn.execute(
+                """INSERT INTO display_profiles(id,user_id,name,name_key,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (
+                    profile_id,
+                    current["user_id"],
+                    body.name,
+                    body.name.casefold(),
+                    stamp,
+                    stamp,
+                ),
+            )
+            replace_display_profile_cameras(conn, profile_id, body.cameraIds)
+            row = conn.execute(
+                "SELECT * FROM display_profiles WHERE id=?", (profile_id,)
+            ).fetchone()
+            result = display_profile_payload(conn, row)
+    except sqlite3.IntegrityError as exc:
+        if "display_profiles.user_id, display_profiles.name_key" in str(exc):
+            raise HTTPException(409, "display-profile-name-exists") from exc
+        raise
+    return result
+
+
+@app.put("/api/display-profiles/{profile_id}")
+def update_display_profile(
+    profile_id: str,
+    body: DisplayProfileInput,
+    current: sqlite3.Row = Depends(require_csrf),
+):
+    try:
+        with DB_LOCK, connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM display_profiles WHERE id=? AND user_id=?",
+                (profile_id, current["user_id"]),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "display-profile-not-found")
+            validate_display_profile_cameras(conn, body.cameraIds)
+            conn.execute(
+                "UPDATE display_profiles SET name=?,name_key=?,updated_at=? WHERE id=?",
+                (body.name, body.name.casefold(), now_iso(), profile_id),
+            )
+            replace_display_profile_cameras(conn, profile_id, body.cameraIds)
+            row = conn.execute(
+                "SELECT * FROM display_profiles WHERE id=?", (profile_id,)
+            ).fetchone()
+            result = display_profile_payload(conn, row)
+    except sqlite3.IntegrityError as exc:
+        if "display_profiles.user_id, display_profiles.name_key" in str(exc):
+            raise HTTPException(409, "display-profile-name-exists") from exc
+        raise
+    return result
+
+
+@app.delete("/api/display-profiles/{profile_id}")
+def delete_display_profile(
+    profile_id: str, current: sqlite3.Row = Depends(require_csrf)
+):
+    with DB_LOCK, connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM display_profiles WHERE id=? AND user_id=?",
+            (profile_id, current["user_id"]),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "display-profile-not-found")
+    return Response(status_code=204)
+
+
+@app.get("/api/cameras")
+def list_cameras(
+    profileId: str | None = None, current: sqlite3.Row = Depends(require_session)
+):
+    with connect() as conn:
+        if profileId:
+            profile = conn.execute(
+                "SELECT 1 FROM display_profiles WHERE id=? AND user_id=?",
+                (profileId, current["user_id"]),
+            ).fetchone()
+            if not profile:
+                raise HTTPException(404, "display-profile-not-found")
+            rows = conn.execute(
+                """SELECT c.* FROM display_profile_cameras dpc
+                   JOIN cameras c ON c.id=dpc.camera_id
+                   WHERE dpc.profile_id=? AND c.enabled=1
+                   ORDER BY dpc.position""",
+                (profileId,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM cameras WHERE enabled=1 ORDER BY position"
+            ).fetchall()
     return {"cameras": [public_camera(row) for row in rows]}
 
 

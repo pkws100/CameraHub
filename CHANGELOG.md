@@ -6,6 +6,12 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
 ### Hinzugefügt
 
+- persönliche Anzeigeprofile je Benutzer mit eigener Kameraauswahl und
+  Kachelreihenfolge für Live- und Leitstellenansicht;
+- geschützte Startlinks für Tablets und Fernseher, die nach der normalen
+  Anmeldung direkt ein persönliches Profil öffnen;
+- Profilauswahl in der Liveübersicht und in den einblendbaren
+  Leitstellen-Steuerelementen;
 - vollständige Cloud-Konto-Verwaltung mit Umbenennen, Aktivieren, Deaktivieren,
   CZEview-Zugangserneuerung und Netatmo-Wiederverbindung ohne doppelte Konten;
 - reproduzierbarer Abschlussbericht und Netatmo-Abnahmeablauf für die
@@ -42,6 +48,10 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
 ### Geändert
 
+- die vorhandene Kamera-Deaktivierung wirkt als globale Sperre für sämtliche
+  Anzeigeprofile, ohne deren Zuordnung oder Reihenfolge zu löschen;
+- Profilwechsel schließen nicht mehr benötigte Streams und geben deren
+  Kamera-Leases frei;
 - CZEview-Kontoprozesse reagieren nur noch auf eine eigene
   Zugangsdatenrevision statt auf den bei jeder Inventur geänderten allgemeinen
   Kontozeitstempel;

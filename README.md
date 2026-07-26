@@ -7,7 +7,7 @@ proprietären Hersteller-Plug-ins. Für CZEview-Akku-Kameras und freigegebene
 Netatmo-Sicherheitskameras stehen getrennte, bedarfsgesteuerte Cloud-Adapter
 bereit.
 
-> **Version 1.1.0:** Dieser Release ist für einen selbst verwalteten
+> **Version 1.2.0:** Dieser Release ist für einen selbst verwalteten
 > privaten Docker-Host vorgesehen. Vor einer Erreichbarkeit über das Internet
 > müssen WireGuard, ein HTTPS-Reverse-Proxy und eine zusätzliche
 > Netzsegmentierung eingerichtet werden.
@@ -117,8 +117,10 @@ Dieser Modus besitzt transportbedingt keinen Secure Context und sollte nicht
 
 - animiertes, barrierearmes Burger-Menü;
 - geschützte Liveansicht und Eigentümerverwaltung;
+- persönliche Anzeigeprofile je Benutzer mit eigener Kameraauswahl,
+  Kachelreihenfolge und geschützten Startlinks;
 - optionaler Leitstellenmodus mit randlosem, automatisch angepasstem
-  Mehrkamera-Raster ohne Kachelsteuerung;
+  Mehrkamera-Raster und derselben persönlichen Profilauswahl;
 - rollenbasierte Benutzerverwaltung mit Eigentümer, Administrator und Betrachter;
 - SQLite-Persistenz für Kameras, Reihenfolge und Polygonzonen;
 - konservative Suche im ausdrücklich konfigurierten privaten Netz über
@@ -167,6 +169,26 @@ randlose Großbildansicht. Bei sechs Kameras wird auf einem Querformatbildschirm
 ein lückenloses 3×2-Raster verwendet; Hochformat und andere Kameraanzahlen
 werden automatisch angepasst. Kamera- und Live-Status bleiben als dezente
 Einblendung sichtbar, die normalen Steuerelemente werden ausgeblendet.
+
+Jeder angemeldete Benutzer kann in der Liveübersicht persönliche
+**Anzeigeprofile** mit eigener Kamerareihenfolge pflegen. Ein Profil gilt nur
+für dieses Benutzerkonto und ist keine zusätzliche Kameraberechtigung.
+Deaktivierte Kameras bleiben im Profil gespeichert, werden aber in Live- und
+Leitstellenansicht ausgeblendet. Nach ihrer Reaktivierung erscheinen sie wieder
+an der gespeicherten Position.
+
+Über **Profile verwalten** lassen sich geschützte Startlinks für die normale
+Liveansicht und den Leitstellenmodus kopieren. Beispiele:
+
+```text
+http://camera-hub/#overview?profile=<Profil-ID>
+http://camera-hub/#wall?profile=<Profil-ID>
+```
+
+Ist noch keine gültige Sitzung vorhanden, erscheint zuerst die normale
+Anmeldung. Ein fremdes oder gelöschtes Profil fällt ohne Datenfreigabe auf
+**Alle aktiven Kameras** zurück. Für Fernseher und Tablets entstehen dadurch
+keine anonymen Kiosk-Zugänge.
 
 Die Schaltfläche **Normalansicht** erscheint kurz beim Wechsel sowie nach
 Zeiger- oder Touchbewegung und blendet sich anschließend aus. Alternativ

@@ -1,8 +1,8 @@
 (() => {
   'use strict';
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const RETRY_DELAYS = [2000, 5000, 15000];
-  const appState = { csrf:'', user:null, permissions:{}, users:[], cameras:[], adminCameras:[], cloudAccounts:[], cloudProviders:[], states:new Map(), observer:null, detail:null, suspended:false, wallMode:false, wallControlsTimer:null, elevatedUntil:0, scanTimer:null, scanId:null, discoveryItems:[], discoveryResultScanId:null, discoveryDevice:null, connectionCamera:null, connectionRollout:null, connectionRequest:0, capabilityCamera:null, capabilityRequest:0, ptz:null };
+  const appState = { csrf:'', user:null, permissions:{}, users:[], cameras:[], adminCameras:[], cloudAccounts:[], cloudProviders:[], displayProfiles:[], profileCameraOptions:[], displayProfileId:'', renderedDisplayProfileId:'', profileDraftOrder:[], cameraRequest:0, states:new Map(), observer:null, detail:null, suspended:false, wallMode:false, wallControlsTimer:null, elevatedUntil:0, scanTimer:null, scanId:null, discoveryItems:[], discoveryResultScanId:null, discoveryDevice:null, connectionCamera:null, connectionRollout:null, connectionRequest:0, capabilityCamera:null, capabilityRequest:0, ptz:null };
   const $ = (selector, root=document) => root.querySelector(selector);
   const $$ = (selector, root=document) => [...root.querySelectorAll(selector)];
   const mediaHost = location.hostname;
@@ -11,6 +11,14 @@
   const hlsUrl = (path) => sameOriginMedia ? `${location.origin}/hls/${encodeURIComponent(path)}?autoplay=true&muted=true&controls=true&playsInline=true` : `http://${mediaHost}:8888/${encodeURIComponent(path)}?autoplay=true&muted=true&controls=true&playsInline=true`;
   const toast = (message) => { const node=$('#toast'); node.textContent=message; node.hidden=false; clearTimeout(node.timer); node.timer=setTimeout(()=>node.hidden=true,3500); };
   const relativeTime = (value) => value ? new Intl.DateTimeFormat('de-DE',{hour:'2-digit',minute:'2-digit',second:'2-digit'}).format(new Date(value)) : '–';
+  function hashRoute(){
+    const fragment=location.hash.slice(1),separator=fragment.indexOf('?'),view=(separator<0?fragment:fragment.slice(0,separator))||'overview',params=new URLSearchParams(separator<0?'':fragment.slice(separator+1));
+    return {view,profileId:params.get('profile')||''};
+  }
+  function liveHash(view=appState.wallMode?'wall':'overview'){
+    const profile=appState.displayProfileId?`?profile=${encodeURIComponent(appState.displayProfileId)}`:'';
+    return `#${view}${profile}`;
+  }
 
   class ApiError extends Error { constructor(status, code){ super(code); this.status=status; this.code=code; } }
   async function api(path, options={}) {
@@ -52,7 +60,7 @@
     if(appState.detail) closeDetail();
     $$('.view').forEach((view)=>{ const active=view.dataset.view===name; view.hidden=!active; view.classList.toggle('is-active',active); });
     $$('.nav-item').forEach((item)=>item.classList.toggle('is-active',item.dataset.view===name));
-    closeMenu(false); history.replaceState(null,'',`#${name}`);const heading=$(`#view-${name} h2`);if(heading){heading.tabIndex=-1;heading.focus({preventScroll:true});}
+    closeMenu(false); history.replaceState(null,'',name==='overview'?liveHash('overview'):`#${name}`);const heading=$(`#view-${name} h2`);if(heading){heading.tabIndex=-1;heading.focus({preventScroll:true});}
     if(name==='discover') loadCloudAccounts(); if(name==='manage') loadAdminCameras(); if(name==='zones') loadZoneCamera(); if(name==='users') loadUsers(); if(name==='system') refreshDiagnostics();
   }
 
@@ -61,18 +69,18 @@
     document.body.classList.add('wall-controls-visible');
     clearTimeout(appState.wallControlsTimer);
     appState.wallControlsTimer=setTimeout(()=>{
-      if(!$('#exit-wall-mode').matches(':focus-visible'))document.body.classList.remove('wall-controls-visible');
+      if(!$('#wall-controls').contains(document.activeElement))document.body.classList.remove('wall-controls-visible');
     },3500);
   }
   function enterWallMode(nativeFullscreen=true){
-    const enterButton=$('#enter-wall-mode'),exitButton=$('#exit-wall-mode');if(!appState.csrf||appState.wallMode||!enterButton||!exitButton)return;
-    closeMenu(false);appState.wallMode=true;document.body.classList.add('wall-mode');exitButton.hidden=false;enterButton.setAttribute('aria-pressed','true');document.title='Camera Hub · Leitstelle';history.replaceState(null,'','#wall');revealWallControls();
+    const enterButton=$('#enter-wall-mode'),controls=$('#wall-controls');if(!appState.csrf||appState.wallMode||!enterButton||!controls)return;
+    closeMenu(false);appState.wallMode=true;document.body.classList.add('wall-mode');controls.hidden=false;enterButton.setAttribute('aria-pressed','true');document.title='Camera Hub · Leitstelle';history.replaceState(null,'',liveHash('wall'));revealWallControls();
     appState.states.forEach(state=>{state.visible=true;if(!state.reader&&state.camera.displayMode!=='snapshot')connect(state,state.camera.lowPath,'low',true);});
     if(nativeFullscreen&&!document.fullscreenElement&&document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(()=>{});
   }
   function exitWallMode({leaveFullscreen=true,updateHistory=true}={}){
     if(!appState.wallMode)return;
-    appState.wallMode=false;clearTimeout(appState.wallControlsTimer);appState.wallControlsTimer=null;document.body.classList.remove('wall-mode','wall-controls-visible');const exitButton=$('#exit-wall-mode'),enterButton=$('#enter-wall-mode');if(exitButton)exitButton.hidden=true;if(enterButton)enterButton.setAttribute('aria-pressed','false');document.title='PKWS Camera Hub';if(updateHistory)history.replaceState(null,'','#overview');
+    appState.wallMode=false;clearTimeout(appState.wallControlsTimer);appState.wallControlsTimer=null;document.body.classList.remove('wall-mode','wall-controls-visible');const controls=$('#wall-controls'),enterButton=$('#enter-wall-mode');if(controls)controls.hidden=true;if(enterButton)enterButton.setAttribute('aria-pressed','false');document.title='PKWS Camera Hub';if(updateHistory)history.replaceState(null,'',liveHash('overview'));
     if(leaveFullscreen&&document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen().catch(()=>{});
   }
 
@@ -136,6 +144,104 @@
     state.snapshot.onerror=()=>{if(state.generation!==generation)return;if(state.retryCount>=RETRY_DELAYS.length){mark(state,'offline','Vorschau nicht erreichbar');return;}const delay=RETRY_DELAYS[state.retryCount++];mark(state,'loading',`Neuer Versuch in ${delay/1000} s`);state.snapshotTimer=setTimeout(()=>startSnapshot(state),delay);};
     state.snapshot.src=`${state.camera.snapshotPath}?t=${Date.now()}`;
   }
+  function renderDisplayProfileSelects(){
+    for(const select of [$('#display-profile-select'),$('#wall-profile-select')]){
+      const selected=appState.displayProfileId;select.replaceChildren(new Option('Alle aktiven Kameras',''));
+      appState.displayProfiles.forEach(profile=>select.add(new Option(profile.name,profile.id)));
+      select.value=appState.displayProfiles.some(profile=>profile.id===selected)?selected:'';
+    }
+  }
+  async function loadDisplayProfiles(){
+    const data=await api('/api/display-profiles');
+    appState.displayProfiles=data.profiles||[];appState.profileCameraOptions=data.cameraOptions||[];
+    if(appState.displayProfileId&&!appState.displayProfiles.some(profile=>profile.id===appState.displayProfileId))appState.displayProfileId='';
+    renderDisplayProfileSelects();
+  }
+  function applyDisplayProfileFromHash(){
+    const requested=hashRoute().profileId;
+    if(!requested){appState.displayProfileId='';return;}
+    if(appState.displayProfiles.some(profile=>profile.id===requested))appState.displayProfileId=requested;
+    else{appState.displayProfileId='';toast('Anzeigeprofil nicht verfügbar · alle aktiven Kameras werden angezeigt');}
+    renderDisplayProfileSelects();
+  }
+  async function selectDisplayProfile(profileId){
+    if(profileId&&!appState.displayProfiles.some(profile=>profile.id===profileId)){toast('Anzeigeprofil nicht verfügbar');profileId='';}
+    appState.displayProfileId=profileId;renderDisplayProfileSelects();const applied=await loadCameras();if(applied)history.replaceState(null,'',liveHash());return applied;
+  }
+  async function applyLiveHashNavigation(){
+    if(!appState.csrf)return;const route=hashRoute();if(!['overview','wall'].includes(route.view))return;
+    const requested=appState.displayProfiles.some(profile=>profile.id===route.profileId)?route.profileId:'';
+    if(route.profileId&&!requested)toast('Anzeigeprofil nicht verfügbar · alle aktiven Kameras werden angezeigt');
+    if(requested!==appState.displayProfileId&&!await selectDisplayProfile(requested))return;
+    if(appState.detail)closeDetail({updateHistory:false});
+    $$('.view').forEach(view=>{const active=view.dataset.view==='overview';view.hidden=!active;view.classList.toggle('is-active',active);});
+    $$('.nav-item').forEach(item=>item.classList.toggle('is-active',item.dataset.view==='overview'));
+    closeMenu(false);
+    if(route.view==='wall'&&!appState.wallMode)enterWallMode(false);
+    else if(route.view==='overview'&&appState.wallMode)exitWallMode({updateHistory:false});
+    history.replaceState(null,'',liveHash(route.view));
+  }
+  function renderProfileEditor(profileId=''){
+    const profile=appState.displayProfiles.find(item=>item.id===profileId);
+    $('#profile-editor-select').value=profile?.id||'';
+    $('#profile-name').value=profile?.name||'';
+    appState.profileDraftOrder=profile?[...profile.cameraIds]:[];
+    $('#delete-display-profile').hidden=!profile;$('#copy-profile-live').disabled=!profile;$('#copy-profile-wall').disabled=!profile;
+    renderProfileCameraList();
+  }
+  function renderProfileEditorSelect(){
+    const select=$('#profile-editor-select'),selected=select.value;select.replaceChildren(new Option('Neues Profil',''));
+    appState.displayProfiles.forEach(profile=>select.add(new Option(profile.name,profile.id)));
+    select.value=appState.displayProfiles.some(profile=>profile.id===selected)?selected:'';
+  }
+  let profileDragged=null;
+  function beginProfileDrag(event){
+    profileDragged=event.currentTarget.closest('.profile-camera-row');profileDragged.classList.add('is-dragging');event.currentTarget.setPointerCapture(event.pointerId);event.currentTarget.addEventListener('pointermove',moveProfileDrag);for(const name of ['pointerup','pointercancel','lostpointercapture'])event.currentTarget.addEventListener(name,endProfileDrag,{once:true});
+  }
+  function moveProfileDrag(event){
+    if(!profileDragged)return;const target=document.elementFromPoint(event.clientX,event.clientY)?.closest('.profile-camera-row');if(!target||target===profileDragged||target.dataset.selected!=='true')return;const box=target.getBoundingClientRect();event.clientY<box.top+box.height/2?target.before(profileDragged):target.after(profileDragged);
+  }
+  function endProfileDrag(event){
+    event.currentTarget.removeEventListener('pointermove',moveProfileDrag);for(const name of ['pointerup','pointercancel','lostpointercapture'])event.currentTarget.removeEventListener(name,endProfileDrag);if(!profileDragged)return;profileDragged.classList.remove('is-dragging');appState.profileDraftOrder=$$('.profile-camera-row[data-selected="true"]',$('#profile-camera-list')).map(row=>row.dataset.cameraId);profileDragged=null;renderProfileCameraList();
+  }
+  function renderProfileCameraList(){
+    const list=$('#profile-camera-list');list.replaceChildren();
+    const options=new Map(appState.profileCameraOptions.map(camera=>[camera.id,camera]));
+    const selected=appState.profileDraftOrder.filter(id=>options.has(id));
+    const remaining=appState.profileCameraOptions.filter(camera=>!selected.includes(camera.id)).map(camera=>camera.id);
+    [...selected,...remaining].forEach((cameraId)=>{
+      const camera=options.get(cameraId),checked=selected.includes(cameraId),index=selected.indexOf(cameraId),row=document.createElement('div');
+      row.className='profile-camera-row';row.dataset.enabled=String(camera.enabled);row.dataset.selected=String(checked);row.dataset.cameraId=cameraId;
+      row.innerHTML=`<button type="button" class="profile-drag-handle" aria-label="${escapeHtml(camera.name)} verschieben" ${checked?'':'disabled'}>↕</button><label><input type="checkbox" ${checked?'checked':''}><span>${escapeHtml(camera.name)}${camera.enabled?'':'<small>In der Liveansicht deaktiviert</small>'}</span></label><div class="profile-camera-moves"><button type="button" data-direction="-1" aria-label="Nach oben" ${!checked||index===0?'disabled':''}>↑</button><button type="button" data-direction="1" aria-label="Nach unten" ${!checked||index===selected.length-1?'disabled':''}>↓</button></div>`;
+      $('.profile-drag-handle',row).addEventListener('pointerdown',beginProfileDrag);
+      $('input',row).addEventListener('change',event=>{if(event.currentTarget.checked)appState.profileDraftOrder.push(cameraId);else appState.profileDraftOrder=appState.profileDraftOrder.filter(id=>id!==cameraId);renderProfileCameraList();});
+      $$('[data-direction]',row).forEach(button=>button.addEventListener('click',()=>{const from=appState.profileDraftOrder.indexOf(cameraId),to=from+Number(button.dataset.direction);if(from<0||to<0||to>=appState.profileDraftOrder.length)return;[appState.profileDraftOrder[from],appState.profileDraftOrder[to]]=[appState.profileDraftOrder[to],appState.profileDraftOrder[from]];renderProfileCameraList();}));
+      list.append(row);
+    });
+    if(!appState.profileCameraOptions.length)list.innerHTML='<div class="empty-state">Keine Kameras vorhanden.</div>';
+  }
+  async function openDisplayProfileDialog(){
+    try{await loadDisplayProfiles();renderProfileEditorSelect();renderProfileEditor(appState.displayProfileId);$('#display-profile-error').textContent='';$('#display-profile-dialog').showModal();}catch(error){toast(`Profile konnten nicht geladen werden: ${error.code}`);}
+  }
+  async function saveDisplayProfile(event){
+    event.preventDefault();const profileId=$('#profile-editor-select').value,name=$('#profile-name').value.trim(),body={name,cameraIds:appState.profileDraftOrder};
+    $('#display-profile-error').textContent='';
+    try{
+      const saved=await api(profileId?`/api/display-profiles/${encodeURIComponent(profileId)}`:'/api/display-profiles',{method:profileId?'PUT':'POST',body:JSON.stringify(body)});
+      await loadDisplayProfiles();$('#display-profile-dialog').close();toast('Anzeigeprofil gespeichert');await selectDisplayProfile(saved.id);
+    }catch(error){$('#display-profile-error').textContent=error.code==='display-profile-name-exists'?'Dieser Profilname ist bereits vergeben.':`Speichern fehlgeschlagen: ${error.code}`;}
+  }
+  async function deleteDisplayProfile(){
+    const profileId=$('#profile-editor-select').value,profile=appState.displayProfiles.find(item=>item.id===profileId);if(!profile||!window.confirm(`Anzeigeprofil „${profile.name}“ löschen?`))return;
+    try{await api(`/api/display-profiles/${encodeURIComponent(profileId)}`,{method:'DELETE'});const wasActive=appState.displayProfileId===profileId;await loadDisplayProfiles();$('#display-profile-dialog').close();if(wasActive)await selectDisplayProfile('');toast('Anzeigeprofil gelöscht');}catch(error){$('#display-profile-error').textContent=`Löschen fehlgeschlagen: ${error.code}`;}
+  }
+  async function copyText(value){
+    try{if(navigator.clipboard&&window.isSecureContext)await navigator.clipboard.writeText(value);else{const area=document.createElement('textarea');area.value=value;area.style.position='fixed';area.style.opacity='0';document.body.append(area);area.select();document.execCommand('copy');area.remove();}toast('Profil-Link kopiert');}catch{window.prompt('Profil-Link kopieren',value);}
+  }
+  function copyProfileLink(view){
+    const profileId=$('#profile-editor-select').value;if(!profileId)return;
+    copyText(`${location.origin}${location.pathname}#${view}?profile=${encodeURIComponent(profileId)}`);
+  }
   function renderCamera(camera){
     const fragment=$('#camera-template').content.cloneNode(true),card=$('.camera-card',fragment),video=$('video',fragment),snapshot=$('.card-snapshot',fragment),status=$('.card-status',fragment);
     const state={camera,card,video,snapshot,status,wallStatus:$('.wall-camera-status',fragment),placeholder:$('.card-placeholder',fragment),lastFrame:$('.last-frame span',fragment),reader:null,retryTimer:null,startupTimer:null,snapshotTimer:null,leaseTimer:null,retryCount:0,generation:0,visible:false,lastFrameAt:null,firstFrameReceived:false,mode:'low',path:camera.lowPath,leaseId:null};
@@ -144,8 +250,18 @@
     card.dataset.cameraId=camera.id;$('h3',fragment).textContent=camera.name;$('.wall-camera-name',fragment).textContent=camera.name;$('.source-badge',fragment).textContent=camera.source;authBadge.dataset.auth=String(usesCredentials);authBadge.setAttribute('aria-label',authText);authBadge.title=authText;$('.auth-badge-text',fragment).textContent=authText;$('.open-camera',fragment).addEventListener('click',()=>openDetail(camera.id));$('.reconnect-camera',fragment).addEventListener('click',()=>camera.displayMode==='snapshot'?startSnapshot(state,true):connect(state,camera.lowPath,'low',true));state.placeholder.addEventListener('click',()=>resumePlayback(state));video.addEventListener('click',()=>resumePlayback(state));appState.states.set(camera.id,state);$('#camera-grid').append(fragment);appState.observer.observe(card);
   }
   async function loadCameras(){
+    const request=++appState.cameraRequest,requestedProfileId=appState.displayProfileId;
+    const query=appState.displayProfileId?`?profileId=${encodeURIComponent(appState.displayProfileId)}`:'';
+    let data;try{data=await api(`/api/cameras${query}`);}catch(error){
+      if(request!==appState.cameraRequest)return false;
+      if(error.code==='display-profile-not-found'){appState.displayProfileId='';renderDisplayProfileSelects();toast('Anzeigeprofil nicht verfügbar · alle aktiven Kameras werden angezeigt');try{data=await api('/api/cameras');}catch(fallbackError){if(request===appState.cameraRequest){appState.displayProfileId=appState.renderedDisplayProfileId;renderDisplayProfileSelects();toast(`Liveansicht konnte nicht geladen werden: ${fallbackError.code}`);}return false;}}
+      else{appState.displayProfileId=appState.renderedDisplayProfileId;renderDisplayProfileSelects();toast(`Liveansicht konnte nicht geladen werden: ${error.code}`);return false;}
+    }
+    if(request!==appState.cameraRequest||requestedProfileId!==appState.displayProfileId&&appState.displayProfileId!=='')return false;
     appState.states.forEach(closeReader); appState.states.clear(); $('#camera-grid').replaceChildren();
-    const data=await api('/api/cameras'); appState.cameras=data.cameras||[];$('#camera-grid').dataset.count=String(appState.cameras.length);appState.cameras.forEach(renderCamera); await loadHealth(); populateZoneSelect();
+    appState.cameras=data.cameras||[];$('#camera-grid').dataset.count=String(appState.cameras.length);appState.cameras.forEach(renderCamera);
+    if(!appState.cameras.length){const empty=document.createElement('div');empty.className='empty-state';empty.innerHTML='<h3>Keine Kameras in dieser Ansicht</h3><p>Wählen Sie ein anderes Profil oder bearbeiten Sie die Kamerazuordnung.</p>';$('#camera-grid').append(empty);}
+    appState.renderedDisplayProfileId=appState.displayProfileId;await loadHealth();if(request===appState.cameraRequest)populateZoneSelect();return true;
   }
   async function loadHealth(){try{const data=await api('/api/health');$('#system-state').dataset.state='live';$('#system-state span').textContent='Lokales Gateway online';data.cameras?.forEach((item)=>{const state=appState.states.get(item.camera);if(!state||state.reader||state.camera.displayMode==='snapshot')return;if(item.lastFrameAt)state.lastFrame.textContent=relativeTime(item.lastFrameAt);if(item.state!=='live')mark(state,'offline','Kamera nicht erreichbar');});}catch{$('#system-state').dataset.state='offline';$('#system-state span').textContent='Gateway nicht erreichbar';}}
   function openDetail(id){
@@ -192,7 +308,7 @@
   function toggleDetailAudio(){
     const video=$('#detail-video');video.muted=!video.muted;video.play().catch(()=>{});$('#detail-audio').textContent=video.muted?'Audio einschalten':'Audio ausschalten';
   }
-  function closeDetail(){const returnFocus=appState.detail?.returnFocus;stopPTZ();if(appState.detail)closeReader(appState.detail);appState.detail=null;appState.ptz=null;$('#detail-functions').hidden=true;$('#detail-hls').hidden=true;$('#detail-hls').removeAttribute('src');$('#detail-snapshot').hidden=true;$('#detail-fallback').hidden=false;$('#detail-hls-toggle').hidden=false;$('#detail').hidden=true;showView('overview');if(returnFocus?.isConnected)returnFocus.focus();}
+  function closeDetail({updateHistory=true}={}){const returnFocus=appState.detail?.returnFocus;stopPTZ();if(appState.detail)closeReader(appState.detail);appState.detail=null;appState.ptz=null;$('#detail-functions').hidden=true;$('#detail-hls').hidden=true;$('#detail-hls').removeAttribute('src');$('#detail-snapshot').hidden=true;$('#detail-fallback').hidden=false;$('#detail-hls-toggle').hidden=false;$('#detail').hidden=true;if(updateHistory)showView('overview');if(returnFocus?.isConnected)returnFocus.focus();}
   function suspend(){stopPTZ();appState.suspended=true;appState.states.forEach(closeReader);if(appState.detail)closeReader(appState.detail);$('#detail-hls').hidden=true;$('#detail-hls').removeAttribute('src');}
   function resume(){if(document.hidden||!navigator.onLine||!appState.csrf)return;appState.suspended=false;if(appState.detail){appState.detail.camera.displayMode==='snapshot'?startSnapshot(appState.detail,true):connect(appState.detail,appState.detail.path,appState.detail.mode,true);}else appState.states.forEach(state=>{if(state.visible)state.camera.displayMode==='snapshot'?startSnapshot(state,true):connect(state,state.camera.lowPath,'low',true);});loadHealth();}
 
@@ -200,7 +316,7 @@
     $('#system-state').dataset.state='loading';$('#system-state span').textContent=setup?'Eigentümerkonto anlegen':'Anmeldung erforderlich';$('#auth-title').textContent=setup?'Eigentümerzugang einrichten':'Anmelden';$('#auth-copy').textContent=setup?'Legen Sie Benutzername und Passwort für den lokalen Eigentümerzugang fest.':'Livebilder und Einstellungen sind geschützt.';$('#auth-dialog').dataset.setup=String(setup);$('#auth-error').textContent='';if(!$('#auth-dialog').open)$('#auth-dialog').showModal();
   }
   async function initializeAuth(){
-    const state=await api('/api/auth/state');if(!state.authenticated){$('#app').hidden=true;showAuth(state.setupRequired);return false;}applyAccess(state);$('#auth-dialog').close();$('#app').hidden=false;await loadCameras();return true;
+    const state=await api('/api/auth/state');if(!state.authenticated){$('#app').hidden=true;showAuth(state.setupRequired);return false;}applyAccess(state);$('#auth-dialog').close();$('#app').hidden=false;await loadDisplayProfiles();applyDisplayProfileFromHash();await loadCameras();return true;
   }
 
   const ROLE_LABELS={owner:'Eigentümer',admin:'Administrator',viewer:'Betrachter'};
@@ -212,7 +328,7 @@
   }
 
   async function loadAdminCameras(){
-    try{const data=await api('/api/admin/cameras');appState.adminCameras=data.cameras||[];renderManage();}catch(error){if(error.status===401)showAuth(false);}
+    try{const data=await api('/api/admin/cameras');appState.adminCameras=data.cameras||[];await loadDisplayProfiles();renderManage();}catch(error){if(error.status===401)showAuth(false);}
   }
   function connectionBadges(camera){
     const active=camera.activeCredentials||{},draft=camera.draftCredentials||{},live=camera.liveAccess||{};
@@ -508,6 +624,7 @@
       await adminApi(`/api/admin/discovery/scans/${encodeURIComponent(scanId)}/devices/${encodeURIComponent(item.id)}/import`,{method:'POST',body:JSON.stringify({name:name.trim()||suggested})});
       item.configuredCameraId='imported';item.configuredName=name.trim()||suggested;
       renderDiscovery(appState.discoveryItems,scanId,false);
+      await loadAdminCameras();
       await loadCameras();
       toast('Cloud-Kamera hinzugefügt');
     }catch(error){toast(`Hinzufügen fehlgeschlagen: ${error.code}`);}
@@ -572,8 +689,9 @@
   async function addCamera(event){event.preventDefault();const form=event.currentTarget;if(form.dataset.tested!=='true'){ $('#camera-error').textContent='Bitte zuerst einen erfolgreichen Frame-Test durchführen.';return;}try{await adminApi('/api/admin/cameras',{method:'POST',body:JSON.stringify(cameraPayload())});form.reset();$('#camera-dialog').close();toast('Kamera wurde hinzugefügt');await loadAdminCameras();await loadCameras();showView('overview');}catch(error){$('#camera-error').textContent=`Hinzufügen fehlgeschlagen: ${error.code||'unerwarteter-fehler'}`;}}
 
   const zoneState={cameraId:'',revision:0,zones:[],draft:[],kind:'alarm',request:0};
-  function populateZoneSelect(){const select=$('#zone-camera'),current=select.value;select.replaceChildren();appState.cameras.forEach(camera=>{const option=new Option(camera.name,camera.id);select.add(option);});if(appState.cameras.some(camera=>camera.id===current))select.value=current;}
-  async function loadZoneCamera(){const id=$('#zone-camera').value||appState.cameras[0]?.id;if(!id)return;const request=++zoneState.request;zoneState.cameraId=id;zoneState.draft=[];zoneState.zones=[];renderZoneList();$('#zone-empty').hidden=false;$('#zone-empty').textContent='Vorschau wird geladen';const image=$('#zone-preview');image.hidden=true;image.onload=()=>{if(request!==zoneState.request||zoneState.cameraId!==id)return;$('#zone-empty').hidden=true;image.hidden=false;resizeCanvas();};image.onerror=()=>{if(request!==zoneState.request||zoneState.cameraId!==id)return;$('#zone-empty').textContent='Keine Vorschau verfügbar – die Quelle bleibt unverändert.';resizeCanvas();};image.src=`/api/admin/cameras/${encodeURIComponent(id)}/preview?t=${Date.now()}`;try{const data=await api(`/api/admin/cameras/${encodeURIComponent(id)}/zones`);if(request!==zoneState.request||zoneState.cameraId!==id)return;zoneState.revision=data.revision;zoneState.zones=data.zones;renderZoneList();drawZones();}catch(error){if(request===zoneState.request)toast(`Zonen konnten nicht geladen werden: ${error.code}`);}}
+  function activeZoneCameras(){return appState.profileCameraOptions.filter(camera=>camera.enabled);}
+  function populateZoneSelect(){const select=$('#zone-camera'),current=select.value,cameras=activeZoneCameras();select.replaceChildren();cameras.forEach(camera=>{const option=new Option(camera.name,camera.id);select.add(option);});if(cameras.some(camera=>camera.id===current))select.value=current;}
+  async function loadZoneCamera(){const id=$('#zone-camera').value||activeZoneCameras()[0]?.id;if(!id)return;const request=++zoneState.request;zoneState.cameraId=id;zoneState.draft=[];zoneState.zones=[];renderZoneList();$('#zone-empty').hidden=false;$('#zone-empty').textContent='Vorschau wird geladen';const image=$('#zone-preview');image.hidden=true;image.onload=()=>{if(request!==zoneState.request||zoneState.cameraId!==id)return;$('#zone-empty').hidden=true;image.hidden=false;resizeCanvas();};image.onerror=()=>{if(request!==zoneState.request||zoneState.cameraId!==id)return;$('#zone-empty').textContent='Keine Vorschau verfügbar – die Quelle bleibt unverändert.';resizeCanvas();};image.src=`/api/admin/cameras/${encodeURIComponent(id)}/preview?t=${Date.now()}`;try{const data=await api(`/api/admin/cameras/${encodeURIComponent(id)}/zones`);if(request!==zoneState.request||zoneState.cameraId!==id)return;zoneState.revision=data.revision;zoneState.zones=data.zones;renderZoneList();drawZones();}catch(error){if(request===zoneState.request)toast(`Zonen konnten nicht geladen werden: ${error.code}`);}}
   function resizeCanvas(){const canvas=$('#zone-canvas'),rect=canvas.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2);canvas.width=Math.max(1,Math.round(rect.width*dpr));canvas.height=Math.max(1,Math.round(rect.height*dpr));drawZones();}
   function zoneImageRect(){const canvas=$('#zone-canvas'),image=$('#zone-preview'),rect=canvas.getBoundingClientRect(),dpr=canvas.width/Math.max(1,rect.width);if(image.hidden||!image.naturalWidth||!image.naturalHeight)return{x:0,y:0,width:canvas.width,height:canvas.height,dpr};const scale=Math.min(rect.width/image.naturalWidth,rect.height/image.naturalHeight),width=image.naturalWidth*scale*dpr,height=image.naturalHeight*scale*dpr;return{x:(canvas.width-width)/2,y:(canvas.height-height)/2,width,height,dpr};}
   function drawPolygon(context,points,kind,draft=false){if(!points.length)return;const area=zoneImageRect();context.beginPath();points.forEach((point,index)=>{const x=area.x+point.x*area.width,y=area.y+point.y*area.height;index?context.lineTo(x,y):context.moveTo(x,y);});if(!draft&&points.length>2)context.closePath();context.strokeStyle=kind==='alarm'?'#ffbd63':'#6aa7ff';context.fillStyle=kind==='alarm'?'#ffbd6326':'#6aa7ff26';context.lineWidth=3*area.dpr;if(!draft)context.fill();context.stroke();points.forEach(point=>{context.beginPath();context.arc(area.x+point.x*area.width,area.y+point.y*area.height,5*area.dpr,0,Math.PI*2);context.fillStyle=context.strokeStyle;context.fill();});}
@@ -590,10 +708,11 @@
     $('#menu-button').addEventListener('click',()=>$('#app-menu').classList.contains('is-open')?closeMenu():openMenu());$('#menu-close').addEventListener('click',()=>closeMenu());$('#menu-backdrop').addEventListener('click',()=>closeMenu());$$('.nav-item').forEach(item=>item.addEventListener('click',()=>showView(item.dataset.view)));
     document.addEventListener('keydown',(event)=>{if(event.key==='Escape'&&appState.wallMode){event.preventDefault();exitWallMode();return;}if(event.key==='Escape'&&$('#app-menu').classList.contains('is-open'))closeMenu();if(event.key==='Tab'&&$('#app-menu').classList.contains('is-open')){const focusable=$$('button:not([disabled])',$('#app-menu'));const first=focusable[0],last=focusable.at(-1);if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}}});
     $$('dialog').forEach(dialog=>dialog.addEventListener('cancel',event=>{if(dialog.dataset.static==='true'){event.preventDefault();return;}if(dialog.id==='reauth-dialog')reauthResolver?.(false);}));
-    $('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const setup=$('#auth-dialog').dataset.setup==='true',body={username:$('#auth-user').value,password:$('#auth-password').value};try{const result=await api(setup?'/api/auth/setup':'/api/auth/login',{method:'POST',body:JSON.stringify(body)});applyAccess(result);$('#auth-password').value='';$('#auth-dialog').close();$('#app').hidden=false;await loadCameras();refreshDiagnostics();if(location.hash==='#wall')enterWallMode(false);}catch(error){$('#auth-error').textContent=error.code==='login-failed'?'Anmeldung fehlgeschlagen.':`Fehler: ${error.code}`;}});
+    $('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const setup=$('#auth-dialog').dataset.setup==='true',body={username:$('#auth-user').value,password:$('#auth-password').value};try{const result=await api(setup?'/api/auth/setup':'/api/auth/login',{method:'POST',body:JSON.stringify(body)});applyAccess(result);$('#auth-password').value='';$('#auth-dialog').close();$('#app').hidden=false;await loadDisplayProfiles();applyDisplayProfileFromHash();await loadCameras();refreshDiagnostics();if(hashRoute().view==='wall')enterWallMode(false);}catch(error){$('#auth-error').textContent=error.code==='login-failed'?'Anmeldung fehlgeschlagen.':`Fehler: ${error.code}`;}});
     $('#reauth-form').addEventListener('submit',async(event)=>{event.preventDefault();try{const result=await api('/api/auth/reauth',{method:'POST',body:JSON.stringify({password:$('#reauth-password').value})});appState.elevatedUntil=result.elevatedUntil;$('#reauth-dialog').close();reauthResolver?.(true);}catch{$('#reauth-error').textContent='Passwort nicht bestätigt.';}});$$('[data-close-dialog]').forEach(button=>button.addEventListener('click',()=>{const dialog=button.closest('dialog');dialog.close();if(dialog.id==='reauth-dialog')reauthResolver?.(false);}));
     $('#logout').addEventListener('click',async()=>{clearTimeout(appState.scanTimer);appState.scanTimer=null;appState.scanId=null;exitWallMode();try{await api('/api/auth/logout',{method:'POST'});}catch{}appState.csrf='';appState.user=null;appState.permissions={};suspend();$('#app').hidden=true;showAuth(false);closeMenu(false);});
-    const enterWall=$('#enter-wall-mode'),exitWall=$('#exit-wall-mode');if(enterWall&&exitWall){enterWall.addEventListener('click',()=>enterWallMode(true));exitWall.addEventListener('click',()=>exitWallMode());exitWall.addEventListener('blur',revealWallControls);}document.addEventListener('pointermove',revealWallControls,{passive:true});document.addEventListener('touchstart',revealWallControls,{passive:true});document.addEventListener('fullscreenchange',()=>{if(appState.wallMode&&!document.fullscreenElement)exitWallMode({leaveFullscreen:false});});
+    const enterWall=$('#enter-wall-mode'),exitWall=$('#exit-wall-mode');if(enterWall&&exitWall){enterWall.addEventListener('click',()=>enterWallMode(true));exitWall.addEventListener('click',()=>exitWallMode());}document.addEventListener('pointermove',revealWallControls,{passive:true});document.addEventListener('touchstart',revealWallControls,{passive:true});document.addEventListener('fullscreenchange',()=>{if(appState.wallMode&&!document.fullscreenElement)exitWallMode({leaveFullscreen:false});});
+    $('#display-profile-select').addEventListener('change',event=>selectDisplayProfile(event.currentTarget.value));$('#wall-profile-select').addEventListener('change',event=>selectDisplayProfile(event.currentTarget.value));$('#manage-display-profiles').addEventListener('click',openDisplayProfileDialog);$('#profile-editor-select').addEventListener('change',event=>renderProfileEditor(event.currentTarget.value));$('#display-profile-form').addEventListener('submit',saveDisplayProfile);$('#delete-display-profile').addEventListener('click',deleteDisplayProfile);$('#copy-profile-live').addEventListener('click',()=>copyProfileLink('overview'));$('#copy-profile-wall').addEventListener('click',()=>copyProfileLink('wall'));
     $('#refresh-all').addEventListener('click',loadHealth);$('#detail-back').addEventListener('click',closeDetail);$('#detail-reconnect').addEventListener('click',()=>{if(!appState.detail)return;appState.detail.camera.displayMode==='snapshot'?startSnapshot(appState.detail,true):connect(appState.detail,appState.detail.path,appState.detail.mode,true);});$('#detail-fallback').addEventListener('click',()=>{if(!appState.detail)return;$('#detail-quality').textContent='Substream';connect(appState.detail,appState.detail.camera.lowPath,'low',true);});$('#detail-hls-toggle').addEventListener('click',()=>{if(!appState.detail)return;closeReader(appState.detail,false);$('#detail-video').hidden=true;const frame=$('#detail-hls'),camera=appState.detail.camera,useHigh=camera.highPath!==camera.lowPath;frame.hidden=false;frame.src=hlsUrl(useHigh?camera.highPath:camera.lowPath);mark(appState.detail,'loading',useHigh?'HLS-Hauptstream lädt':'HLS-Fallback lädt');});$('#detail-hls').addEventListener('load',()=>{if(appState.detail)mark(appState.detail,'live','Live · HLS');});$('#detail-message').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-video').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-audio').addEventListener('click',toggleDetailAudio);$('#detail-fullscreen').addEventListener('click',()=>{const shell=$('#detail-shell'),video=$('#detail-video');if(shell.requestFullscreen)shell.requestFullscreen();else video.webkitEnterFullscreen?.();});
     $$('[data-ptz-x]').forEach(button=>{button.addEventListener('pointerdown',event=>{event.preventDefault();button.setPointerCapture?.(event.pointerId);startPTZ(button);});for(const name of ['pointerup','pointercancel','pointerleave'])button.addEventListener(name,stopPTZ);button.addEventListener('keydown',event=>{if((event.key===' '||event.key==='Enter')&&!event.repeat){event.preventDefault();startPTZ(button);}});button.addEventListener('keyup',event=>{if(event.key===' '||event.key==='Enter')stopPTZ();});button.addEventListener('blur',stopPTZ);});$('[data-ptz-stop]').addEventListener('click',stopPTZ);$('#ptz-presets').addEventListener('change',gotoPreset);
     $('#start-scan').addEventListener('click',startScan);$('#cancel-scan').addEventListener('click',cancelScan);$('#manual-add').addEventListener('click',()=>openCameraDialog());$('#discovery-auth-form').addEventListener('submit',probeDiscovery);$('#discovery-auth-dialog').addEventListener('close',()=>{const form=$('#discovery-auth-form');form.elements.username.value='';form.elements.password.value='';appState.discoveryDevice=null;});$('#test-source').addEventListener('click',testSource);$('#camera-form').addEventListener('submit',addCamera);for(const name of ['input','change'])$('#camera-form').addEventListener(name,()=>{$('#camera-form').dataset.tested='false';$('#source-test').textContent='Verbindungsdaten geändert · bitte erneut testen.';});$('#credential-mode').addEventListener('change',updateCredentialFields);$('#connection-test-button').addEventListener('click',testConnection);$('#connection-form').addEventListener('submit',saveConnection);for(const name of ['input','change'])$('#connection-form').addEventListener(name,()=>{$('#connection-form').dataset.tested='false';$('#connection-test').dataset.state='';$('#connection-test').textContent='Verbindungsdaten geändert · bitte erneut prüfen.';});$('#connection-activate').addEventListener('click',activateConnection);$('#capability-refresh').addEventListener('click',refreshCapabilities);$('#zone-camera').addEventListener('change',loadZoneCamera);$('#zone-canvas').addEventListener('pointerdown',addZonePoint);$('#zone-add-coordinate').addEventListener('click',addZoneCoordinate);$$('[data-zone-kind]').forEach(button=>button.addEventListener('click',()=>{$$('[data-zone-kind]').forEach(item=>item.classList.remove('is-active'));button.classList.add('is-active');zoneState.kind=button.dataset.zoneKind;}));$('#zone-undo').addEventListener('click',()=>{zoneState.draft.pop();drawZones();});$('#zone-complete').addEventListener('click',completeZone);$('#zone-save').addEventListener('click',saveZones);window.addEventListener('resize',resizeCanvas);
@@ -601,13 +720,13 @@
     $('#configure-netatmo').addEventListener('click',()=>{const form=$('#netatmo-config-form');form.reset();form.elements.redirectUri.value=`${location.origin}/api/cloud/oauth/netatmo/callback`;$('#netatmo-config-error').textContent='';$('#netatmo-config-dialog').showModal();});$('#netatmo-config-form').addEventListener('submit',saveNetatmoConfig);
     $('#add-netatmo-account').addEventListener('click',()=>{$('#netatmo-account-form').reset();$('#netatmo-account-error').textContent='';$('#netatmo-account-dialog').showModal();});$('#netatmo-account-form').addEventListener('submit',authorizeNetatmo);
     $('#add-user').addEventListener('click',()=>{$('#user-form').reset();$('#user-error').textContent='';$('#user-dialog').showModal();});$('#user-form').addEventListener('submit',createUser);$('#password-form').addEventListener('submit',saveUserPassword);$('#change-own-password').addEventListener('click',()=>{$('#own-password-form').reset();$('#own-password-error').textContent='';$('#own-password-dialog').showModal();});$('#own-password-form').addEventListener('submit',changeOwnPassword);
-    document.addEventListener('visibilitychange',()=>document.hidden?suspend():resume());window.addEventListener('pagehide',suspend);window.addEventListener('pageshow',resume);window.addEventListener('focus',resume);window.addEventListener('blur',stopPTZ);window.addEventListener('offline',suspend);window.addEventListener('online',resume);
+    document.addEventListener('visibilitychange',()=>document.hidden?suspend():resume());window.addEventListener('pagehide',suspend);window.addEventListener('pageshow',resume);window.addEventListener('focus',resume);window.addEventListener('blur',stopPTZ);window.addEventListener('offline',suspend);window.addEventListener('online',resume);window.addEventListener('hashchange',()=>applyLiveHashNavigation().catch(()=>toast('Ansicht konnte nicht gewechselt werden')));
   }
 
   window.addEventListener('load',async()=>{
     bindEvents();refreshDiagnostics();appState.observer=new IntersectionObserver(entries=>entries.forEach(entry=>{const state=appState.states.get(entry.target.dataset.cameraId);if(!state)return;state.visible=entry.isIntersecting;if(appState.detail)return;if(state.visible)state.camera.displayMode==='snapshot'?startSnapshot(state,true):connect(state,state.camera.lowPath,'low',true);else closeReader(state);}),{threshold:.2,rootMargin:'100px'});
     try{await initializeAuth();}catch{showAuth(false);}
     if('serviceWorker'in navigator){let reloadingForUpdate=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(reloadingForUpdate)return;reloadingForUpdate=true;location.reload();});navigator.serviceWorker.register('./sw.js').then(refreshDiagnostics).catch(()=>{});}
-    const initial=location.hash.slice(1),initialView=initial.split('?',1)[0];if(initialView==='wall'&&appState.csrf)enterWallMode(false);else if(['discover','manage','zones','users','system'].includes(initialView)&&appState.csrf){showView(initialView);if(initial.includes('netatmo=connected'))toast('Netatmo-Konto wurde verbunden');}
+    const initial=location.hash.slice(1),initialView=hashRoute().view;if(initialView==='wall'&&appState.csrf)enterWallMode(false);else if(['discover','manage','zones','users','system'].includes(initialView)&&appState.csrf){showView(initialView);if(initial.includes('netatmo=connected'))toast('Netatmo-Konto wurde verbunden');}
   });
 })();

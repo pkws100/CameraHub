@@ -17,6 +17,7 @@
   <link rel="stylesheet" href="./camera-connections.css">
   <link rel="stylesheet" href="./audit-fixes.css">
   <link rel="stylesheet" href="./wall-mode.css">
+  <link rel="stylesheet" href="./display-profiles.css">
   <link rel="stylesheet" href="./auth-badges.css">
   <script defer src="./reader.js"></script>
   <script defer src="./app.js"></script>
@@ -44,7 +45,7 @@
 
   <main id="app" hidden>
     <section class="view is-active" id="view-overview" data-view="overview">
-      <div class="section-head"><div><p class="kicker">Liveübersicht</p><h2>Ihre Kameras</h2></div><div class="overview-actions"><button type="button" class="primary" id="enter-wall-mode" title="Randlose Kachelübersicht für große Bildschirme">Leitstellenmodus</button><button type="button" class="ghost" id="refresh-all">Aktualisieren</button></div></div>
+      <div class="section-head"><div><p class="kicker">Liveübersicht</p><h2>Ihre Kameras</h2></div><div class="overview-actions"><label class="compact-select">Anzeigeprofil<select id="display-profile-select" aria-label="Anzeigeprofil"><option value="">Alle aktiven Kameras</option></select></label><button type="button" id="manage-display-profiles">Profile verwalten</button><button type="button" class="primary" id="enter-wall-mode" title="Randlose Kachelübersicht für große Bildschirme">Leitstellenmodus</button><button type="button" class="ghost" id="refresh-all">Aktualisieren</button></div></div>
       <div class="camera-grid" id="camera-grid" aria-live="polite"></div>
       <p class="privacy-note">WebRTC primär · HLS als Fallback · Keine Aufzeichnung · Keine Drittanbieter</p>
     </section>
@@ -101,7 +102,7 @@
         <article><span>WebRTC</span><strong id="diag-webrtc">–</strong></article>
         <article><span>HLS</span><strong id="diag-hls">–</strong></article>
         <article><span>Backend</span><strong id="diag-backend">–</strong></article>
-        <article><span>App-Version</span><strong id="diag-version">1.1.0</strong></article>
+        <article><span>App-Version</span><strong id="diag-version">1.2.0</strong></article>
         <article class="span-two"><span>Origin</span><strong id="diag-origin">–</strong></article>
       </div>
       <p class="privacy-note">Die Erkennungs-Adapter-API ist vorbereitet, aber standardmäßig deaktiviert.</p>
@@ -129,7 +130,10 @@
     </section>
   </main>
 
-  <button type="button" id="exit-wall-mode" class="wall-exit" aria-keyshortcuts="Escape" hidden>Normalansicht</button>
+  <div id="wall-controls" class="wall-controls" hidden>
+    <label>Anzeigeprofil<select id="wall-profile-select" aria-label="Anzeigeprofil im Leitstellenmodus"><option value="">Alle aktiven Kameras</option></select></label>
+    <button type="button" id="exit-wall-mode" aria-keyshortcuts="Escape">Normalansicht</button>
+  </div>
 
   <dialog id="auth-dialog" class="modal" data-static="true" aria-labelledby="auth-title">
     <form id="auth-form"><p class="kicker">Privater Zugang</p><h2 id="auth-title">Anmelden</h2><p id="auth-copy">Livebilder und Einstellungen sind geschützt.</p>
@@ -139,6 +143,18 @@
   </dialog>
 
   <dialog id="reauth-dialog" class="modal" aria-labelledby="reauth-title"><form id="reauth-form"><p class="kicker">Sicherheitsbestätigung</p><h2 id="reauth-title">Änderung freigeben</h2><p>Bitte bestätigen Sie Ihr Kontopasswort.</p><label>Passwort<input id="reauth-password" type="password" autocomplete="current-password" minlength="8" required></label><p class="form-error" id="reauth-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Bestätigen</button></div></form></dialog>
+
+  <dialog id="display-profile-dialog" class="modal profile-modal" aria-labelledby="display-profile-title"><form id="display-profile-form">
+    <p class="kicker">Persönliche Liveansicht</p><h2 id="display-profile-title">Anzeigeprofile verwalten</h2>
+    <p>Profile gelten nur für Ihr Benutzerkonto. Deaktivierte Kameras bleiben zugeordnet, werden aber nicht live angezeigt.</p>
+    <label>Profil auswählen<select id="profile-editor-select"><option value="">Neues Profil</option></select></label>
+    <label>Profilname<input id="profile-name" maxlength="80" required placeholder="Zum Beispiel Eingang oder Garten"></label>
+    <div class="profile-camera-head"><strong>Kameras und Reihenfolge</strong><span>Neue Profile starten leer.</span></div>
+    <div id="profile-camera-list" class="profile-camera-list"></div>
+    <p class="form-error" id="display-profile-error" role="alert"></p>
+    <div class="profile-link-actions"><button type="button" id="copy-profile-live" disabled>Live-Link kopieren</button><button type="button" id="copy-profile-wall" disabled>Leitstellen-Link kopieren</button></div>
+    <div class="dialog-actions"><button type="button" data-close-dialog>Schließen</button><button type="button" id="delete-display-profile" class="danger" hidden>Profil löschen</button><button class="primary" type="submit">Profil speichern</button></div>
+  </form></dialog>
 
   <dialog id="discovery-auth-dialog" class="modal" aria-labelledby="discovery-auth-title"><form id="discovery-auth-form">
     <p class="kicker">Einmalige Streamprüfung</p><h2 id="discovery-auth-title">Streams und Vorschau erkennen</h2>
