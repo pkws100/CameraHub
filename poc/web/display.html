@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#020504">
+  <title>Camera Hub Anzeige</title>
+  <link rel="stylesheet" href="./display-device.css">
+</head>
+<body>
+  <main id="pair-view" class="display-center" hidden>
+    <form id="pair-form" class="display-panel">
+      <p class="kicker">PKWS Camera Hub</p>
+      <h1>Anzeigegerät koppeln</h1>
+      <p>Erzeugen Sie in Camera Hub unter „System → Anzeigegeräte“ einen einmaligen Code.</p>
+      <label>Achtstelliger Kopplungscode
+        <input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{8}" maxlength="8" required autofocus>
+      </label>
+      <p id="pair-error" class="error" role="alert"></p>
+      <button type="submit">Sicher koppeln</button>
+    </form>
+  </main>
+
+  <main id="idle-view" class="display-center idle" hidden>
+    <div class="idle-content">
+      <p class="kicker">Private Anzeige</p>
+      <h1 id="idle-device">Anzeigegerät</h1>
+      <time id="idle-clock"></time>
+      <p id="idle-next">Derzeit ist kein Profil aktiv.</p>
+    </div>
+  </main>
+
+  <main id="live-view" hidden>
+    <div id="display-grid" class="display-grid" aria-live="polite"></div>
+    <aside class="display-controls">
+      <span><strong id="display-device-name"></strong> · <span id="display-profile-name"></span></span>
+      <button id="display-fullscreen" type="button">Anzeige starten</button>
+      <button id="display-logout" type="button">Neu koppeln</button>
+    </aside>
+  </main>
+
+  <template id="display-camera-template">
+    <article class="display-camera">
+      <video autoplay muted playsinline></video>
+      <img class="display-snapshot" alt="" hidden>
+      <iframe title="HLS-Livebild" allow="autoplay; fullscreen" hidden></iframe>
+      <div class="display-placeholder"><i></i><span>Verbindung wird aufgebaut</span></div>
+      <footer>
+        <strong class="display-camera-name"></strong>
+        <span class="display-transport">Automatisch</span>
+      </footer>
+    </article>
+  </template>
+
+  <script src="./reader.js"></script>
+  <script src="./display-device.js"></script>
+</body>
+</html>

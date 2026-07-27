@@ -56,3 +56,40 @@ zurückweisen.
 Camera Hub folgt keinen Weiterleitungen und wartet höchstens fünf Sekunden.
 Nach einer fehlgeschlagenen Erstzustellung folgen Versuche nach 1, 5, 15 und
 60 Minuten. Danach bleibt die Zustellung als fehlgeschlagen dokumentiert.
+
+## Anzeigegeräte
+
+Unter **Systemstatus → Anzeigegeräte** legt der Eigentümer ein Gerät an, weist
+Anzeigeprofile in Prioritätsreihenfolge zu und erzeugt einen Kopplungscode.
+Auf dem Tablet oder Fernseher wird anschließend
+`http://<camera-hub>/display.html` geöffnet. Der Code ist achtstellig, zehn
+Minuten gültig und nur einmal verwendbar.
+
+Das Gerät erhält eine widerrufbare HttpOnly-/SameSite-Strict-Sitzung. Sie
+besitzt ausschließlich Leserechte auf das aktuell aktive, zugewiesene Profil,
+dessen Kameradaten und genau die dazugehörigen geschützten Medienpfade. Die
+Schaltfläche **Anzeige starten** fordert Browser-Vollbild an. Browser- oder
+PWA-Kioskmodus können ergänzend verwendet werden.
+
+Wochenzeitfenster werden in `CAMERA_HUB_TIMEZONE` (Standard:
+`Europe/Berlin`) ausgewertet. Bei Überschneidungen gewinnt das in der
+Gerätezuordnung höher angeordnete Profil. Ohne aktives Zeitfenster bleibt das
+Gerät im Ruhebildschirm und lädt weder Kameraliste noch Medien.
+
+Qualitätsmodi:
+
+- `auto`: kompatibler Standardpfad mit HLS-Fallback;
+- `high`: Hauptstream über WebRTC, ersatzweise derselbe Hauptpfad über HLS;
+- `low`: ausschließlich der Substream über WebRTC;
+- `hls`: Haupt- beziehungsweise vorhandener Einzelpfad über HLS.
+
+Gerätesitzungen und Kopplungscodes sind nicht Bestandteil einer Sicherung.
+Nach jeder Wiederherstellung müssen Anzeigen neu gekoppelt werden.
+
+## Betriebsabnahme
+
+Die automatischen Browser-, Medien-, Migrations- und
+Wiederherstellungsprüfungen laufen in CI. Für die praktische 24-Stunden- und
+48-Stunden-Freigabe gelten die Abläufe in
+[poc/acceptance/README.md](poc/acceptance/README.md). Das passive
+Dauerskript ruft keine Lease-, Wake-, Snapshot- oder Stream-Endpunkte auf.

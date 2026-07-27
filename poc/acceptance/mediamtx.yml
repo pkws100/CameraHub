@@ -1,0 +1,44 @@
+logLevel: warn
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1", "172.29.33.0/24"]
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+api: true
+apiAddress: :9997
+rtsp: true
+rtspAddress: :8554
+rtmp: false
+srt: false
+playback: false
+hls: true
+hlsAddress: :8888
+hlsAllowOrigins: ["http://127.0.0.1:18091", "http://camera-hub.test:18091"]
+hlsAlwaysRemux: true
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+webrtc: true
+webrtcAddress: :8889
+webrtcAllowOrigins: ["http://127.0.0.1:18091", "http://camera-hub.test:18091"]
+webrtcAdditionalHosts: ["127.0.0.1"]
+webrtcLocalUDPAddress: :18189
+webrtcLocalTCPAddress: :18189
+pathDefaults:
+  record: false
+paths:
+  acceptance-01: {source: "udp+mpegts://0.0.0.0:12001"}
+  acceptance-02: {source: "udp+mpegts://0.0.0.0:12002"}
+  acceptance-03: {source: "udp+mpegts://0.0.0.0:12003"}
+  acceptance-04: {source: "udp+mpegts://0.0.0.0:12004"}
+  acceptance-05: {source: "udp+mpegts://0.0.0.0:12005"}
+  acceptance-06: {source: "udp+mpegts://0.0.0.0:12006"}
+  acceptance-07: {source: "udp+mpegts://0.0.0.0:12007"}
+  acceptance-08: {source: "udp+mpegts://0.0.0.0:12008"}
+  acceptance-09: {source: "udp+mpegts://0.0.0.0:12009"}
+  acceptance-10: {source: "udp+mpegts://0.0.0.0:12010"}
+  acceptance-11: {source: "udp+mpegts://0.0.0.0:12011"}

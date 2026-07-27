@@ -2,6 +2,43 @@
 
 Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
+## [Unveröffentlicht – 1.4.0]
+
+### Hinzugefügt
+
+- widerrufbare Nur-Lese-Anzeigegeräte mit achtstelligem, zehn Minuten gültigem
+  Einmalcode und 180-Tage-Gerätesitzung;
+- priorisierte Profilzuordnung, wiederkehrende Wochenzeitpläne in einer
+  konfigurierbaren Zeitzone und privater Ruhebildschirm ohne Kameraabrufe;
+- Qualitätsmodus `auto`, `high`, `low` oder `hls` pro Kamera und Anzeigeprofil;
+- additive Datenbankmigration für Geräte, Sitzungen, Codes, Zuordnungen,
+  Zeitpläne und Qualitätsmodus;
+- Browserabnahme auf Desktop, Tablet und Mobilgerät sowie ein echter
+  Caddy-/MediaMTX-/H.264-Teststapel mit elf Quellen.
+
+### Sicherheit
+
+- Kopplungscodes und Gerätetokens werden nur gehasht gespeichert und
+  Fehlversuche je Quelladresse und Code begrenzt;
+- Gerätesitzungen können weder Verwaltung noch PTZ, Cloud-Konten, Backups oder
+  Ereignisdetails öffnen und sind auf aktive, zugewiesene Medienpfade begrenzt;
+- Sicherungen erhalten die Gerätekonfiguration, entfernen aber alle
+  Gerätesitzungen und Kopplungscodes.
+
+## [1.3.3 – Freigabe ausstehend]
+
+### Hinzugefügt
+
+- reproduzierbare synthetische H.264-, MediaMTX-, Caddy-, WHEP- und HLS-Abnahme;
+- verbindliche CZEview-Brückentests und Browserregression in GitHub Actions;
+- ausschließlich passive, bereinigte 24-Stunden-Dauerabnahme ohne Wake- oder
+  Lease-Aufrufe für Akku- und Cloudkameras.
+
+### Freigabe
+
+- Der Tag `v1.3.3` bleibt bis zum bestandenen 24-Stunden-Lauf und der
+  praktischen Wiederherstellung gesperrt.
+
 ## [1.3.2] – 2026-07-26
 
 ### Behoben

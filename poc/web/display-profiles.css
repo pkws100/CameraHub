@@ -33,7 +33,7 @@
 
 .profile-camera-row {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr minmax(8rem, auto) auto;
   align-items: center;
   gap: .65rem;
   padding: .65rem;
@@ -72,6 +72,11 @@
   width: auto;
 }
 
+.profile-camera-row select {
+  min-width: 8rem;
+  padding: .48rem;
+}
+
 .profile-camera-row small {
   display: block;
   color: var(--muted);
@@ -91,6 +96,98 @@
   flex-wrap: wrap;
   gap: .55rem;
   margin: .3rem 0 1rem;
+}
+
+.profile-schedule-head,
+.display-device-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 1rem 0 .45rem;
+}
+
+.profile-schedule-help,
+.display-device-head p {
+  margin: .2rem 0;
+  color: var(--muted);
+  font-size: .72rem;
+}
+
+.profile-schedule-list,
+.display-device-list,
+.device-profile-options {
+  display: grid;
+  gap: .45rem;
+}
+
+.profile-schedule-row {
+  display: grid;
+  grid-template-columns: minmax(7rem, 1fr) 1fr 1fr auto;
+  gap: .5rem;
+  align-items: end;
+}
+
+.display-device-head {
+  margin-top: 1.4rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.display-device-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 1rem;
+  align-items: center;
+  padding: .75rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #091713;
+}
+
+.display-device-row p {
+  margin: .25rem 0 0;
+  color: var(--muted);
+  font-size: .72rem;
+}
+
+.display-device-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem;
+}
+
+.display-device-actions button {
+  padding: .5rem .65rem;
+}
+
+.device-profile-option {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: .6rem;
+  margin: 0 !important;
+  padding: .55rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.device-profile-option input {
+  width: auto;
+}
+
+#pairing-code {
+  display: block;
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #07110e;
+  color: var(--mint2);
+  font-size: clamp(2rem, 10vw, 4rem);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .16em;
+  text-align: center;
 }
 
 .danger {
@@ -121,5 +218,18 @@
 
   .overview-actions > button {
     flex: 1;
+  }
+
+  .profile-camera-row {
+    grid-template-columns: auto 1fr auto;
+  }
+
+  .profile-camera-row select {
+    grid-column: 2 / -1;
+  }
+
+  .profile-schedule-row,
+  .display-device-row {
+    grid-template-columns: 1fr;
   }
 }

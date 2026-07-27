@@ -103,7 +103,7 @@
         <article><span>WebRTC</span><strong id="diag-webrtc">–</strong></article>
         <article><span>HLS</span><strong id="diag-hls">–</strong></article>
         <article><span>Backend</span><strong id="diag-backend">–</strong></article>
-        <article><span>App-Version</span><strong id="diag-version">1.3.2</strong></article>
+        <article><span>App-Version</span><strong id="diag-version">1.4.0-dev</strong></article>
         <article class="span-two"><span>Origin</span><strong id="diag-origin">–</strong></article>
       </div>
       <section class="operations-section" aria-labelledby="events-title">
@@ -138,6 +138,11 @@
           </article>
         </div>
         <div class="webhook-list" id="webhook-list"></div>
+        <div class="display-device-head">
+          <div><strong>Anzeigegeräte</strong><p>Gekoppelte Nur-Lese-Anzeigen für Tablets und Fernseher.</p></div>
+          <button id="add-display-device" type="button">Anzeigegerät anlegen</button>
+        </div>
+        <div class="display-device-list" id="display-device-list"></div>
       </section>
       <p class="privacy-note">Die Überwachung prüft Dauerstreams passiv. Akku- und On-Demand-Kameras werden nicht automatisch geweckt.</p>
     </section>
@@ -220,6 +225,23 @@
     <div class="dialog-actions"><button id="copy-webhook-secret">Geheimnis kopieren</button><button class="primary" type="button" data-close-dialog>Fertig</button></div>
   </div></dialog>
 
+  <dialog id="display-device-dialog" class="modal operations-modal" aria-labelledby="display-device-title"><form id="display-device-form">
+    <input name="deviceId" type="hidden">
+    <p class="kicker">Nur-Lese-Anzeige</p><h2 id="display-device-title">Anzeigegerät anlegen</h2>
+    <label>Gerätename<input name="name" maxlength="80" required placeholder="Zum Beispiel Wohnzimmer-TV"></label>
+    <label class="check-label"><input name="enabled" type="checkbox" checked> Gerät aktiviert</label>
+    <fieldset><legend>Zugewiesene Profile in Prioritätsreihenfolge</legend><div id="display-device-profiles" class="device-profile-options"></div></fieldset>
+    <p class="form-error" id="display-device-error" role="alert"></p>
+    <div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Gerät speichern</button></div>
+  </form></dialog>
+
+  <dialog id="pairing-code-dialog" class="modal operations-modal" aria-labelledby="pairing-code-title"><div class="secret-dialog-content">
+    <p class="kicker">Zehn Minuten gültig</p><h2 id="pairing-code-title">Anzeigegerät koppeln</h2>
+    <p>Öffnen Sie <strong id="display-route"></strong> auf dem Anzeigegerät und geben Sie diesen einmaligen Code ein.</p>
+    <output id="pairing-code"></output>
+    <div class="dialog-actions"><button id="copy-pairing-code" type="button">Code kopieren</button><button class="primary" type="button" data-close-dialog>Fertig</button></div>
+  </div></dialog>
+
   <dialog id="display-profile-dialog" class="modal profile-modal" aria-labelledby="display-profile-title"><form id="display-profile-form">
     <p class="kicker">Persönliche Liveansicht</p><h2 id="display-profile-title">Anzeigeprofile verwalten</h2>
     <p>Profile gelten nur für Ihr Benutzerkonto. Deaktivierte Kameras bleiben zugeordnet, werden aber nicht live angezeigt.</p>
@@ -227,6 +249,9 @@
     <label>Profilname<input id="profile-name" maxlength="80" required placeholder="Zum Beispiel Eingang oder Garten"></label>
     <div class="profile-camera-head"><strong>Kameras und Reihenfolge</strong><span>Neue Profile starten leer.</span></div>
     <div id="profile-camera-list" class="profile-camera-list"></div>
+    <div class="profile-schedule-head"><strong>Wöchentliche Zeitfenster</strong><button id="add-profile-schedule" type="button">Zeitfenster</button></div>
+    <p class="profile-schedule-help">Ohne Zeitfenster ist das Profil auf zugewiesenen Anzeigegeräten immer aktiv. Zeiträume über Mitternacht werden intern sicher aufgeteilt.</p>
+    <div id="profile-schedule-list" class="profile-schedule-list"></div>
     <p class="form-error" id="display-profile-error" role="alert"></p>
     <div class="profile-link-actions"><button type="button" id="copy-profile-live" disabled>Live-Link kopieren</button><button type="button" id="copy-profile-wall" disabled>Leitstellen-Link kopieren</button></div>
     <div class="dialog-actions"><button type="button" data-close-dialog>Schließen</button><button type="button" id="delete-display-profile" class="danger" hidden>Profil löschen</button><button class="primary" type="submit">Profil speichern</button></div>

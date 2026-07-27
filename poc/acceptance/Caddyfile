@@ -1,0 +1,27 @@
+{
+	admin off
+	auto_https off
+}
+
+:8090 {
+	encode zstd gzip
+
+	@protectedMedia path /whep/* /hls/*
+	forward_auth @protectedMedia web:8090 {
+		uri /api/auth/authorize
+	}
+
+	handle_path /whep/* {
+		reverse_proxy mediamtx:8889
+	}
+
+	handle_path /hls/* {
+		reverse_proxy mediamtx:8888 {
+			header_down Location ^/(.*)$ /hls/$1
+		}
+	}
+
+	handle {
+		reverse_proxy web:8090
+	}
+}

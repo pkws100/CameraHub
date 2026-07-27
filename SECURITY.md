@@ -15,7 +15,9 @@
 
 ## Anmeldung und Secrets
 
-- Liveansicht und Verwaltung erfordern eine Eigentümersitzung.
+- Liveansicht und Verwaltung erfordern eine Benutzersitzung; ausdrücklich
+  gekoppelte Anzeigegeräte verwenden stattdessen eine eigene eingeschränkte
+  Nur-Lese-Sitzung.
 - Passwörter werden mit Argon2 gehasht; Kamera-Zugangsdaten mit AES-GCM
   verschlüsselt.
 - Sitzungscookie: HttpOnly, SameSite Strict und unter HTTPS zusätzlich Secure.
@@ -73,6 +75,17 @@
   HMAC-SHA-256. Private LAN-Ziele sind für den lokalen Betrieb ausdrücklich
   zulässig. Webhook-Nutzdaten enthalten keine Zugangsdaten, Token oder
   Stream-URIs.
+- Anzeigegeräte werden mit einem zufälligen, achtstelligen, zehn Minuten
+  gültigen Einmalcode gekoppelt. Codes und 180 Tage gültige Gerätesitzungen
+  werden ausschließlich gehasht gespeichert; Fehlversuche werden je
+  Quelladresse und Code begrenzt.
+- Eine Gerätesitzung darf nur ausdrücklich zugewiesene Profile,
+  Kamera-Metadaten, Leases und Medienpfade lesen. Benutzer-, Kamera-, Cloud-,
+  PTZ-, Backup-, Ereignis- und Webhook-Verwaltung bleiben gesperrt. Sperren,
+  Widerrufen oder erneutes Koppeln beendet bestehende Gerätesitzungen.
+- Backups enthalten Gerätenamen, Profilzuordnung, Qualitätsmodus und
+  Zeitpläne, jedoch keine Kopplungscodes oder Gerätesitzungen. Nach einer
+  Wiederherstellung muss jedes Anzeigegerät erneut gekoppelt werden.
 
 ## Medien und Alarmvorbereitung
 
