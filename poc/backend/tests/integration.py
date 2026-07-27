@@ -60,6 +60,33 @@ os.environ.update({
 import uvicorn
 import app as camera_app
 
+# Prove the additive 1.3.2/1.3.3 -> 1.4 schema path before the main API test.
+legacy_db = os.path.join(TEMP, "legacy-1.3.3.db")
+with sqlite3.connect(legacy_db) as legacy:
+    legacy.executescript(
+        """
+        CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        INSERT INTO schema_migrations(version,applied_at) VALUES(8,'2026-01-01T00:00:00Z');
+        CREATE TABLE display_profile_cameras(
+          profile_id TEXT NOT NULL,
+          camera_id TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          PRIMARY KEY(profile_id,camera_id)
+        );
+        """
+    )
+main_db_path = camera_app.DB_PATH
+camera_app.DB_PATH = camera_app.Path(legacy_db)
+camera_app.initialize_database()
+with camera_app.connect() as migrated:
+    assert "stream_mode" in {
+        row["name"] for row in migrated.execute("PRAGMA table_info(display_profile_cameras)")
+    }
+    assert migrated.execute(
+        "SELECT 1 FROM schema_migrations WHERE version=9"
+    ).fetchone()
+camera_app.DB_PATH = main_db_path
+
 
 PORT = 18090
 server = uvicorn.Server(uvicorn.Config(camera_app.app, host="127.0.0.1", port=PORT, log_level="error", proxy_headers=False))
@@ -249,6 +276,294 @@ try:
     )
     assert updated_profile["cameraIds"] == ["garten", "eingang"]
     assert [item["id"] for item in request(f"/api/cameras?profileId={owner_profile['id']}")["cameras"]] == ["garten", "eingang"]
+    updated_profile = request(
+        f"/api/display-profiles/{owner_profile['id']}",
+        "PUT",
+        {
+            "name": updated_profile["name"],
+            "cameraIds": ["garten", "eingang"],
+            "cameraModes": {"garten": "high", "eingang": "hls"},
+            "schedules": [],
+        },
+        csrf,
+    )
+    assert updated_profile["cameraModes"] == {"garten": "high", "eingang": "hls"}
+    profiled_cameras = request(f"/api/cameras?profileId={owner_profile['id']}")["cameras"]
+    assert [item["streamMode"] for item in profiled_cameras] == ["high", "hls"]
+
+    display_device = request(
+        "/api/owner/display-devices",
+        "POST",
+        {
+            "name": "Leitstellen-TV",
+            "enabled": True,
+            "profileIds": [owner_profile["id"]],
+        },
+        csrf,
+        expected=201,
+    )
+    assert display_device["profileIds"] == [owner_profile["id"]]
+    assert request(
+        "/api/owner/display-devices",
+        expected=403,
+        opener=admin_client,
+    )["detail"] == "insufficient-role"
+    pair_code = request(
+        f"/api/owner/display-devices/{display_device['id']}/pairing-code",
+        "POST",
+        csrf=csrf,
+    )["code"]
+    assert len(pair_code) == 8 and pair_code.isdigit()
+    cross_origin_pair = urllib.request.Request(
+        base + "/api/display/pair",
+        data=json.dumps({"code": pair_code}).encode(),
+        method="POST",
+        headers={
+            "Host": "127.0.0.1",
+            "Origin": "http://untrusted.example",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        urllib.request.urlopen(cross_origin_pair, timeout=10)
+        raise AssertionError("cross-origin display pairing was accepted")
+    except urllib.error.HTTPError as error:
+        assert error.code == 403 and json.load(error)["detail"] == "display-origin-invalid"
+    display_client = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+    )
+    paired = request(
+        "/api/display/pair",
+        "POST",
+        {"code": pair_code},
+        opener=display_client,
+    )
+    assert paired["paired"] and paired["active"]
+    second_display_client = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+    )
+    assert request(
+        "/api/display/pair",
+        "POST",
+        {"code": pair_code},
+        expected=400,
+        opener=second_display_client,
+    )["detail"] == "display-pair-code-invalid"
+    expired_code = request(
+        f"/api/owner/display-devices/{display_device['id']}/pairing-code",
+        "POST",
+        csrf=csrf,
+    )["code"]
+    with camera_app.connect() as conn:
+        conn.execute(
+            "UPDATE display_pairing_codes SET expires_at=0 WHERE code_hash=?",
+            (camera_app.hash_pairing_code(expired_code),),
+        )
+    assert request(
+        "/api/display/pair",
+        "POST",
+        {"code": expired_code},
+        expected=400,
+        opener=second_display_client,
+    )["detail"] == "display-pair-code-invalid"
+    initial_display_revision = paired["configRevision"]
+    request("/api/admin/cameras/garten", "PATCH", {"enabled": False}, csrf)
+    disabled_display_state = request("/api/display/state", opener=display_client)
+    assert disabled_display_state["configRevision"] != initial_display_revision
+    assert [
+        item["id"]
+        for item in request("/api/display/cameras", opener=display_client)["cameras"]
+    ] == ["eingang"]
+    request("/api/admin/cameras/garten", "PATCH", {"enabled": True}, csrf)
+    assert (
+        request("/api/display/state", opener=display_client)["configRevision"]
+        != disabled_display_state["configRevision"]
+    )
+    display_cameras = request("/api/display/cameras", opener=display_client)
+    assert [item["id"] for item in display_cameras["cameras"]] == ["garten", "eingang"]
+    assert [item["streamMode"] for item in display_cameras["cameras"]] == ["high", "hls"]
+    assert request(
+        "/api/admin/users",
+        expected=401,
+        opener=display_client,
+    )["detail"] == "authentication-required"
+    display_lease = request(
+        "/api/display/cameras/garten/lease",
+        "POST",
+        opener=display_client,
+    )
+    assert display_lease["leaseId"].startswith(f"display-{display_device['id']}-")
+    assert request(
+        "/api/display/cameras/garage/lease",
+        "POST",
+        expected=404,
+        opener=display_client,
+    )["detail"] == "display-camera-not-assigned"
+    request(
+        f"/api/display/cameras/garten/lease?leaseId={display_lease['leaseId']}",
+        "DELETE",
+        expected=204,
+        opener=display_client,
+    )
+    allowed_media = urllib.request.Request(
+        base + "/api/auth/authorize",
+        headers={"X-Forwarded-Uri": "/whep/garten-low/whep"},
+    )
+    with display_client.open(allowed_media, timeout=10) as response:
+        assert response.status == 204
+    denied_media = urllib.request.Request(
+        base + "/api/auth/authorize",
+        headers={"X-Forwarded-Uri": "/hls/garage-low/"},
+    )
+    try:
+        display_client.open(denied_media, timeout=10)
+        raise AssertionError("display accessed an unassigned media path")
+    except urllib.error.HTTPError as error:
+        assert error.code == 403
+
+    with camera_app.connect() as conn:
+        original_paths = conn.execute(
+            "SELECT low_path,high_path FROM cameras WHERE id='garten'"
+        ).fetchone()
+        conn.execute(
+            "UPDATE cameras SET low_path='garten-low-only',high_path='garten-high-only' WHERE id='garten'"
+        )
+    high_media = urllib.request.Request(
+        base + "/api/auth/authorize",
+        headers={"X-Forwarded-Uri": "/whep/garten-high-only/whep"},
+    )
+    with display_client.open(high_media, timeout=10) as response:
+        assert response.status == 204
+    forbidden_low_media = urllib.request.Request(
+        base + "/api/auth/authorize",
+        headers={"X-Forwarded-Uri": "/whep/garten-low-only/whep"},
+    )
+    try:
+        display_client.open(forbidden_low_media, timeout=10)
+        raise AssertionError("high-only display profile accessed its low stream")
+    except urllib.error.HTTPError as error:
+        assert error.code == 403
+    with camera_app.connect() as conn:
+        conn.execute(
+            "UPDATE cameras SET low_path=?,high_path=? WHERE id='garten'",
+            (original_paths["low_path"], original_paths["high_path"]),
+        )
+
+    midnight_profile = request(
+        f"/api/display-profiles/{owner_profile['id']}",
+        "PUT",
+        {
+            "name": updated_profile["name"],
+            "cameraIds": ["garten", "eingang"],
+            "cameraModes": {"garten": "high", "eingang": "hls"},
+            "schedules": [
+                {"weekday": 6, "startMinute": 1380, "endMinute": 90}
+            ],
+        },
+        csrf,
+    )
+    assert midnight_profile["schedules"] == [
+        {"weekday": 6, "startMinute": 1380, "endMinute": 1440},
+        {"weekday": 0, "startMinute": 0, "endMinute": 90},
+    ]
+    request(
+        f"/api/display-profiles/{owner_profile['id']}",
+        "PUT",
+        {
+            "name": updated_profile["name"],
+            "cameraIds": ["garten", "eingang"],
+            "cameraModes": {"garten": "high", "eingang": "hls"},
+            "schedules": [],
+        },
+        csrf,
+    )
+
+    with camera_app.connect() as conn:
+        stamp = camera_app.now_iso()
+        secondary_profile_id = "owner-secondary-test"
+        conn.execute(
+            """INSERT INTO display_profiles(id,user_id,name,name_key,created_at,updated_at)
+               VALUES(?,?,?,?,?,?)""",
+            (
+                secondary_profile_id,
+                "owner",
+                "Sekundärprofil",
+                "sekundärprofil",
+                stamp,
+                stamp,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO display_device_profiles(device_id,profile_id,position)
+               VALUES(?,?,?)""",
+            (display_device["id"], secondary_profile_id, 1),
+        )
+        conn.execute(
+            """INSERT INTO display_profile_schedules(
+               id,profile_id,weekday,start_minute,end_minute,position)
+               VALUES(?,?,?,?,?,?)""",
+            ("test-window", owner_profile["id"], 0, 600, 660, 0),
+        )
+        conn.execute(
+            """INSERT INTO display_profile_schedules(
+               id,profile_id,weekday,start_minute,end_minute,position)
+               VALUES(?,?,?,?,?,?)""",
+            ("test-overlap", secondary_profile_id, 0, 600, 660, 0),
+        )
+        monday_active = camera_app.datetime(
+            2026, 1, 5, 10, 30, tzinfo=camera_app.DISPLAY_TIMEZONE
+        )
+        monday_idle = camera_app.datetime(
+            2026, 1, 5, 11, 30, tzinfo=camera_app.DISPLAY_TIMEZONE
+        )
+        assert camera_app.active_display_profile(
+            conn, display_device["id"], monday_active
+        )[0]["id"] == owner_profile["id"]
+        assert camera_app.active_display_profile(
+            conn, display_device["id"], monday_idle
+        )[0] is None
+        # Overlapping weekly windows always select the device assignment with
+        # the lower position (the owner's explicitly configured priority).
+        assert camera_app.active_display_profile(
+            conn, display_device["id"], monday_active
+        )[0]["id"] == owner_profile["id"]
+        conn.execute(
+            "DELETE FROM display_profile_schedules WHERE id IN ('test-window','test-overlap')"
+        )
+        conn.execute(
+            """INSERT INTO display_profile_schedules(
+               id,profile_id,weekday,start_minute,end_minute,position)
+               VALUES(?,?,?,?,?,?)""",
+            ("test-dst", owner_profile["id"], 6, 150, 210, 0),
+        )
+        before_dst_gap = camera_app.datetime(
+            2026, 3, 28, 12, 0, tzinfo=camera_app.DISPLAY_TIMEZONE
+        )
+        dst_start = camera_app.next_profile_start(
+            conn, display_device["id"], before_dst_gap
+        )[0]
+        assert (dst_start.hour, dst_start.minute) == (3, 30)
+        # Both occurrences of 02:30 during the autumn clock change remain
+        # inside the configured weekly window.
+        for fold in (0, 1):
+            autumn = camera_app.datetime(
+                2026,
+                10,
+                25,
+                2,
+                30,
+                fold=fold,
+                tzinfo=camera_app.DISPLAY_TIMEZONE,
+            )
+            assert camera_app.profile_active_at(conn, owner_profile["id"], autumn)
+        conn.execute("DELETE FROM display_profile_schedules WHERE id='test-dst'")
+        conn.execute(
+            "DELETE FROM display_device_profiles WHERE profile_id=?",
+            (secondary_profile_id,),
+        )
+        conn.execute(
+            "DELETE FROM display_profiles WHERE id=?", (secondary_profile_id,)
+        )
     request(
         f"/api/display-profiles/{viewer_profile['id']}",
         "DELETE",
@@ -1212,6 +1527,25 @@ try:
             (f"cloud-account:{cloud_account['id']}:auth",),
         ).fetchone()["status"] == "resolved"
 
+    backup_profile = request(
+        "/api/display-profiles",
+        "POST",
+        {
+            "name": "Backup-Zeitplan",
+            "cameraIds": ["eingang"],
+            "cameraModes": {"eingang": "low"},
+            "schedules": [
+                {"weekday": 4, "startMinute": 1320, "endMinute": 120}
+            ],
+        },
+        csrf,
+        expected=201,
+    )
+    request(
+        f"/api/owner/display-devices/{display_device['id']}/pairing-code",
+        "POST",
+        csrf=csrf,
+    )
     backup_passphrase = "Portable-Backup-Test-42!"
     backup_archive = camera_app.create_backup_archive(backup_passphrase)
     assert backup_passphrase.encode() not in backup_archive
@@ -1220,7 +1554,7 @@ try:
     manifest, backup_database, source_key = camera_app.decode_backup_archive(
         backup_archive, backup_passphrase
     )
-    assert manifest["schemaVersion"] == 8 and manifest["appVersion"] == "1.3.2"
+    assert manifest["schemaVersion"] == 9 and manifest["appVersion"] == "1.4.0-dev"
     assert len(backup_database) <= camera_app.BACKUP_DATABASE_MAX_BYTES
     assert camera_app.BACKUP_EXPANDED_MAX_BYTES > len(base64.b64encode(backup_database))
     for invalid_archive, invalid_passphrase, expected_code in (
@@ -1246,6 +1580,33 @@ try:
         )
         with sqlite3.connect(portable_candidate) as portable:
             portable.row_factory = sqlite3.Row
+            assert portable.execute(
+                "SELECT COUNT(*) FROM display_devices WHERE id=?",
+                (display_device["id"],),
+            ).fetchone()[0] == 1
+            assert portable.execute(
+                "SELECT COUNT(*) FROM display_device_profiles WHERE device_id=?",
+                (display_device["id"],),
+            ).fetchone()[0] == 1
+            assert portable.execute(
+                """SELECT stream_mode FROM display_profile_cameras
+                   WHERE profile_id=? AND camera_id='eingang'""",
+                (backup_profile["id"],),
+            ).fetchone()["stream_mode"] == "low"
+            assert portable.execute(
+                "SELECT COUNT(*) FROM display_profile_schedules WHERE profile_id=?",
+                (backup_profile["id"],),
+            ).fetchone()[0] == 2
+            assert portable.execute(
+                "SELECT COUNT(*) FROM display_device_sessions"
+            ).fetchone()[0] == 0
+            assert portable.execute(
+                "SELECT COUNT(*) FROM display_pairing_codes"
+            ).fetchone()[0] == 0
+            assert portable.execute(
+                "SELECT paired_at FROM display_devices WHERE id=?",
+                (display_device["id"],),
+            ).fetchone()["paired_at"] is None
             portable_account = portable.execute(
                 "SELECT auth_payload_ct FROM cloud_accounts WHERE id=?",
                 (cloud_account["id"],),
@@ -1296,11 +1657,92 @@ try:
     with camera_app.connect() as conn:
         assert conn.execute("SELECT name FROM cameras WHERE id='garten'").fetchone()["name"] == original_camera_name
         assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM display_device_sessions").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM display_pairing_codes").fetchone()[0] == 0
     assert request("/api/auth/state")["authenticated"] is False
     session = request("/api/auth/login", "POST", {"username": "owner", "password": password})
     csrf = session["csrfToken"]
 
-    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration personal-display-profiles profile-order profile-isolation camera-disable-retention camera-delete-cascade ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist operations-schema event-threshold event-dedup event-recovery passive-on-demand-monitor hmac-webhooks backup-encryption backup-corruption backup-restore restore-session-revocation")
+    lifecycle_client = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+    )
+    lifecycle_code = request(
+        f"/api/owner/display-devices/{display_device['id']}/pairing-code",
+        "POST",
+        csrf=csrf,
+    )["code"]
+    request(
+        "/api/display/pair",
+        "POST",
+        {"code": lifecycle_code},
+        opener=lifecycle_client,
+    )
+    lifecycle_lease = request(
+        "/api/display/cameras/garten/lease",
+        "POST",
+        opener=lifecycle_client,
+    )["leaseId"]
+    assert lifecycle_lease in camera_app.LEASES.get("garten", {})
+    request(
+        f"/api/owner/display-devices/{display_device['id']}",
+        "PUT",
+        {"name": "Leitstellen-TV", "enabled": False, "profileIds": [owner_profile["id"]]},
+        csrf,
+    )
+    assert request(
+        "/api/display/state", expected=401, opener=lifecycle_client
+    )["detail"] == "display-session-expired"
+    assert lifecycle_lease not in camera_app.LEASES.get("garten", {})
+    request(
+        f"/api/owner/display-devices/{display_device['id']}",
+        "PUT",
+        {"name": "Leitstellen-TV", "enabled": True, "profileIds": [owner_profile["id"]]},
+        csrf,
+    )
+    lifecycle_code = request(
+        f"/api/owner/display-devices/{display_device['id']}/pairing-code",
+        "POST",
+        csrf=csrf,
+    )["code"]
+    request(
+        "/api/display/pair",
+        "POST",
+        {"code": lifecycle_code},
+        opener=lifecycle_client,
+    )
+    lifecycle_lease = request(
+        "/api/display/cameras/garten/lease",
+        "POST",
+        opener=lifecycle_client,
+    )["leaseId"]
+    request(
+        f"/api/owner/display-devices/{display_device['id']}/revoke",
+        "POST",
+        csrf=csrf,
+    )
+    assert request(
+        "/api/display/state", expected=401, opener=lifecycle_client
+    )["detail"] == "display-session-expired"
+    assert lifecycle_lease not in camera_app.LEASES.get("garten", {})
+
+    camera_app.DISPLAY_PAIR_ATTEMPTS.clear()
+    for attempt in range(12):
+        assert request(
+            "/api/display/pair",
+            "POST",
+            {"code": f"{70_000_000 + attempt:08d}"},
+            expected=400,
+            opener=second_display_client,
+        )["detail"] == "display-pair-code-invalid"
+    assert request(
+        "/api/display/pair",
+        "POST",
+        {"code": "99999999"},
+        expected=429,
+        opener=second_display_client,
+    )["detail"] == "display-pair-rate-limited"
+
+    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration-v9 personal-display-profiles profile-order profile-isolation camera-disable-retention camera-delete-cascade ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist display-pair-expiry display-pair-one-use display-pair-rate-limit display-device-disable display-device-revoke display-media-isolation weekly-schedules-midnight-dst-priority operations-schema event-threshold event-dedup event-recovery passive-on-demand-monitor hmac-webhooks backup-encryption backup-corruption backup-restore restore-session-revocation")
 finally:
     server.should_exit = True
     thread.join(timeout=5)

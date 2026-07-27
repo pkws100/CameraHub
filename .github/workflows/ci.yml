@@ -19,14 +19,22 @@ jobs:
       - name: Prepare non-secret Compose fixtures
         run: |
           mkdir -p poc/runtime/secrets
+          mkdir -p poc/runtime/acceptance
           printf 'ci-only-placeholder\n' > poc/runtime/secrets/zmodo_secret_key
           printf 'ci-only-placeholder\n' > poc/runtime/secrets/zmodo_internal_token
+          printf 'ci-only-placeholder\n' > poc/runtime/acceptance/zmodo_secret_key
+          printf 'ci-only-placeholder\n' > poc/runtime/acceptance/zmodo_internal_token
 
       - name: Validate JavaScript
         run: |
           node --check poc/web/app.js
+          node --check poc/web/display-device.js
           node --check poc/web/reader.js
           node --check poc/web/sw.js
+          node --check playwright.config.js
+          node --check poc/e2e/camera-hub.spec.js
+          node --check poc/e2e/display-device.spec.js
+          node --check poc/e2e/synthetic-stack.spec.js
 
       - name: Validate PowerShell syntax
         shell: pwsh
@@ -55,6 +63,7 @@ jobs:
           docker compose -f poc/docker-compose.yml config --quiet
           docker compose -f poc/docker-compose.yml -f poc/docker-compose.http-test.yml config --quiet
           docker compose -f poc/docker-compose.yml -f poc/docker-compose.https.yml config --quiet
+          docker compose -f poc/acceptance/docker-compose.yml config --quiet
 
       - name: Validate Caddy gateways
         run: |
@@ -64,9 +73,54 @@ jobs:
           docker run --rm -e ZMODO_BIND_IP=192.168.1.50 \
             -v "$PWD/poc/proxy/Caddyfile.http:/etc/caddy/Caddyfile:ro" \
             caddy:2.10.0-alpine caddy validate --config /etc/caddy/Caddyfile
+          docker run --rm \
+            -v "$PWD/poc/acceptance/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.10.0-alpine caddy validate --config /etc/caddy/Caddyfile
 
       - name: Build backend test image
         run: docker build -t camerahub-backend-ci poc/backend
 
       - name: Run backend integration suite
         run: docker run --rm --entrypoint python -e PYTHONPATH=/app camerahub-backend-ci /app/tests/integration.py
+
+      - name: Build and test CZEview bridge
+        run: |
+          docker build -t camerahub-czeview-ci poc/czeview
+          docker run --rm --entrypoint python -e PYTHONPATH=/app camerahub-czeview-ci \
+            -m unittest discover -s /app/tests -p 'test_*.py'
+
+      - name: Install browser test dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium chrome
+
+      - name: Run desktop, tablet and mobile browser tests
+        run: npm run test:e2e
+
+      - name: Prepare synthetic acceptance secrets
+        run: |
+          mkdir -p poc/runtime/acceptance
+          openssl rand -base64 32 > poc/runtime/acceptance/zmodo_secret_key
+          openssl rand -base64 32 > poc/runtime/acceptance/zmodo_internal_token
+
+      - name: Start real Caddy, MediaMTX and synthetic H.264 stack
+        run: docker compose -f poc/acceptance/docker-compose.yml up -d --build --wait
+
+      - name: Run real stream acceptance
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:18091
+          RUN_SYNTHETIC_ACCEPTANCE: "1"
+        run: npx playwright test poc/e2e/synthetic-stack.spec.js --project=chrome-acceptance
+
+      - name: Stop synthetic acceptance stack
+        if: always()
+        run: docker compose -f poc/acceptance/docker-compose.yml down -v --remove-orphans
+
+      - name: Upload browser test report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report
+          retention-days: 7

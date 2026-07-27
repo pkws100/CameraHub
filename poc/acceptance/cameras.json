@@ -1,0 +1,15 @@
+{
+  "cameras": [
+    {"id":"acceptance-01","name":"Test 01","lowPath":"acceptance-01","highPath":"acceptance-01","source":"Synthetisches H.264","detailQuality":"Hauptstream"},
+    {"id":"acceptance-02","name":"Test 02","lowPath":"acceptance-02","highPath":"acceptance-02","source":"Synthetisches H.264","detailQuality":"Hauptstream"},
+    {"id":"acceptance-03","name":"Test 03","lowPath":"acceptance-03","highPath":"acceptance-03","source":"Synthetisches H.264","detailQuality":"Hauptstream"},
+    {"id":"acceptance-04","name":"Test 04","lowPath":"acceptance-04","highPath":"acceptance-04","source":"Synthetisches H.264","detailQuality":"Hauptstream"},
+    {"id":"acceptance-05","name":"Test 05","lowPath":"acceptance-05","highPath":"acceptance-05","source":"Synthetisches H.264","detailQuality":"Hauptstream"},
+    {"id":"acceptance-06","name":"Test 06","lowPath":"acceptance-06","highPath":"acceptance-06","source":"Synthetisches H.264","detailQuality":"Hauptstream"},
+    {"id":"acceptance-07","name":"Test 07","lowPath":"acceptance-07","highPath":"acceptance-07","source":"Synthetisches H.264","detailQuality":"Hauptstream"},
+    {"id":"acceptance-08","name":"Test 08","lowPath":"acceptance-08","highPath":"acceptance-08","source":"Synthetisches H.264","detailQuality":"Hauptstream"},
+    {"id":"acceptance-09","name":"Test 09","lowPath":"acceptance-09","highPath":"acceptance-09","source":"Synthetisches H.264","detailQuality":"Hauptstream"},
+    {"id":"acceptance-10","name":"Test 10","lowPath":"acceptance-10","highPath":"acceptance-10","source":"Synthetisches H.264","detailQuality":"Hauptstream"},
+    {"id":"acceptance-11","name":"Test 11","lowPath":"acceptance-11","highPath":"acceptance-11","source":"Synthetisches H.264","detailQuality":"Hauptstream"}
+  ]
+}

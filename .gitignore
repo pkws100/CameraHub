@@ -28,3 +28,7 @@ __pycache__/
 *.pfx
 provider.local.*
 *.provider.local
+
+node_modules/
+test-results/
+playwright-report/

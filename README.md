@@ -7,7 +7,7 @@ proprietären Hersteller-Plug-ins. Für CZEview-Akku-Kameras und freigegebene
 Netatmo-Sicherheitskameras stehen getrennte, bedarfsgesteuerte Cloud-Adapter
 bereit.
 
-> **Version 1.3.2:** Dieser Release ist für einen selbst verwalteten
+> **Entwicklungsstand 1.4.0:** Dieser Stand ist für einen selbst verwalteten
 > privaten Docker-Host vorgesehen. Vor einer Erreichbarkeit über das Internet
 > müssen WireGuard, ein HTTPS-Reverse-Proxy und eine zusätzliche
 > Netzsegmentierung eingerichtet werden.
@@ -86,6 +86,26 @@ keine Zugangsdaten oder internen Stream-Adressen. Einzelheiten zu Archivformat,
 Signaturprüfung und Fehlerverhalten stehen in
 [OPERATIONS.md](OPERATIONS.md).
 
+## Gekoppelte Anzeigegeräte
+
+Eigentümer verwalten unter **Systemstatus → Anzeigegeräte** eigene
+Nur-Lese-Zugänge für Tablets und Fernseher. Ein achtstelliger Code ist zehn
+Minuten und genau einmal gültig. Nach der Kopplung öffnet das Gerät
+`/display.html`; eine normale Benutzeranmeldung und Verwaltungsrechte erhält
+es nicht.
+
+Einem Gerät können mehrere Anzeigeprofile in Prioritätsreihenfolge zugewiesen
+werden. Pro Kamera speichert das Profil `Automatisch`, `Hauptstream`,
+`Substream` oder `HLS-Hauptstream`. Wiederkehrende Wochenzeitfenster werden in
+`Europe/Berlin` ausgewertet; `CAMERA_HUB_TIMEZONE` kann diese Zeitzone ändern.
+Zeiträume über Mitternacht und Sommer-/Winterzeit werden berücksichtigt.
+
+Ist kein Zeitfenster aktiv, zeigt das Gerät ausschließlich seinen privaten
+Ruhebildschirm mit Uhrzeit und nächstem Profilstart. Dabei werden keine
+Kameradaten, Vorschaubilder oder Leases geladen. Geräte können gesperrt, erneut
+gekoppelt oder vollständig widerrufen werden. Sicherungen erhalten
+Gerätekonfiguration und Zeitpläne, aber keine Gerätesitzungen.
+
 ## Zugriff über die private IP
 
 Der sichere Docker-Host-Modus wird an eine konkrete private IP gebunden:
@@ -138,7 +158,9 @@ Dieser Modus besitzt transportbedingt keinen Secure Context und sollte nicht
 - animiertes, barrierearmes Burger-Menü;
 - geschützte Liveansicht und Eigentümerverwaltung;
 - persönliche Anzeigeprofile je Benutzer mit eigener Kameraauswahl,
-  Kachelreihenfolge und geschützten Startlinks;
+  Kachelreihenfolge, Wochenzeitplänen, kamerabezogener Streamqualität und
+  geschützten Startlinks;
+- gekoppelte, widerrufbare Nur-Lese-Anzeigegeräte mit Ruhebildschirm;
 - optionaler Leitstellenmodus mit randlosem, automatisch angepasstem
   Mehrkamera-Raster und derselben persönlichen Profilauswahl;
 - rollenbasierte Benutzerverwaltung mit Eigentümer, Administrator und Betrachter;
@@ -208,7 +230,8 @@ http://camera-hub/#wall?profile=<Profil-ID>
 Ist noch keine gültige Sitzung vorhanden, erscheint zuerst die normale
 Anmeldung. Ein fremdes oder gelöschtes Profil fällt ohne Datenfreigabe auf
 **Alle aktiven Kameras** zurück. Für Fernseher und Tablets entstehen dadurch
-keine anonymen Kiosk-Zugänge.
+keine anonymen Kiosk-Zugänge. Für unbeaufsichtigte Displays steht stattdessen
+der ausdrücklich gekoppelte Nur-Lese-Zugang unter `/display.html` bereit.
 
 Die Schaltfläche **Normalansicht** erscheint kurz beim Wechsel sowie nach
 Zeiger- oder Touchbewegung und blendet sich anschließend aus. Alternativ
@@ -231,6 +254,14 @@ Rollbackpfad; ihre Quelladressen gehören nur in die ignorierte `.env`.
 
 Camera Hub verändert weder Kamera-, Receiver-, Router- noch
 Aufzeichnungseinstellungen.
+
+## Automatische Abnahme
+
+Desktop-, Tablet- und Mobiltests sowie der echte Caddy-/MediaMTX-/H.264-Pfad
+laufen in GitHub Actions. Die lokale 24-Stunden-Abnahme fragt ausschließlich
+passive Statusdaten ab und schließt Akku-/Cloudkameras aus. Befehle,
+Freigabekriterien und bereinigte Protokolle beschreibt
+[poc/acceptance/README.md](poc/acceptance/README.md).
 
 ## Akku-/Cloudkameras
 

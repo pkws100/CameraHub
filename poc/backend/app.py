@@ -19,10 +19,11 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
-from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.parse import quote, unquote, urlencode
 from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
@@ -48,6 +49,8 @@ MEDIAMTX_API = os.environ.get("MEDIAMTX_API", "http://mediamtx:9997")
 ALLOWED_NETWORK = ipaddress.ip_network(os.environ.get("DISCOVERY_NETWORK", "192.168.1.0/24"), strict=True)
 MAX_CAMERAS = int(os.environ.get("MAX_CAMERAS", "32"))
 SESSION_SECONDS = 8 * 60 * 60
+DISPLAY_SESSION_SECONDS = 180 * 24 * 60 * 60
+DISPLAY_PAIRING_SECONDS = 10 * 60
 ELEVATION_SECONDS = 10 * 60
 SCAN_TTL_SECONDS = 15 * 60
 SCAN_PORTS = (80, 443, 554, 2020, 8000, 8080, 8554, 8899, 10080, 10554)
@@ -64,6 +67,7 @@ PREVIEW_SEMAPHORE = threading.BoundedSemaphore(2)
 PREVIEW_CACHE: dict[str, tuple[float, bytes]] = {}
 DISCOVERY_PREVIEW_CACHE: dict[tuple[str, str], tuple[float, bytes]] = {}
 REAUTH_ATTEMPTS: dict[str, list[float]] = {}
+DISPLAY_PAIR_ATTEMPTS: dict[str, list[float]] = {}
 NETATMO_TOKEN_LOCKS: dict[str, threading.Lock] = {}
 NETATMO_STREAM_CACHE: dict[str, tuple[float, list[str]]] = {}
 CLOUD_PROBE_LEASES: dict[str, dict] = {}
@@ -84,7 +88,12 @@ BACKUP_SCRYPT_N = 2**17
 BACKUP_LEGACY_SCRYPT_N = 2**14
 BACKUP_FORMAT = "pkws-camera-hub-backup"
 BACKUP_VERSION = 1
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.4.0-dev"
+CAMERA_HUB_TIMEZONE = os.environ.get("CAMERA_HUB_TIMEZONE", "Europe/Berlin")
+try:
+    DISPLAY_TIMEZONE = ZoneInfo(CAMERA_HUB_TIMEZONE)
+except ZoneInfoNotFoundError as exc:
+    raise RuntimeError(f"invalid CAMERA_HUB_TIMEZONE: {CAMERA_HUB_TIMEZONE}") from exc
 HTTP_DIAGNOSTIC_ONLY = os.environ.get("HTTP_DIAGNOSTIC_ONLY") == "1"
 ALLOW_INSECURE_LOOPBACK_MANAGEMENT = (
     os.environ.get("ALLOW_INSECURE_LOOPBACK_MANAGEMENT") == "1"
@@ -310,11 +319,45 @@ CREATE TABLE IF NOT EXISTS display_profile_cameras(
  profile_id TEXT NOT NULL REFERENCES display_profiles(id) ON DELETE CASCADE,
  camera_id TEXT NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
  position INTEGER NOT NULL,
+ stream_mode TEXT NOT NULL DEFAULT 'auto' CHECK(stream_mode IN ('auto','high','low','hls')),
  PRIMARY KEY(profile_id,camera_id),
  UNIQUE(profile_id,position)
 );
 CREATE INDEX IF NOT EXISTS display_profile_cameras_camera_idx
  ON display_profile_cameras(camera_id);
+CREATE TABLE IF NOT EXISTS display_devices(
+ id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, paired_at TEXT, last_seen_at TEXT
+);
+CREATE TABLE IF NOT EXISTS display_device_sessions(
+ token_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES display_devices(id) ON DELETE CASCADE,
+ expires_at INTEGER NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS display_device_sessions_device_idx
+ ON display_device_sessions(device_id,expires_at);
+CREATE TABLE IF NOT EXISTS display_pairing_codes(
+ code_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES display_devices(id) ON DELETE CASCADE,
+ expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS display_pairing_codes_device_idx
+ ON display_pairing_codes(device_id,expires_at);
+CREATE TABLE IF NOT EXISTS display_device_profiles(
+ device_id TEXT NOT NULL REFERENCES display_devices(id) ON DELETE CASCADE,
+ profile_id TEXT NOT NULL REFERENCES display_profiles(id) ON DELETE CASCADE,
+ position INTEGER NOT NULL,
+ PRIMARY KEY(device_id,profile_id),
+ UNIQUE(device_id,position)
+);
+CREATE TABLE IF NOT EXISTS display_profile_schedules(
+ id TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES display_profiles(id) ON DELETE CASCADE,
+ weekday INTEGER NOT NULL CHECK(weekday BETWEEN 0 AND 6),
+ start_minute INTEGER NOT NULL CHECK(start_minute BETWEEN 0 AND 1439),
+ end_minute INTEGER NOT NULL CHECK(end_minute BETWEEN 1 AND 1440),
+ position INTEGER NOT NULL,
+ CHECK(start_minute < end_minute)
+);
+CREATE INDEX IF NOT EXISTS display_profile_schedules_profile_idx
+ ON display_profile_schedules(profile_id,weekday,start_minute);
 CREATE TABLE IF NOT EXISTS system_events(
  id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL, event_type TEXT NOT NULL,
  severity TEXT NOT NULL CHECK(severity IN ('info','warning','critical')),
@@ -404,6 +447,18 @@ def initialize_database() -> None:
         if conn.execute("SELECT 1 FROM schema_migrations WHERE version=8").fetchone() is None:
             conn.execute(
                 "INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)",
+                (now_iso(),),
+            )
+        display_profile_camera_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(display_profile_cameras)")
+        }
+        if "stream_mode" not in display_profile_camera_columns:
+            conn.execute(
+                "ALTER TABLE display_profile_cameras ADD COLUMN stream_mode TEXT NOT NULL DEFAULT 'auto'"
+            )
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=9").fetchone() is None:
+            conn.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(9,?)",
                 (now_iso(),),
             )
         webhook_delivery_columns = {
@@ -633,6 +688,8 @@ class CameraPatch(BaseModel):
 class DisplayProfileInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     cameraIds: list[str] = Field(default_factory=list, max_length=MAX_CAMERAS)
+    cameraModes: dict[str, Literal["auto", "high", "low", "hls"]] = Field(default_factory=dict)
+    schedules: list["DisplayScheduleInput"] = Field(default_factory=list, max_length=64)
 
     @field_validator("name")
     @classmethod
@@ -641,6 +698,38 @@ class DisplayProfileInput(BaseModel):
         if not value:
             raise ValueError("profile name must not be blank")
         return value
+
+
+class DisplayScheduleInput(BaseModel):
+    weekday: int = Field(ge=0, le=6)
+    startMinute: int = Field(ge=0, le=1439)
+    endMinute: int = Field(ge=0, le=1440)
+
+    @field_validator("endMinute")
+    @classmethod
+    def valid_end(cls, value: int, info) -> int:
+        start = info.data.get("startMinute")
+        if start is not None and value == start:
+            raise ValueError("schedule range must not be empty")
+        return value
+
+
+class DisplayDeviceInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    enabled: bool = True
+    profileIds: list[str] = Field(default_factory=list, max_length=32)
+
+    @field_validator("name")
+    @classmethod
+    def clean_device_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("display device name must not be blank")
+        return value
+
+
+class DisplayPairInput(BaseModel):
+    code: str = Field(pattern=r"^\d{8}$")
 
 
 class ExternalCameraInput(BaseModel):
@@ -858,6 +947,21 @@ def hash_token(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def hash_pairing_code(value: str) -> str:
+    return hmac.new(AES_KEY, f"display-pair:{value}".encode(), hashlib.sha256).hexdigest()
+
+
+def release_display_device_leases(device_id: str | None = None) -> None:
+    prefix = f"display-{device_id}-" if device_id else "display-"
+    for camera_id, leases in list(LEASES.items()):
+        for lease_id in [
+            lease_id for lease_id in leases if lease_id.startswith(prefix)
+        ]:
+            leases.pop(lease_id, None)
+        if not leases:
+            LEASES.pop(camera_id, None)
+
+
 def session_from_request(request: FastAPIRequest) -> sqlite3.Row:
     token = request.cookies.get("pkws_session")
     if not token:
@@ -872,6 +976,76 @@ def session_from_request(request: FastAPIRequest) -> sqlite3.Row:
     if not row:
         raise HTTPException(401, "session-expired")
     return row
+
+
+def display_session_from_request(request: FastAPIRequest, *, refresh: bool = True) -> sqlite3.Row:
+    token = request.cookies.get("pkws_display")
+    if not token:
+        raise HTTPException(401, "display-authentication-required")
+    now = int(time.time())
+    with DB_LOCK, connect() as conn:
+        row = conn.execute(
+            """SELECT s.*,d.name,d.enabled,d.updated_at AS device_updated_at
+               FROM display_device_sessions s
+               JOIN display_devices d ON d.id=s.device_id
+               WHERE s.token_hash=? AND s.expires_at>? AND d.enabled=1""",
+            (hash_token(token), now),
+        ).fetchone()
+        if not row:
+            raise HTTPException(401, "display-session-expired")
+        touched = False
+        if refresh and (row["expires_at"] - now < 30 * 24 * 60 * 60):
+            conn.execute(
+                "UPDATE display_device_sessions SET expires_at=?,last_seen_at=? WHERE token_hash=?",
+                (now + DISPLAY_SESSION_SECONDS, now_iso(), row["token_hash"]),
+            )
+            touched = True
+        elif refresh:
+            last_seen = datetime.fromisoformat(row["last_seen_at"])
+            if datetime.now(timezone.utc) - last_seen >= timedelta(hours=12):
+                conn.execute(
+                    "UPDATE display_device_sessions SET last_seen_at=? WHERE token_hash=?",
+                    (now_iso(), row["token_hash"]),
+                )
+                touched = True
+        if touched:
+            conn.execute(
+                "UPDATE display_devices SET last_seen_at=? WHERE id=?",
+                (now_iso(), row["device_id"]),
+            )
+    return row
+
+
+def require_display_session(request: FastAPIRequest) -> sqlite3.Row:
+    return display_session_from_request(request)
+
+
+def require_display_same_origin(request: FastAPIRequest) -> sqlite3.Row:
+    row = display_session_from_request(request)
+    enforce_display_origin(request)
+    return row
+
+
+def enforce_display_origin(request: FastAPIRequest) -> None:
+    origin = request.headers.get("origin")
+    scheme = "https" if request_is_secure(request) else request.url.scheme
+    expected = f"{scheme}://{request.headers.get('host', '')}".rstrip("/")
+    if origin and origin.rstrip("/") != expected:
+        raise HTTPException(403, "display-origin-invalid")
+
+
+def set_display_cookie(
+    response: Response, request: FastAPIRequest, token: str
+) -> None:
+    response.set_cookie(
+        "pkws_display",
+        token,
+        max_age=DISPLAY_SESSION_SECONDS,
+        httponly=True,
+        secure=request_is_secure(request),
+        samesite="strict",
+        path="/",
+    )
 
 
 def require_session(request: FastAPIRequest) -> sqlite3.Row:
@@ -1087,6 +1261,14 @@ def create_backup_archive(passphrase: str) -> bytes:
             backup.execute("PRAGMA foreign_keys=ON")
             backup.execute("DELETE FROM sessions")
             backup.execute("DELETE FROM oauth_states")
+            if backup.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='display_device_sessions'"
+            ).fetchone():
+                backup.execute("DELETE FROM display_device_sessions")
+                backup.execute("DELETE FROM display_pairing_codes")
+                backup.execute(
+                    "UPDATE display_devices SET paired_at=NULL,last_seen_at=NULL"
+                )
             backup.commit()
             integrity = backup.execute("PRAGMA integrity_check").fetchone()[0]
             schema_version = int(
@@ -1229,14 +1411,38 @@ def validate_backup_database(database: bytes, source_key: bytes) -> tuple[dict, 
                 int(row["version"])
                 for row in candidate.execute("SELECT version FROM schema_migrations")
             }
-            if migrations != set(range(2, 9)):
-                if any(version > 8 for version in migrations):
+            schema_version = max(migrations) if migrations else 0
+            if schema_version not in {8, 9} or migrations != set(range(2, schema_version + 1)):
+                if any(version > 9 for version in migrations):
                     raise HTTPException(422, "backup-schema-newer-than-application")
                 raise HTTPException(422, "backup-migrations-incomplete")
-            schema_version = max(migrations)
+            if schema_version >= 9:
+                display_signature = {
+                    "display_devices": {"id", "name", "enabled"},
+                    "display_device_sessions": {"token_hash", "device_id", "expires_at"},
+                    "display_pairing_codes": {"code_hash", "device_id", "expires_at"},
+                    "display_device_profiles": {"device_id", "profile_id", "position"},
+                    "display_profile_schedules": {
+                        "id", "profile_id", "weekday", "start_minute", "end_minute"
+                    },
+                }
+                if not set(display_signature).issubset(tables):
+                    raise HTTPException(422, "backup-schema-invalid")
+                for table, required_columns in display_signature.items():
+                    columns = {
+                        row["name"] for row in candidate.execute(f"PRAGMA table_info({table})")
+                    }
+                    if not required_columns.issubset(columns):
+                        raise HTTPException(422, "backup-schema-invalid")
+                profile_columns = {
+                    row["name"]
+                    for row in candidate.execute("PRAGMA table_info(display_profile_cameras)")
+                }
+                if "stream_mode" not in profile_columns:
+                    raise HTTPException(422, "backup-schema-invalid")
             if candidate.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise HTTPException(422, "backup-foreign-keys-invalid")
-            if schema_version > 8:
+            if schema_version > 9:
                 raise HTTPException(422, "backup-schema-newer-than-application")
             sensitive_columns = {
                 "credentials": ("username_ct", "password_ct"),
@@ -1267,6 +1473,14 @@ def validate_backup_database(database: bytes, source_key: bytes) -> tuple[dict, 
                 candidate.execute("DELETE FROM sessions")
             if "oauth_states" in tables:
                 candidate.execute("DELETE FROM oauth_states")
+            if "display_device_sessions" in tables:
+                candidate.execute("DELETE FROM display_device_sessions")
+            if "display_pairing_codes" in tables:
+                candidate.execute("DELETE FROM display_pairing_codes")
+            if "display_devices" in tables:
+                candidate.execute(
+                    "UPDATE display_devices SET paired_at=NULL,last_seen_at=NULL"
+                )
             candidate.commit()
             if candidate.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise HTTPException(422, "backup-foreign-keys-invalid")
@@ -1308,6 +1522,12 @@ def restore_backup_database(candidate_path: Path, actor_id: str) -> str:
                 if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise RuntimeError("restored database failed foreign key check")
                 conn.execute("DELETE FROM sessions")
+                conn.execute("DELETE FROM display_device_sessions")
+                conn.execute("DELETE FROM display_pairing_codes")
+                conn.execute(
+                    "UPDATE display_devices SET paired_at=NULL,last_seen_at=NULL"
+                )
+                release_display_device_leases()
                 audit(conn, actor_id, "system.backup.restored", "backup")
             return rollback_path.name
         except Exception:
@@ -1693,7 +1913,7 @@ def issue_session(response: Response, request: FastAPIRequest, user: sqlite3.Row
     }
 
 
-def public_camera(row: sqlite3.Row) -> dict:
+def public_camera(row: sqlite3.Row, stream_mode: str = "auto") -> dict:
     external_source = row["protocol"] == "external"
     with connect() as conn:
         capability_row = None if external_source else conn.execute(
@@ -1730,6 +1950,7 @@ def public_camera(row: sqlite3.Row) -> dict:
         "onDemand": bool(row["on_demand"]),
         "highWebRTCCompatible": bool(row["high_webrtc_compatible"]),
         "compatibilityRelay": bool(row["force_transcode"]),
+        "streamMode": stream_mode,
         "displayMode": "snapshot" if row["protocol"] == "snapshot" else "stream",
         "snapshotPath": f"/api/cameras/{row['id']}/snapshot" if row["protocol"] == "snapshot" else None,
         "features": {
@@ -1979,6 +2200,34 @@ def media_paths() -> tuple[dict[str, dict], bool]:
         return {item.get("name", ""): item for item in payload.get("items", [])}, True
     except Exception:
         return {}, False
+
+
+def passive_runtime_metrics() -> dict:
+    rss_bytes = None
+    try:
+        resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
+        rss_bytes = resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, ValueError, IndexError):
+        pass
+    result = {
+        "processRssBytes": rss_bytes,
+        "hlsMuxers": None,
+        "hlsSessions": None,
+        "webRtcSessions": None,
+    }
+    for key, resource in (
+        ("hlsMuxers", "hlsmuxers"),
+        ("hlsSessions", "hlssessions"),
+        ("webRtcSessions", "webrtcsessions"),
+    ):
+        try:
+            with urlopen(
+                f"{MEDIAMTX_API}/v3/{resource}/list", timeout=2
+            ) as response:
+                result[key] = int(json.load(response).get("itemCount", 0))
+        except Exception:
+            pass
+    return result
 
 
 def mediamtx_config_request(path: str, method: str = "GET", payload: dict | None = None) -> dict:
@@ -2237,8 +2486,44 @@ def logout(request: FastAPIRequest, response: Response, _: sqlite3.Row = Depends
     return {"ok": True}
 
 
+def requested_media_path(request: FastAPIRequest) -> str | None:
+    raw = (
+        request.headers.get("x-forwarded-uri")
+        or request.headers.get("x-original-uri")
+        or ""
+    ).split("?", 1)[0]
+    match = re.match(r"^/(?:whep|hls)/(.+?)(?:/whep)?/?$", raw)
+    return unquote(match.group(1)) if match else None
+
+
 @app.get("/api/auth/authorize")
-def authorize_media(_: sqlite3.Row = Depends(require_session)):
+def authorize_media(request: FastAPIRequest):
+    try:
+        session_from_request(request)
+        return Response(status_code=204)
+    except HTTPException:
+        display = display_session_from_request(request)
+    media_path = requested_media_path(request)
+    if not media_path:
+        raise HTTPException(403, "display-media-path-invalid")
+    with connect() as conn:
+        active, _ = active_display_profile(conn, display["device_id"])
+        if not active:
+            raise HTTPException(403, "display-profile-inactive")
+        permitted = conn.execute(
+            """SELECT 1 FROM display_profile_cameras dpc
+               JOIN cameras c ON c.id=dpc.camera_id
+               WHERE dpc.profile_id=? AND c.enabled=1
+                 AND (
+                   (dpc.stream_mode IN ('auto','low') AND c.low_path=?)
+                   OR
+                   (dpc.stream_mode IN ('high','hls')
+                    AND COALESCE(NULLIF(c.high_path,''),c.low_path)=?)
+                 )""",
+            (active["id"], media_path, media_path),
+        ).fetchone()
+    if not permitted:
+        raise HTTPException(403, "display-media-not-assigned")
     return Response(status_code=204)
 
 
@@ -2853,17 +3138,31 @@ def delete_webhook_target(
 
 
 def display_profile_payload(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
-    camera_ids = [
-        item["camera_id"]
-        for item in conn.execute(
-            "SELECT camera_id FROM display_profile_cameras WHERE profile_id=? ORDER BY position",
-            (row["id"],),
-        )
-    ]
+    camera_rows = conn.execute(
+        """SELECT camera_id,stream_mode FROM display_profile_cameras
+           WHERE profile_id=? ORDER BY position""",
+        (row["id"],),
+    ).fetchall()
+    schedules = conn.execute(
+        """SELECT weekday,start_minute,end_minute FROM display_profile_schedules
+           WHERE profile_id=? ORDER BY position,id""",
+        (row["id"],),
+    ).fetchall()
     return {
         "id": row["id"],
         "name": row["name"],
-        "cameraIds": camera_ids,
+        "cameraIds": [item["camera_id"] for item in camera_rows],
+        "cameraModes": {
+            item["camera_id"]: item["stream_mode"] for item in camera_rows
+        },
+        "schedules": [
+            {
+                "weekday": item["weekday"],
+                "startMinute": item["start_minute"],
+                "endMinute": item["end_minute"],
+            }
+            for item in schedules
+        ],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
@@ -2887,12 +3186,53 @@ def validate_display_profile_cameras(conn: sqlite3.Connection, camera_ids: list[
 
 
 def replace_display_profile_cameras(
-    conn: sqlite3.Connection, profile_id: str, camera_ids: list[str]
+    conn: sqlite3.Connection,
+    profile_id: str,
+    camera_ids: list[str],
+    camera_modes: dict[str, str] | None = None,
 ) -> None:
+    camera_modes = camera_modes or {}
+    if set(camera_modes) - set(camera_ids):
+        raise HTTPException(400, "camera-mode-not-selected")
     conn.execute("DELETE FROM display_profile_cameras WHERE profile_id=?", (profile_id,))
     conn.executemany(
-        "INSERT INTO display_profile_cameras(profile_id,camera_id,position) VALUES(?,?,?)",
-        [(profile_id, camera_id, position) for position, camera_id in enumerate(camera_ids)],
+        """INSERT INTO display_profile_cameras(
+           profile_id,camera_id,position,stream_mode) VALUES(?,?,?,?)""",
+        [
+            (profile_id, camera_id, position, camera_modes.get(camera_id, "auto"))
+            for position, camera_id in enumerate(camera_ids)
+        ],
+    )
+
+
+def replace_display_profile_schedules(
+    conn: sqlite3.Connection,
+    profile_id: str,
+    schedules: list[DisplayScheduleInput],
+) -> None:
+    conn.execute("DELETE FROM display_profile_schedules WHERE profile_id=?", (profile_id,))
+    expanded: list[tuple[int, int, int]] = []
+    for item in schedules:
+        if item.endMinute > item.startMinute:
+            expanded.append((item.weekday, item.startMinute, item.endMinute))
+        else:
+            expanded.append((item.weekday, item.startMinute, 1440))
+            if item.endMinute > 0:
+                expanded.append(((item.weekday + 1) % 7, 0, item.endMinute))
+    conn.executemany(
+        """INSERT INTO display_profile_schedules(
+           id,profile_id,weekday,start_minute,end_minute,position) VALUES(?,?,?,?,?,?)""",
+        [
+            (
+                str(uuid.uuid4()),
+                profile_id,
+                weekday,
+                start_minute,
+                end_minute,
+                position,
+            )
+            for position, (weekday, start_minute, end_minute) in enumerate(expanded)
+        ],
     )
 
 
@@ -2941,7 +3281,8 @@ def create_display_profile(
                     stamp,
                 ),
             )
-            replace_display_profile_cameras(conn, profile_id, body.cameraIds)
+            replace_display_profile_cameras(conn, profile_id, body.cameraIds, body.cameraModes)
+            replace_display_profile_schedules(conn, profile_id, body.schedules)
             row = conn.execute(
                 "SELECT * FROM display_profiles WHERE id=?", (profile_id,)
             ).fetchone()
@@ -2972,7 +3313,8 @@ def update_display_profile(
                 "UPDATE display_profiles SET name=?,name_key=?,updated_at=? WHERE id=?",
                 (body.name, body.name.casefold(), now_iso(), profile_id),
             )
-            replace_display_profile_cameras(conn, profile_id, body.cameraIds)
+            replace_display_profile_cameras(conn, profile_id, body.cameraIds, body.cameraModes)
+            replace_display_profile_schedules(conn, profile_id, body.schedules)
             row = conn.execute(
                 "SELECT * FROM display_profiles WHERE id=?", (profile_id,)
             ).fetchone()
@@ -2998,6 +3340,467 @@ def delete_display_profile(
     return Response(status_code=204)
 
 
+def replace_display_device_profiles(
+    conn: sqlite3.Connection,
+    device_id: str,
+    profile_ids: list[str],
+    owner_id: str,
+) -> None:
+    if len(set(profile_ids)) != len(profile_ids):
+        raise HTTPException(400, "duplicate-display-profile")
+    if profile_ids:
+        placeholders = ",".join("?" for _ in profile_ids)
+        existing = {
+            row["id"]
+            for row in conn.execute(
+                f"""SELECT id FROM display_profiles
+                    WHERE user_id=? AND id IN ({placeholders})""",
+                [owner_id, *profile_ids],
+            )
+        }
+        if existing != set(profile_ids):
+            raise HTTPException(400, "display-profile-not-owned")
+    conn.execute("DELETE FROM display_device_profiles WHERE device_id=?", (device_id,))
+    conn.executemany(
+        """INSERT INTO display_device_profiles(device_id,profile_id,position)
+           VALUES(?,?,?)""",
+        [
+            (device_id, profile_id, position)
+            for position, profile_id in enumerate(profile_ids)
+        ],
+    )
+
+
+def display_device_payload(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    profiles = conn.execute(
+        """SELECT p.id,p.name,ddp.position
+           FROM display_device_profiles ddp
+           JOIN display_profiles p ON p.id=ddp.profile_id
+           WHERE ddp.device_id=? ORDER BY ddp.position""",
+        (row["id"],),
+    ).fetchall()
+    paired = conn.execute(
+        """SELECT 1 FROM display_device_sessions
+           WHERE device_id=? AND expires_at>? LIMIT 1""",
+        (row["id"], int(time.time())),
+    ).fetchone()
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "enabled": bool(row["enabled"]),
+        "profileIds": [item["id"] for item in profiles],
+        "profiles": [
+            {"id": item["id"], "name": item["name"], "priority": item["position"]}
+            for item in profiles
+        ],
+        "paired": bool(paired),
+        "pairedAt": row["paired_at"],
+        "lastSeenAt": row["last_seen_at"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def profile_active_at(
+    conn: sqlite3.Connection, profile_id: str, local_now: datetime
+) -> bool:
+    windows = conn.execute(
+        """SELECT weekday,start_minute,end_minute FROM display_profile_schedules
+           WHERE profile_id=?""",
+        (profile_id,),
+    ).fetchall()
+    if not windows:
+        return True
+    minute = local_now.hour * 60 + local_now.minute
+    return any(
+        row["weekday"] == local_now.weekday()
+        and row["start_minute"] <= minute < row["end_minute"]
+        for row in windows
+    )
+
+
+def next_profile_start(
+    conn: sqlite3.Connection, device_id: str, local_now: datetime
+) -> tuple[datetime, sqlite3.Row] | None:
+    rows = conn.execute(
+        """SELECT p.*,ddp.position AS device_position,s.weekday,s.start_minute
+           FROM display_device_profiles ddp
+           JOIN display_profiles p ON p.id=ddp.profile_id
+           JOIN display_profile_schedules s ON s.profile_id=p.id
+           WHERE ddp.device_id=?
+           ORDER BY ddp.position,s.position""",
+        (device_id,),
+    ).fetchall()
+    candidates: list[tuple[datetime, int, sqlite3.Row]] = []
+    for row in rows:
+        days = (row["weekday"] - local_now.weekday()) % 7
+        candidate_date = (local_now + timedelta(days=days)).date()
+        candidate = datetime(
+            candidate_date.year,
+            candidate_date.month,
+            candidate_date.day,
+            row["start_minute"] // 60,
+            row["start_minute"] % 60,
+            tzinfo=DISPLAY_TIMEZONE,
+        )
+        # A weekly wall-clock time can fall into the skipped hour when daylight
+        # saving time starts. A UTC round-trip normalizes that gap to the first
+        # real local instant (for example 02:30 becomes 03:30 in Europe/Berlin).
+        normalized = candidate.astimezone(timezone.utc).astimezone(DISPLAY_TIMEZONE)
+        if normalized.replace(tzinfo=None) != candidate.replace(tzinfo=None):
+            candidate = normalized
+        if candidate <= local_now:
+            candidate += timedelta(days=7)
+        candidates.append((candidate, row["device_position"], row))
+    if not candidates:
+        return None
+    candidate, _, row = min(candidates, key=lambda item: (item[0], item[1]))
+    return candidate, row
+
+
+def active_display_profile(
+    conn: sqlite3.Connection,
+    device_id: str,
+    at: datetime | None = None,
+) -> tuple[sqlite3.Row | None, tuple[datetime, sqlite3.Row] | None]:
+    local_now = (at or datetime.now(timezone.utc)).astimezone(DISPLAY_TIMEZONE)
+    profiles = conn.execute(
+        """SELECT p.*,ddp.position AS device_position
+           FROM display_device_profiles ddp
+           JOIN display_profiles p ON p.id=ddp.profile_id
+           WHERE ddp.device_id=? ORDER BY ddp.position""",
+        (device_id,),
+    ).fetchall()
+    for profile in profiles:
+        if profile_active_at(conn, profile["id"], local_now):
+            return profile, None
+    return None, next_profile_start(conn, device_id, local_now)
+
+
+def display_state_payload(conn: sqlite3.Connection, display: sqlite3.Row) -> dict:
+    active, next_start = active_display_profile(conn, display["device_id"])
+    profile_revision = (
+        active["updated_at"]
+        if active
+        else (next_start[1]["updated_at"] if next_start else "")
+    )
+    camera_revision = ""
+    if active:
+        camera_state = conn.execute(
+            """SELECT COUNT(*) AS camera_count,
+                      COALESCE(MAX(c.updated_at),'') AS camera_updated_at
+               FROM display_profile_cameras dpc
+               JOIN cameras c ON c.id=dpc.camera_id
+               WHERE dpc.profile_id=?""",
+            (active["id"],),
+        ).fetchone()
+        camera_revision = (
+            f"{camera_state['camera_count']}:{camera_state['camera_updated_at']}"
+        )
+    return {
+        "paired": True,
+        "device": {"id": display["device_id"], "name": display["name"]},
+        "timezone": CAMERA_HUB_TIMEZONE,
+        "active": bool(active),
+        "profile": (
+            {"id": active["id"], "name": active["name"]} if active else None
+        ),
+        "nextProfileStart": (
+            next_start[0].astimezone(timezone.utc).isoformat() if next_start else None
+        ),
+        "nextProfileName": next_start[1]["name"] if next_start else None,
+        "configRevision": (
+            f"{display['device_updated_at']}:{profile_revision}:{camera_revision}"
+        ),
+    }
+
+
+def display_camera_is_active(
+    conn: sqlite3.Connection, device_id: str, camera_id: str
+) -> bool:
+    active, _ = active_display_profile(conn, device_id)
+    if not active:
+        return False
+    return bool(
+        conn.execute(
+            """SELECT 1 FROM display_profile_cameras dpc
+               JOIN cameras c ON c.id=dpc.camera_id
+               WHERE dpc.profile_id=? AND dpc.camera_id=? AND c.enabled=1""",
+            (active["id"], camera_id),
+        ).fetchone()
+    )
+
+
+@app.get("/api/owner/display-devices")
+def list_display_devices(actor: sqlite3.Row = Depends(require_owner)):
+    with connect() as conn:
+        devices = conn.execute(
+            "SELECT * FROM display_devices ORDER BY name COLLATE NOCASE,id"
+        ).fetchall()
+        profiles = conn.execute(
+            """SELECT id,name FROM display_profiles WHERE user_id=?
+               ORDER BY name COLLATE NOCASE,id""",
+            (actor["user_id"],),
+        ).fetchall()
+        payload = [display_device_payload(conn, row) for row in devices]
+    return {
+        "devices": payload,
+        "profileOptions": [{"id": row["id"], "name": row["name"]} for row in profiles],
+    }
+
+
+@app.post("/api/owner/display-devices", status_code=201)
+def create_display_device(
+    body: DisplayDeviceInput,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    device_id, stamp = str(uuid.uuid4()), now_iso()
+    with DB_LOCK, connect() as conn:
+        conn.execute(
+            """INSERT INTO display_devices(
+               id,name,enabled,created_at,updated_at) VALUES(?,?,?,?,?)""",
+            (device_id, body.name, int(body.enabled), stamp, stamp),
+        )
+        replace_display_device_profiles(
+            conn, device_id, body.profileIds, actor["user_id"]
+        )
+        audit(conn, actor["user_id"], "display-device.created", "display-device", device_id)
+        result = display_device_payload(
+            conn,
+            conn.execute("SELECT * FROM display_devices WHERE id=?", (device_id,)).fetchone(),
+        )
+    return result
+
+
+@app.put("/api/owner/display-devices/{device_id}")
+def update_display_device(
+    device_id: str,
+    body: DisplayDeviceInput,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    with DB_LOCK, connect() as conn:
+        row = conn.execute("SELECT * FROM display_devices WHERE id=?", (device_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "display-device-not-found")
+        conn.execute(
+            "UPDATE display_devices SET name=?,enabled=?,updated_at=? WHERE id=?",
+            (body.name, int(body.enabled), now_iso(), device_id),
+        )
+        replace_display_device_profiles(
+            conn, device_id, body.profileIds, actor["user_id"]
+        )
+        if not body.enabled:
+            conn.execute("DELETE FROM display_device_sessions WHERE device_id=?", (device_id,))
+        audit(conn, actor["user_id"], "display-device.updated", "display-device", device_id)
+        result = display_device_payload(
+            conn,
+            conn.execute("SELECT * FROM display_devices WHERE id=?", (device_id,)).fetchone(),
+        )
+    if not body.enabled:
+        release_display_device_leases(device_id)
+    return result
+
+
+@app.delete("/api/owner/display-devices/{device_id}")
+def delete_display_device(
+    device_id: str,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    with DB_LOCK, connect() as conn:
+        deleted = conn.execute("DELETE FROM display_devices WHERE id=?", (device_id,))
+        if deleted.rowcount != 1:
+            raise HTTPException(404, "display-device-not-found")
+        audit(conn, actor["user_id"], "display-device.deleted", "display-device", device_id)
+    release_display_device_leases(device_id)
+    return Response(status_code=204)
+
+
+@app.post("/api/owner/display-devices/{device_id}/pairing-code")
+def create_display_pairing_code(
+    device_id: str,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    with DB_LOCK, connect() as conn:
+        device = conn.execute(
+            "SELECT * FROM display_devices WHERE id=? AND enabled=1", (device_id,)
+        ).fetchone()
+        if not device:
+            raise HTTPException(404, "display-device-not-found")
+        conn.execute("DELETE FROM display_pairing_codes WHERE device_id=?", (device_id,))
+        for _ in range(20):
+            code = f"{secrets.randbelow(100_000_000):08d}"
+            try:
+                conn.execute(
+                    """INSERT INTO display_pairing_codes(
+                       code_hash,device_id,expires_at,attempts,created_at)
+                       VALUES(?,?,?,0,?)""",
+                    (
+                        hash_pairing_code(code),
+                        device_id,
+                        int(time.time()) + DISPLAY_PAIRING_SECONDS,
+                        now_iso(),
+                    ),
+                )
+                break
+            except sqlite3.IntegrityError:
+                continue
+        else:
+            raise HTTPException(503, "pairing-code-generation-failed")
+        audit(conn, actor["user_id"], "display-device.pairing-code", "display-device", device_id)
+    return {"code": code, "expiresIn": DISPLAY_PAIRING_SECONDS}
+
+
+@app.post("/api/owner/display-devices/{device_id}/revoke")
+def revoke_display_device(
+    device_id: str,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    with DB_LOCK, connect() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM display_devices WHERE id=?", (device_id,)
+        ).fetchone():
+            raise HTTPException(404, "display-device-not-found")
+        conn.execute("DELETE FROM display_device_sessions WHERE device_id=?", (device_id,))
+        conn.execute("DELETE FROM display_pairing_codes WHERE device_id=?", (device_id,))
+        conn.execute(
+            "UPDATE display_devices SET paired_at=NULL,updated_at=? WHERE id=?",
+            (now_iso(), device_id),
+        )
+        audit(conn, actor["user_id"], "display-device.revoked", "display-device", device_id)
+    release_display_device_leases(device_id)
+    return {"ok": True}
+
+
+def enforce_display_pair_rate_limit(request: FastAPIRequest, code_hash: str) -> None:
+    now = time.time()
+    keys = (f"ip:{effective_client_ip(request)}", f"code:{code_hash}")
+    for key, maximum in ((keys[0], 12), (keys[1], 6)):
+        attempts = [stamp for stamp in DISPLAY_PAIR_ATTEMPTS.get(key, []) if now - stamp < 600]
+        if len(attempts) >= maximum:
+            raise HTTPException(429, "display-pair-rate-limited")
+        attempts.append(now)
+        DISPLAY_PAIR_ATTEMPTS[key] = attempts
+
+
+@app.post("/api/display/pair")
+def pair_display(body: DisplayPairInput, request: FastAPIRequest, response: Response):
+    enforce_display_origin(request)
+    code_hash = hash_pairing_code(body.code)
+    enforce_display_pair_rate_limit(request, code_hash)
+    now, stamp = int(time.time()), now_iso()
+    with DB_LOCK, connect() as conn:
+        conn.execute("DELETE FROM display_pairing_codes WHERE expires_at<=?", (now,))
+        pairing = conn.execute(
+            """SELECT pc.*,d.name,d.enabled FROM display_pairing_codes pc
+               JOIN display_devices d ON d.id=pc.device_id
+               WHERE pc.code_hash=?""",
+            (code_hash,),
+        ).fetchone()
+        if not pairing or not pairing["enabled"]:
+            raise HTTPException(400, "display-pair-code-invalid")
+        if pairing["attempts"] >= 5:
+            conn.execute("DELETE FROM display_pairing_codes WHERE code_hash=?", (code_hash,))
+            raise HTTPException(429, "display-pair-code-locked")
+        conn.execute(
+            "UPDATE display_pairing_codes SET attempts=attempts+1 WHERE code_hash=?",
+            (code_hash,),
+        )
+        token = secrets.token_urlsafe(32)
+        conn.execute("DELETE FROM display_pairing_codes WHERE code_hash=?", (code_hash,))
+        conn.execute(
+            "DELETE FROM display_device_sessions WHERE device_id=?",
+            (pairing["device_id"],),
+        )
+        conn.execute(
+            """INSERT INTO display_device_sessions(
+               token_hash,device_id,expires_at,created_at,last_seen_at)
+               VALUES(?,?,?,?,?)""",
+            (
+                hash_token(token),
+                pairing["device_id"],
+                now + DISPLAY_SESSION_SECONDS,
+                stamp,
+                stamp,
+            ),
+        )
+        conn.execute(
+            """UPDATE display_devices SET paired_at=?,last_seen_at=?,updated_at=?
+               WHERE id=?""",
+            (stamp, stamp, stamp, pairing["device_id"]),
+        )
+        display = conn.execute(
+            """SELECT s.*,d.name,d.enabled,d.updated_at AS device_updated_at
+               FROM display_device_sessions s JOIN display_devices d ON d.id=s.device_id
+               WHERE s.token_hash=?""",
+            (hash_token(token),),
+        ).fetchone()
+        state = display_state_payload(conn, display)
+    release_display_device_leases(pairing["device_id"])
+    set_display_cookie(response, request, token)
+    return state
+
+
+@app.post("/api/display/logout")
+def logout_display(
+    request: FastAPIRequest,
+    response: Response,
+    display: sqlite3.Row = Depends(require_display_same_origin),
+):
+    token = request.cookies.get("pkws_display", "")
+    with DB_LOCK, connect() as conn:
+        conn.execute(
+            "DELETE FROM display_device_sessions WHERE token_hash=?",
+            (hash_token(token),),
+        )
+    release_display_device_leases(display["device_id"])
+    response.delete_cookie("pkws_display", path="/")
+    return {"ok": True}
+
+
+@app.get("/api/display/state")
+def get_display_state(
+    request: FastAPIRequest,
+    response: Response,
+    display: sqlite3.Row = Depends(require_display_session),
+):
+    with connect() as conn:
+        payload = display_state_payload(conn, display)
+    set_display_cookie(response, request, request.cookies["pkws_display"])
+    return payload
+
+
+@app.get("/api/display/cameras")
+def get_display_cameras(display: sqlite3.Row = Depends(require_display_session)):
+    with connect() as conn:
+        active, next_start = active_display_profile(conn, display["device_id"])
+        if not active:
+            return {
+                "active": False,
+                "cameras": [],
+                "nextProfileStart": (
+                    next_start[0].astimezone(timezone.utc).isoformat()
+                    if next_start
+                    else None
+                ),
+            }
+        rows = conn.execute(
+            """SELECT c.*,dpc.stream_mode AS profile_stream_mode
+               FROM display_profile_cameras dpc
+               JOIN cameras c ON c.id=dpc.camera_id
+               WHERE dpc.profile_id=? AND c.enabled=1
+               ORDER BY dpc.position""",
+            (active["id"],),
+        ).fetchall()
+        cameras = [
+            public_camera(row, row["profile_stream_mode"]) for row in rows
+        ]
+    return {
+        "active": True,
+        "profile": {"id": active["id"], "name": active["name"]},
+        "cameras": cameras,
+    }
+
+
 @app.get("/api/cameras")
 def list_cameras(
     profileId: str | None = None, current: sqlite3.Row = Depends(require_session)
@@ -3011,7 +3814,8 @@ def list_cameras(
             if not profile:
                 raise HTTPException(404, "display-profile-not-found")
             rows = conn.execute(
-                """SELECT c.* FROM display_profile_cameras dpc
+                """SELECT c.*,dpc.stream_mode AS profile_stream_mode
+                   FROM display_profile_cameras dpc
                    JOIN cameras c ON c.id=dpc.camera_id
                    WHERE dpc.profile_id=? AND c.enabled=1
                    ORDER BY dpc.position""",
@@ -3021,7 +3825,17 @@ def list_cameras(
             rows = conn.execute(
                 "SELECT * FROM cameras WHERE enabled=1 ORDER BY position"
             ).fetchall()
-    return {"cameras": [public_camera(row) for row in rows]}
+    return {
+        "cameras": [
+            public_camera(
+                row,
+                row["profile_stream_mode"]
+                if "profile_stream_mode" in row.keys()
+                else "auto",
+            )
+            for row in rows
+        ]
+    }
 
 
 @app.get("/api/admin/cameras")
@@ -3037,7 +3851,14 @@ def health(_: sqlite3.Row = Depends(require_session)):
     paths, ok = media_paths()
     with connect() as conn:
         rows = conn.execute("SELECT * FROM cameras WHERE enabled=1 ORDER BY position").fetchall()
-    return JSONResponse({"mediaMTX": "online" if ok else "offline", "cameras": [camera_status(row, paths, ok) for row in rows]}, status_code=200 if ok else 503)
+    return JSONResponse(
+        {
+            "mediaMTX": "online" if ok else "offline",
+            "cameras": [camera_status(row, paths, ok) for row in rows],
+            "runtime": passive_runtime_metrics(),
+        },
+        status_code=200 if ok else 503,
+    )
 
 
 @app.get("/healthz")
@@ -4690,9 +5511,21 @@ def put_zones(camera_id: str, body: ZonesUpdate, _: sqlite3.Row = Depends(requir
     return {"cameraId": camera_id, "revision": revision}
 
 
+def require_camera_media_access(
+    camera_id: str, request: FastAPIRequest
+) -> sqlite3.Row:
+    try:
+        return session_from_request(request)
+    except HTTPException:
+        display = display_session_from_request(request)
+    with connect() as conn:
+        require_active_display_camera(conn, display, camera_id)
+    return display
+
+
 @app.get("/api/cameras/{camera_id}/snapshot")
 @app.get("/api/admin/cameras/{camera_id}/preview")
-def preview(camera_id: str, _: sqlite3.Row = Depends(require_session)):
+def preview(camera_id: str, _: sqlite3.Row = Depends(require_camera_media_access)):
     cached = PREVIEW_CACHE.get(camera_id)
     if cached and cached[0] > time.time():
         return Response(cached[1], media_type="image/jpeg", headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
@@ -4813,6 +5646,59 @@ def renew_lease(camera_id: str, leaseId: str | None = None, _: sqlite3.Row = Dep
 def release_lease(camera_id: str, leaseId: str | None = None, _: sqlite3.Row = Depends(require_csrf)):
     if not leaseId:
         raise HTTPException(400, "lease-id-required")
+    leases = LEASES.get(camera_id)
+    if leases:
+        leases.pop(leaseId, None)
+        if not leases:
+            LEASES.pop(camera_id, None)
+    return Response(status_code=204)
+
+
+def require_active_display_camera(
+    conn: sqlite3.Connection, display: sqlite3.Row, camera_id: str
+) -> None:
+    if not display_camera_is_active(conn, display["device_id"], camera_id):
+        raise HTTPException(404, "display-camera-not-assigned")
+
+
+@app.post("/api/display/cameras/{camera_id}/lease")
+def acquire_display_lease(
+    camera_id: str,
+    display: sqlite3.Row = Depends(require_display_same_origin),
+):
+    with connect() as conn:
+        require_active_display_camera(conn, display, camera_id)
+    lease_id = f"display-{display['device_id']}-{secrets.token_urlsafe(12)}"
+    active_camera_leases(camera_id)
+    LEASES.setdefault(camera_id, {})[lease_id] = time.time() + 90
+    return {"cameraId": camera_id, "leaseId": lease_id, "expiresIn": 90}
+
+
+@app.put("/api/display/cameras/{camera_id}/lease")
+def renew_display_lease(
+    camera_id: str,
+    leaseId: str | None = None,
+    display: sqlite3.Row = Depends(require_display_same_origin),
+):
+    if not leaseId or not leaseId.startswith(f"display-{display['device_id']}-"):
+        raise HTTPException(400, "lease-id-invalid")
+    with connect() as conn:
+        require_active_display_camera(conn, display, camera_id)
+    leases = active_camera_leases(camera_id)
+    if leaseId not in leases:
+        raise HTTPException(404, "lease-not-found")
+    leases[leaseId] = time.time() + 90
+    return {"cameraId": camera_id, "leaseId": leaseId, "expiresIn": 90}
+
+
+@app.delete("/api/display/cameras/{camera_id}/lease")
+def release_display_lease(
+    camera_id: str,
+    leaseId: str | None = None,
+    display: sqlite3.Row = Depends(require_display_same_origin),
+):
+    if not leaseId or not leaseId.startswith(f"display-{display['device_id']}-"):
+        raise HTTPException(400, "lease-id-invalid")
     leases = LEASES.get(camera_id)
     if leases:
         leases.pop(leaseId, None)
