@@ -8,7 +8,7 @@
   const mediaHost = location.hostname;
   const sameOriginMedia = !['127.0.0.1', 'localhost'].includes(mediaHost);
   const whepUrl = (path) => sameOriginMedia ? `${location.origin}/whep/${encodeURIComponent(path)}/whep` : `http://${mediaHost}:8889/${encodeURIComponent(path)}/whep`;
-  const hlsUrl = (path) => sameOriginMedia ? `${location.origin}/hls/${encodeURIComponent(path)}?autoplay=true&muted=true&controls=true&playsInline=true` : `http://${mediaHost}:8888/${encodeURIComponent(path)}?autoplay=true&muted=true&controls=true&playsInline=true`;
+  const hlsUrl = (path) => sameOriginMedia ? `${location.origin}/hls/${encodeURIComponent(path)}/?autoplay=true&muted=true&controls=true&playsInline=true` : `http://${mediaHost}:8888/${encodeURIComponent(path)}/?autoplay=true&muted=true&controls=true&playsInline=true`;
   const toast = (message) => { const node=$('#toast'); node.textContent=message; node.hidden=false; clearTimeout(node.timer); node.timer=setTimeout(()=>node.hidden=true,3500); };
   const relativeTime = (value) => value ? new Intl.DateTimeFormat('de-DE',{hour:'2-digit',minute:'2-digit',second:'2-digit'}).format(new Date(value)) : '–';
   function hashRoute(){
@@ -84,9 +84,33 @@
       if(!$('#wall-controls').contains(document.activeElement))document.body.classList.remove('wall-controls-visible');
     },3500);
   }
+  function updateWallGridLayout(){
+    if(!appState.wallMode)return;
+    const grid=$('#camera-grid'),count=Math.max(0,appState.cameras.length);
+    if(!grid)return;
+    if(count<=1){
+      grid.style.setProperty('--wall-columns','1');
+      grid.style.setProperty('--wall-rows','1');
+      return;
+    }
+    const width=Math.max(1,window.innerWidth),height=Math.max(1,window.innerHeight);
+    const portrait=height>width;
+    const minColumns=portrait?(count<=2?1:2):(count<=3?count:2);
+    const maxColumns=Math.min(count,portrait?4:8);
+    let best={columns:minColumns,rows:Math.ceil(count/minColumns),score:Number.POSITIVE_INFINITY};
+    for(let columns=minColumns;columns<=maxColumns;columns+=1){
+      const rows=Math.ceil(count/columns);
+      const tileAspect=(width/columns)/(height/rows);
+      const emptyCells=(columns*rows-count)/(columns*rows);
+      const score=Math.abs(Math.log(tileAspect/(16/9)))+emptyCells*.18;
+      if(score<best.score)best={columns,rows,score};
+    }
+    grid.style.setProperty('--wall-columns',String(best.columns));
+    grid.style.setProperty('--wall-rows',String(best.rows));
+  }
   function enterWallMode(nativeFullscreen=true){
     const enterButton=$('#enter-wall-mode'),controls=$('#wall-controls');if(!appState.csrf||appState.wallMode||!enterButton||!controls)return;
-    closeMenu(false);appState.wallMode=true;document.body.classList.add('wall-mode');controls.hidden=false;enterButton.setAttribute('aria-pressed','true');document.title='Camera Hub · Leitstelle';history.replaceState(null,'',liveHash('wall'));revealWallControls();
+    closeMenu(false);appState.wallMode=true;document.body.classList.add('wall-mode');controls.hidden=false;enterButton.setAttribute('aria-pressed','true');document.title='Camera Hub · Leitstelle';history.replaceState(null,'',liveHash('wall'));updateWallGridLayout();revealWallControls();
     appState.states.forEach(state=>{state.visible=true;if(!state.reader&&state.camera.displayMode!=='snapshot')connect(state,state.camera.lowPath,'low',true);});
     if(nativeFullscreen&&!document.fullscreenElement&&document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(()=>{});
   }
@@ -97,7 +121,7 @@
   }
 
   function closeReader(state,release=true){
-    if(!state) return; clearTimeout(state.retryTimer); clearTimeout(state.startupTimer); clearTimeout(state.snapshotTimer); state.retryTimer=state.startupTimer=state.snapshotTimer=null; state.generation+=1;
+    if(!state) return; clearTimeout(state.retryTimer); clearTimeout(state.startupTimer); clearTimeout(state.snapshotTimer); clearTimeout(state.hlsTimer); state.retryTimer=state.startupTimer=state.snapshotTimer=state.hlsTimer=null; state.generation+=1;
     if(state.reader) state.reader.close(); state.reader=null; state.video?.pause(); if(state.video) state.video.srcObject=null;
     if(state.snapshot){state.snapshot.onload=null;state.snapshot.onerror=null;state.snapshot.removeAttribute('src');}
     if(release){clearTimeout(state.leaseTimer);state.leaseTimer=null;}
@@ -153,6 +177,18 @@
     video.addEventListener('waiting',()=>{const current=video._cameraState;if(current)mark(current,'loading','Puffert');});
     video.addEventListener('stalled',()=>{const current=video._cameraState;if(current)scheduleRetry(current,current.path,current.mode);});
     video.addEventListener('timeupdate',()=>{const current=video._cameraState;if(current)stampFrame(current);});
+  }
+  function watchHlsPlayback(state,generation){
+    if(state!==appState.detail||state.generation!==generation)return;
+    const frame=$('#detail-hls');if(frame.hidden)return;
+    if(!sameOriginMedia){stampFrame(state);mark(state,'live',state.hlsLiveLabel||'Live · HLS');return;}
+    const video=frame.contentDocument?.querySelector('video');
+    if(video&&video.readyState>=2&&!video.paused&&video.currentTime>0){
+      stampFrame(state);mark(state,'live',state.hlsLiveLabel||'Live · HLS');return;
+    }
+    state.hlsChecks=(state.hlsChecks||0)+1;
+    if(state.hlsChecks>=60){mark(state,'offline','HLS-Stream konnte nicht gestartet werden');return;}
+    state.hlsTimer=setTimeout(()=>watchHlsPlayback(state,generation),500);
   }
   function startSnapshot(state,manual=false){
     closeReader(state,false);if(manual)state.retryCount=0;if(appState.suspended||!navigator.onLine){mark(state,'offline','Netzwerk offline');return;}
@@ -277,17 +313,17 @@
     if(request!==appState.cameraRequest||requestedProfileId!==appState.displayProfileId&&appState.displayProfileId!=='')return false;
     appState.states.forEach(closeReader); appState.states.clear(); $('#camera-grid').replaceChildren();
     appState.cameras=data.cameras||[];$('#camera-grid').dataset.count=String(appState.cameras.length);appState.cameras.forEach(renderCamera);
-    if(!appState.cameras.length){const empty=document.createElement('div');empty.className='empty-state';empty.innerHTML='<h3>Keine Kameras in dieser Ansicht</h3><p>Wählen Sie ein anderes Profil oder bearbeiten Sie die Kamerazuordnung.</p>';$('#camera-grid').append(empty);}
+    if(!appState.cameras.length){const empty=document.createElement('div');empty.className='empty-state';empty.innerHTML='<h3>Keine Kameras in dieser Ansicht</h3><p>Wählen Sie ein anderes Profil oder bearbeiten Sie die Kamerazuordnung.</p>';$('#camera-grid').append(empty);}if(appState.wallMode)updateWallGridLayout();
     appState.renderedDisplayProfileId=appState.displayProfileId;await loadHealth();if(request===appState.cameraRequest)populateZoneSelect();return true;
   }
   async function loadHealth(){try{const data=await api('/api/health');$('#system-state').dataset.state='live';$('#system-state span').textContent='Lokales Gateway online';const labels={connecting:['loading','Verbindung wird aufgebaut'],sleeping:['loading','Bereit · startet beim Öffnen'],offline:['offline','Kamera nicht erreichbar'],'cloud-auth-required':['offline','Cloud-Anmeldung erforderlich'],'media-server-offline':['offline','Medienserver nicht erreichbar'],unknown:['loading','Status unbekannt']};data.cameras?.forEach((item)=>{const state=appState.states.get(item.camera),detail=appState.detail?.camera.id===item.camera?appState.detail:null;if(item.state==='cloud-auth-required'){for(const target of new Set([state,detail].filter(Boolean))){closeReader(target);mark(target,'offline','Cloud-Anmeldung erforderlich');}return;}if(!state||state.reader||state.camera.displayMode==='snapshot')return;if(item.lastFrameAt)state.lastFrame.textContent=relativeTime(item.lastFrameAt);if(item.state!=='live'){const [status,text]=labels[item.state]||labels.unknown;mark(state,status,text);}});}catch{$('#system-state').dataset.state='offline';$('#system-state span').textContent='Gateway nicht erreichbar';}}
   function openDetail(id){
     const camera=appState.cameras.find(item=>item.id===id),tile=appState.states.get(id);if(!camera||!tile)return;const returnFocus=document.activeElement;closeReader(tile);$$('.view').forEach(view=>view.hidden=true);$('#detail').hidden=false;history.replaceState(null,'',`#camera/${camera.id}`);
-    const highAvailable=camera.highPath!==camera.lowPath,highWebRTC=highAvailable&&camera.highWebRTCCompatible!==false,initialPath=highWebRTC?camera.highPath:camera.lowPath,mode=highWebRTC?'high':'low';
+    const highAvailable=camera.highPath!==camera.lowPath,singlePathMain=!highAvailable&&String(camera.detailQuality||'').toLocaleLowerCase('de-DE').includes('hauptstream'),highWebRTC=highAvailable&&camera.highWebRTCCompatible!==false,initialPath=highWebRTC?camera.highPath:camera.lowPath,mode=highWebRTC||singlePathMain?'high':'low';
     $('#detail-name').textContent=camera.name;$('#detail-source').textContent=camera.source;
-    $('#detail-quality').textContent=camera.displayMode==='snapshot'?'Vorschaubild':(highWebRTC?(camera.detailQuality||'Hauptstream'):(highAvailable?'Substream · Hauptstream über HLS':'Substream'));
-    $('#detail-hls-toggle').textContent=highAvailable&&!highWebRTC?'HLS-Hauptstream':'HLS-Fallback';
-    const state={camera,video:$('#detail-video'),snapshot:$('#detail-snapshot'),status:$('#detail-status'),placeholder:$('#detail-message'),lastFrame:$('#detail-last-frame'),reader:null,retryTimer:null,startupTimer:null,snapshotTimer:null,retryCount:0,generation:0,lastFrameAt:null,firstFrameReceived:false,mode,path:initialPath,returnFocus,leaseId:null};appState.detail=state;
+    $('#detail-quality').textContent=camera.displayMode==='snapshot'?'Vorschaubild':(highWebRTC?(camera.detailQuality||'Hauptstream'):(highAvailable?'Substream · Hauptstream über HLS':(camera.detailQuality||'Substream')));
+    $('#detail-hls-toggle').textContent=highAvailable&&!highWebRTC||singlePathMain?'HLS-Hauptstream':'HLS-Fallback';
+    const state={camera,video:$('#detail-video'),snapshot:$('#detail-snapshot'),status:$('#detail-status'),placeholder:$('#detail-message'),lastFrame:$('#detail-last-frame'),reader:null,retryTimer:null,startupTimer:null,snapshotTimer:null,hlsTimer:null,hlsChecks:0,hlsLiveLabel:'',retryCount:0,generation:0,lastFrameAt:null,firstFrameReceived:false,mode,path:initialPath,returnFocus,leaseId:null};appState.detail=state;
     const isSnapshot=camera.displayMode==='snapshot';$('#detail-video').hidden=isSnapshot;$('#detail-snapshot').hidden=!isSnapshot;$('#detail-fallback').hidden=isSnapshot||!highWebRTC;$('#detail-hls-toggle').hidden=isSnapshot;$('#detail-audio').hidden=isSnapshot||!camera.features?.audio;$('#detail-video').muted=true;$('#detail-audio').textContent='Audio einschalten';loadDetailFunctions(camera);$('#detail-back').focus();if(isSnapshot)startSnapshot(state,true);else{bindVideoEvents(state);connect(state,initialPath,mode,true);}
 
   }
@@ -835,9 +871,9 @@
     $('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const setup=$('#auth-dialog').dataset.setup==='true',body={username:$('#auth-user').value,password:$('#auth-password').value};try{const result=await api(setup?'/api/auth/setup':'/api/auth/login',{method:'POST',body:JSON.stringify(body)});applyAccess(result);$('#auth-password').value='';$('#auth-dialog').close();$('#app').hidden=false;await loadDisplayProfiles();applyDisplayProfileFromHash();await loadCameras();refreshDiagnostics();const requestedView=hashRoute().view;if(requestedView==='wall')enterWallMode(false);else if(['discover','manage','zones','users','system'].includes(requestedView))showView(requestedView);}catch(error){$('#auth-error').textContent=error.code==='login-failed'?'Anmeldung fehlgeschlagen.':`Fehler: ${error.code}`;}});
     $('#reauth-form').addEventListener('submit',async(event)=>{event.preventDefault();try{const result=await api('/api/auth/reauth',{method:'POST',body:JSON.stringify({password:$('#reauth-password').value})});appState.elevatedUntil=result.elevatedUntil;$('#reauth-dialog').close();reauthResolver?.(true);}catch{$('#reauth-error').textContent='Passwort nicht bestätigt.';}});$$('[data-close-dialog]').forEach(button=>button.addEventListener('click',()=>{const dialog=button.closest('dialog');if(dialog.querySelector('form[aria-busy="true"]'))return;clearTransientDialogState(dialog);dialog.close();if(dialog.id==='reauth-dialog')reauthResolver?.(false);}));
     $('#logout').addEventListener('click',async()=>{clearTimeout(appState.scanTimer);appState.scanTimer=null;appState.scanId=null;exitWallMode();try{await api('/api/auth/logout',{method:'POST'});}catch{}appState.csrf='';appState.user=null;appState.permissions={};suspend();$('#app').hidden=true;showAuth(false);closeMenu(false);});
-    const enterWall=$('#enter-wall-mode'),exitWall=$('#exit-wall-mode');if(enterWall&&exitWall){enterWall.addEventListener('click',()=>enterWallMode(true));exitWall.addEventListener('click',()=>exitWallMode());}document.addEventListener('pointermove',revealWallControls,{passive:true});document.addEventListener('touchstart',revealWallControls,{passive:true});document.addEventListener('fullscreenchange',()=>{if(appState.wallMode&&!document.fullscreenElement)exitWallMode({leaveFullscreen:false});});
+    const enterWall=$('#enter-wall-mode'),exitWall=$('#exit-wall-mode');if(enterWall&&exitWall){enterWall.addEventListener('click',()=>enterWallMode(true));exitWall.addEventListener('click',()=>exitWallMode());}document.addEventListener('pointermove',revealWallControls,{passive:true});document.addEventListener('touchstart',revealWallControls,{passive:true});window.addEventListener('resize',updateWallGridLayout,{passive:true});document.addEventListener('fullscreenchange',()=>{if(appState.wallMode&&!document.fullscreenElement)exitWallMode({leaveFullscreen:false});else updateWallGridLayout();});
     $('#display-profile-select').addEventListener('change',event=>selectDisplayProfile(event.currentTarget.value));$('#wall-profile-select').addEventListener('change',event=>selectDisplayProfile(event.currentTarget.value));$('#manage-display-profiles').addEventListener('click',openDisplayProfileDialog);$('#profile-editor-select').addEventListener('change',event=>renderProfileEditor(event.currentTarget.value));$('#display-profile-form').addEventListener('submit',saveDisplayProfile);$('#delete-display-profile').addEventListener('click',deleteDisplayProfile);$('#copy-profile-live').addEventListener('click',()=>copyProfileLink('overview'));$('#copy-profile-wall').addEventListener('click',()=>copyProfileLink('wall'));
-    $('#refresh-all').addEventListener('click',loadHealth);$('#detail-back').addEventListener('click',closeDetail);$('#detail-reconnect').addEventListener('click',()=>{if(!appState.detail)return;appState.detail.camera.displayMode==='snapshot'?startSnapshot(appState.detail,true):connect(appState.detail,appState.detail.path,appState.detail.mode,true);});$('#detail-fallback').addEventListener('click',()=>{if(!appState.detail)return;$('#detail-quality').textContent='Substream';connect(appState.detail,appState.detail.camera.lowPath,'low',true);});$('#detail-hls-toggle').addEventListener('click',()=>{if(!appState.detail)return;closeReader(appState.detail,false);$('#detail-video').hidden=true;const frame=$('#detail-hls'),camera=appState.detail.camera,useHigh=camera.highPath!==camera.lowPath;frame.hidden=false;frame.src=hlsUrl(useHigh?camera.highPath:camera.lowPath);mark(appState.detail,'loading',useHigh?'HLS-Hauptstream lädt':'HLS-Fallback lädt');});$('#detail-hls').addEventListener('load',()=>{if(appState.detail)mark(appState.detail,'live','Live · HLS');});$('#detail-message').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-video').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-audio').addEventListener('click',toggleDetailAudio);$('#detail-fullscreen').addEventListener('click',()=>{const shell=$('#detail-shell'),video=$('#detail-video');if(shell.requestFullscreen)shell.requestFullscreen();else video.webkitEnterFullscreen?.();});
+    $('#refresh-all').addEventListener('click',loadHealth);$('#detail-back').addEventListener('click',closeDetail);$('#detail-reconnect').addEventListener('click',()=>{if(!appState.detail)return;appState.detail.camera.displayMode==='snapshot'?startSnapshot(appState.detail,true):connect(appState.detail,appState.detail.path,appState.detail.mode,true);});$('#detail-fallback').addEventListener('click',()=>{if(!appState.detail)return;$('#detail-quality').textContent='Substream';connect(appState.detail,appState.detail.camera.lowPath,'low',true);});$('#detail-hls-toggle').addEventListener('click',()=>{if(!appState.detail)return;closeReader(appState.detail,false);$('#detail-video').hidden=true;const state=appState.detail,frame=$('#detail-hls'),camera=state.camera,useHigh=camera.highPath!==camera.lowPath,isMain=useHigh||String(camera.detailQuality||'').toLocaleLowerCase('de-DE').includes('hauptstream');state.hlsChecks=0;state.hlsLiveLabel=isMain?'Live · HLS-Hauptstream':'Live · HLS';frame.hidden=false;frame.src=hlsUrl(useHigh?camera.highPath:camera.lowPath);mark(state,'loading',isMain?'HLS-Hauptstream wird aufgebaut · kann bis zu 20 s dauern':'HLS-Fallback wird aufgebaut');});$('#detail-hls').addEventListener('load',()=>{const state=appState.detail;if(state)watchHlsPlayback(state,state.generation);});$('#detail-message').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-video').addEventListener('click',()=>resumePlayback(appState.detail));$('#detail-audio').addEventListener('click',toggleDetailAudio);$('#detail-fullscreen').addEventListener('click',()=>{const shell=$('#detail-shell'),video=$('#detail-video');if(shell.requestFullscreen)shell.requestFullscreen();else video.webkitEnterFullscreen?.();});
     $$('[data-ptz-x]').forEach(button=>{button.addEventListener('pointerdown',event=>{event.preventDefault();button.setPointerCapture?.(event.pointerId);startPTZ(button);});for(const name of ['pointerup','pointercancel','pointerleave'])button.addEventListener(name,stopPTZ);button.addEventListener('keydown',event=>{if((event.key===' '||event.key==='Enter')&&!event.repeat){event.preventDefault();startPTZ(button);}});button.addEventListener('keyup',event=>{if(event.key===' '||event.key==='Enter')stopPTZ();});button.addEventListener('blur',stopPTZ);});$('[data-ptz-stop]').addEventListener('click',stopPTZ);$('#ptz-presets').addEventListener('change',gotoPreset);
     $('#start-scan').addEventListener('click',startScan);$('#cancel-scan').addEventListener('click',cancelScan);$('#manual-add').addEventListener('click',()=>openCameraDialog());$('#discovery-auth-form').addEventListener('submit',probeDiscovery);$('#test-source').addEventListener('click',testSource);$('#camera-form').addEventListener('submit',addCamera);for(const name of ['input','change'])$('#camera-form').addEventListener(name,()=>{$('#camera-form').dataset.tested='false';$('#source-test').textContent='Verbindungsdaten geändert · bitte erneut testen.';});$('#credential-mode').addEventListener('change',updateCredentialFields);$('#connection-test-button').addEventListener('click',testConnection);$('#connection-form').addEventListener('submit',saveConnection);for(const name of ['input','change'])$('#connection-form').addEventListener(name,()=>{$('#connection-form').dataset.tested='false';$('#connection-test').dataset.state='';$('#connection-test').textContent='Verbindungsdaten geändert · bitte erneut prüfen.';});$('#connection-activate').addEventListener('click',activateConnection);$('#capability-refresh').addEventListener('click',refreshCapabilities);$('#zone-camera').addEventListener('change',loadZoneCamera);$('#zone-canvas').addEventListener('pointerdown',addZonePoint);$('#zone-add-coordinate').addEventListener('click',addZoneCoordinate);$$('[data-zone-kind]').forEach(button=>button.addEventListener('click',()=>{$$('[data-zone-kind]').forEach(item=>item.classList.remove('is-active'));button.classList.add('is-active');zoneState.kind=button.dataset.zoneKind;}));$('#zone-undo').addEventListener('click',()=>{zoneState.draft.pop();drawZones();});$('#zone-complete').addEventListener('click',completeZone);$('#zone-save').addEventListener('click',saveZones);window.addEventListener('resize',resizeCanvas);
     $('#add-czeview-account').addEventListener('click',()=>{$('#czeview-account-form').reset();$('#czeview-account-title').textContent='CZEview-Konto hinzufügen';$('#czeview-account-form').elements.countryCode.value='DE';$('#czeview-account-form').elements.phoneCode.value='49';$('#czeview-account-form').elements.sourceApp.value='141';$('#czeview-account-error').textContent='';$('#czeview-account-dialog').showModal();});$('#czeview-account-form').addEventListener('submit',saveCzeviewAccount);$('#cloud-import-form').addEventListener('submit',importCloudCamera);
