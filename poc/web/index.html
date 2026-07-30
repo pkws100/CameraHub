@@ -20,6 +20,7 @@
   <link rel="stylesheet" href="./display-profiles.css">
   <link rel="stylesheet" href="./auth-badges.css">
   <link rel="stylesheet" href="./operations.css">
+  <link rel="stylesheet" href="./detection.css">
   <script defer src="./reader.js"></script>
   <script defer src="./app.js"></script>
 </head>
@@ -79,6 +80,16 @@
           <p>Tippen Sie mindestens drei Eckpunkte in das Bild.</p>
           <details class="zone-coordinate"><summary>Punkt per Tastatur eingeben</summary><div class="form-grid"><label>X in Prozent<input id="zone-x" type="number" min="0" max="100" value="50"></label><label>Y in Prozent<input id="zone-y" type="number" min="0" max="100" value="50"></label></div><button type="button" id="zone-add-coordinate">Punkt hinzufügen</button></details>
           <div class="tool-actions"><button id="zone-undo">Letzten Punkt löschen</button><button id="zone-complete" class="primary">Zone übernehmen</button></div>
+          <section class="detection-camera-settings" id="detection-camera-settings">
+            <div class="detection-setting-head"><strong>Lokale Bewegungserkennung</strong><span id="detection-camera-support">Wird geprüft</span></div>
+            <label class="check-label"><input id="detection-camera-enabled" type="checkbox"> Diese Dauerstream-Kamera analysieren</label>
+            <details>
+              <summary>Kamera-Zeitplan</summary>
+              <div id="detection-camera-schedules" class="detection-schedules"></div>
+              <button type="button" id="add-camera-detection-schedule">Zeitfenster hinzufügen</button>
+              <p>Ohne Zeitfenster ist die Kamera immer aktiv. Zeiträume über Mitternacht bitte in zwei Fenster teilen.</p>
+            </details>
+          </section>
           <div class="zone-list" id="zone-list"></div>
           <button id="zone-save" class="primary wide">Zonen speichern</button>
         </aside>
@@ -103,20 +114,52 @@
         <article><span>WebRTC</span><strong id="diag-webrtc">–</strong></article>
         <article><span>HLS</span><strong id="diag-hls">–</strong></article>
         <article><span>Backend</span><strong id="diag-backend">–</strong></article>
-        <article><span>App-Version</span><strong id="diag-version">1.4.0-dev</strong></article>
+        <article><span>App-Version</span><strong id="diag-version">1.5.0-dev</strong></article>
         <article class="span-two"><span>Origin</span><strong id="diag-origin">–</strong></article>
       </div>
+      <section class="operations-section detection-overview" aria-labelledby="detection-title">
+        <div class="operations-head">
+          <div><p class="kicker">Lokale Analyse</p><h3 id="detection-title">Alarmzonenerkennung</h3></div>
+          <div data-permission="manageUsers" class="detection-mode-control">
+            <label>Betriebsart
+              <select id="detection-mode"><option value="off">Aus</option><option value="observe">Beobachten</option><option value="armed">Scharf</option></select>
+            </label>
+            <button id="save-detection-mode" type="button">Übernehmen</button>
+          </div>
+        </div>
+        <div class="detection-status-grid" id="detection-status-grid">
+          <span>Worker <strong id="detection-worker-state">–</strong></span>
+          <span>Aktive Kameras <strong id="detection-active-cameras">0</strong></span>
+          <span>Verzögerung <strong id="detection-delay">–</strong></span>
+          <span>CPU <strong id="detection-cpu">–</strong></span>
+          <span>Speicher <strong id="detection-memory">–</strong></span>
+          <span>Offene Bewegungen <strong id="detection-open-events">0</strong></span>
+        </div>
+        <div class="detection-browser-controls">
+          <label class="check-label"><input id="motion-browser-alerts" type="checkbox"> Alarmbanner in diesem Browser anzeigen</label>
+          <label class="check-label"><input id="motion-browser-sound" type="checkbox"> Alarmton bewusst freigeben</label>
+        </div>
+        <p id="detection-last-error" class="privacy-note"></p>
+      </section>
       <section class="operations-section" aria-labelledby="events-title">
         <div class="operations-head">
           <div><p class="kicker">Betrieb</p><h3 id="events-title">Ereignisse und Störungen</h3></div>
-          <label>Status
-            <select id="event-filter">
-              <option value="active">Aktuell</option>
-              <option value="open">Offene Störungen</option>
-              <option value="resolved">Behoben</option>
-              <option value="all">Alle</option>
-            </select>
-          </label>
+          <div class="event-filters">
+            <label>Art
+              <select id="event-type-filter">
+                <option value="">Alle Ereignisse</option>
+                <option value="zone.motion">Bewegungen</option>
+              </select>
+            </label>
+            <label>Status
+              <select id="event-filter">
+                <option value="active">Aktuell</option>
+                <option value="open">Offene Störungen</option>
+                <option value="resolved">Behoben</option>
+                <option value="all">Alle</option>
+              </select>
+            </label>
+          </div>
         </div>
         <div class="event-summary" id="event-summary" aria-live="polite"></div>
         <div class="event-list" id="event-list"><div class="empty-state">Ereignisse werden geladen …</div></div>
@@ -213,6 +256,7 @@
       <label class="check-label"><input name="eventType" type="checkbox" value="camera.on-demand-unavailable" checked> On-Demand-Kamera reagiert nicht</label>
       <label class="check-label"><input name="eventType" type="checkbox" value="cloud-account.reauth-required" checked> Cloud-Anmeldung erforderlich</label>
       <label class="check-label"><input name="eventType" type="checkbox" value="media-server.offline" checked> Medienserver gestört</label>
+      <label class="check-label"><input name="eventType" type="checkbox" value="zone.motion" checked> Bewegung in Alarmzone</label>
     </fieldset>
     <p class="form-error" id="webhook-error" role="alert"></p>
     <div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Webhook speichern</button></div>
@@ -381,6 +425,10 @@
     <p class="form-error" id="own-password-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close-dialog>Abbrechen</button><button class="primary" type="submit">Passwort ändern</button></div>
   </form></dialog>
 
+  <aside id="motion-alert-banner" class="motion-alert-banner" hidden role="alert" aria-live="assertive">
+    <div><p class="kicker">Bewegungsalarm</p><strong id="motion-alert-title">Bewegung erkannt</strong><span id="motion-alert-time"></span></div>
+    <div class="motion-alert-actions"><button id="motion-alert-open" class="primary">Kamera öffnen</button><button id="motion-alert-dismiss">Für diesen Browser schließen</button></div>
+  </aside>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
   <template id="camera-template"><article class="camera-card"><div class="card-video"><video autoplay muted playsinline></video><img class="card-snapshot" alt="Aktuelle Kameravorschau" hidden><button type="button" class="card-placeholder" aria-label="Videowiedergabe starten"><span class="pulse"></span><span>Vorschau wartet</span></button><span class="source-badge"></span><span class="auth-badge" data-auth="false" role="img"><svg class="auth-icon auth-icon-locked" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V8a5 5 0 0 1 10 0v2m-9 0h8a2 2 0 0 1 2 2v7H6v-7a2 2 0 0 1 2-2Z"/></svg><svg class="auth-icon auth-icon-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 10V8a4 4 0 0 1 7.5-2M8 10h8a2 2 0 0 1 2 2v7H6v-7a2 2 0 0 1 2-2Z"/></svg><span class="auth-badge-text">Ohne Anmeldung</span></span><div class="wall-label"><strong class="wall-camera-name"></strong><span class="wall-camera-status" data-state="loading"><i></i><span>Verbindet</span></span></div></div><div class="card-body"><div class="card-heading"><h3></h3><div class="card-status" data-state="loading"><i></i><span class="status-text">Verbindung wird hergestellt</span></div></div><p class="last-frame">Letzter Frame: <span>–</span></p><div class="card-actions"><button class="primary open-camera">Öffnen</button><button class="reconnect-camera">Neu verbinden</button></div></div></article></template>

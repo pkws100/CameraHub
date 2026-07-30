@@ -32,7 +32,7 @@ from argon2 import PasswordHasher
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request as FastAPIRequest, Response, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from onvif_client import OnvifClient, OnvifError
@@ -45,6 +45,8 @@ SECRET_PATH = Path(os.environ.get("SECRET_KEY_PATH", "/run/secrets/zmodo_secret_
 INTERNAL_TOKEN_PATH = Path(os.environ.get("INTERNAL_TOKEN_PATH", "/run/secrets/zmodo_internal_token"))
 CZEVIEW_ADAPTER_TOKEN_PATH = Path(os.environ.get("CZEVIEW_ADAPTER_TOKEN_PATH", "/run/secrets/czeview_adapter_token"))
 NETATMO_ADAPTER_TOKEN_PATH = Path(os.environ.get("NETATMO_ADAPTER_TOKEN_PATH", "/run/secrets/netatmo_adapter_token"))
+DETECTION_ADAPTER_TOKEN_PATH = Path(os.environ.get("DETECTION_ADAPTER_TOKEN_PATH", "/run/secrets/detection_adapter_token"))
+MOTION_ASSET_ROOT = Path(os.environ.get("MOTION_ASSET_ROOT", "/data/motion-assets"))
 MEDIAMTX_API = os.environ.get("MEDIAMTX_API", "http://mediamtx:9997")
 ALLOWED_NETWORK = ipaddress.ip_network(os.environ.get("DISCOVERY_NETWORK", "192.168.1.0/24"), strict=True)
 MAX_CAMERAS = int(os.environ.get("MAX_CAMERAS", "32"))
@@ -88,7 +90,12 @@ BACKUP_SCRYPT_N = 2**17
 BACKUP_LEGACY_SCRYPT_N = 2**14
 BACKUP_FORMAT = "pkws-camera-hub-backup"
 BACKUP_VERSION = 1
-APP_VERSION = "1.4.0-dev"
+APP_VERSION = "1.5.0-dev"
+MOTION_ASSET_MAX_BYTES = int(os.environ.get("MOTION_ASSET_MAX_BYTES", str(500 * 1024 * 1024)))
+MOTION_ASSET_RETENTION_SECONDS = int(os.environ.get("MOTION_ASSET_RETENTION_SECONDS", str(7 * 24 * 60 * 60)))
+MOTION_METADATA_RETENTION_SECONDS = int(os.environ.get("MOTION_METADATA_RETENTION_SECONDS", str(90 * 24 * 60 * 60)))
+MOTION_METADATA_MAX_ROWS = int(os.environ.get("MOTION_METADATA_MAX_ROWS", "100000"))
+DETECTION_STALE_SECONDS = int(os.environ.get("DETECTION_STALE_SECONDS", "20"))
 CAMERA_HUB_TIMEZONE = os.environ.get("CAMERA_HUB_TIMEZONE", "Europe/Berlin")
 try:
     DISPLAY_TIMEZONE = ZoneInfo(CAMERA_HUB_TIMEZONE)
@@ -193,6 +200,7 @@ def read_optional_service_token(path: Path, test_name: str) -> str:
 
 CZEVIEW_ADAPTER_TOKEN = read_optional_service_token(CZEVIEW_ADAPTER_TOKEN_PATH, "czeview-adapter")
 NETATMO_ADAPTER_TOKEN = read_optional_service_token(NETATMO_ADAPTER_TOKEN_PATH, "netatmo-adapter")
+DETECTION_ADAPTER_TOKEN = read_optional_service_token(DETECTION_ADAPTER_TOKEN_PATH, "detection-adapter")
 
 
 def encrypt_text(value: str) -> str:
@@ -372,6 +380,53 @@ CREATE UNIQUE INDEX IF NOT EXISTS system_events_active_idx
  ON system_events(dedupe_key) WHERE status IN ('pending','open');
 CREATE INDEX IF NOT EXISTS system_events_status_idx
  ON system_events(status,updated_at);
+CREATE TABLE IF NOT EXISTS detection_settings(
+ id INTEGER PRIMARY KEY CHECK(id=1),
+ mode TEXT NOT NULL DEFAULT 'off' CHECK(mode IN ('off','observe','armed')),
+ revision INTEGER NOT NULL DEFAULT 1,
+ worker_last_seen_at TEXT, worker_status_json TEXT NOT NULL DEFAULT '{}',
+ updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS camera_detection_settings(
+ camera_id TEXT PRIMARY KEY REFERENCES cameras(id) ON DELETE CASCADE,
+ enabled INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS zone_detection_settings(
+ zone_id TEXT PRIMARY KEY REFERENCES zones(id) ON DELETE CASCADE,
+ enabled INTEGER NOT NULL DEFAULT 0,
+ sensitivity INTEGER NOT NULL DEFAULT 50 CHECK(sensitivity BETWEEN 1 AND 100),
+ min_area_ratio REAL NOT NULL DEFAULT 0.015 CHECK(min_area_ratio > 0 AND min_area_ratio <= 1),
+ confirmation_ms INTEGER NOT NULL DEFAULT 1000 CHECK(confirmation_ms BETWEEN 100 AND 60000),
+ quiet_ms INTEGER NOT NULL DEFAULT 5000 CHECK(quiet_ms BETWEEN 500 AND 300000),
+ cooldown_ms INTEGER NOT NULL DEFAULT 30000 CHECK(cooldown_ms BETWEEN 0 AND 3600000),
+ snapshot_enabled INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS camera_detection_schedules(
+ id TEXT PRIMARY KEY, camera_id TEXT NOT NULL REFERENCES cameras(id) ON DELETE CASCADE,
+ weekday INTEGER NOT NULL CHECK(weekday BETWEEN 0 AND 6),
+ start_minute INTEGER NOT NULL CHECK(start_minute BETWEEN 0 AND 1439),
+ end_minute INTEGER NOT NULL CHECK(end_minute BETWEEN 1 AND 1440),
+ position INTEGER NOT NULL, CHECK(start_minute < end_minute)
+);
+CREATE INDEX IF NOT EXISTS camera_detection_schedules_idx
+ ON camera_detection_schedules(camera_id,weekday,start_minute);
+CREATE TABLE IF NOT EXISTS zone_detection_schedules(
+ id TEXT PRIMARY KEY, zone_id TEXT NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
+ weekday INTEGER NOT NULL CHECK(weekday BETWEEN 0 AND 6),
+ start_minute INTEGER NOT NULL CHECK(start_minute BETWEEN 0 AND 1439),
+ end_minute INTEGER NOT NULL CHECK(end_minute BETWEEN 1 AND 1440),
+ position INTEGER NOT NULL, CHECK(start_minute < end_minute)
+);
+CREATE INDEX IF NOT EXISTS zone_detection_schedules_idx
+ ON zone_detection_schedules(zone_id,weekday,start_minute);
+CREATE TABLE IF NOT EXISTS motion_event_assets(
+ event_id TEXT PRIMARY KEY REFERENCES system_events(id) ON DELETE CASCADE,
+ asset_path TEXT NOT NULL, nonce BLOB NOT NULL, mime_type TEXT NOT NULL,
+ width INTEGER NOT NULL, height INTEGER NOT NULL, plain_size INTEGER NOT NULL,
+ created_at TEXT NOT NULL, expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS motion_event_assets_expiry_idx
+ ON motion_event_assets(expires_at);
 CREATE TABLE IF NOT EXISTS webhook_targets(
  id TEXT PRIMARY KEY, label TEXT NOT NULL, url TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
  event_types_json TEXT NOT NULL DEFAULT '["*"]', secret_ct TEXT NOT NULL,
@@ -460,6 +515,18 @@ def initialize_database() -> None:
             conn.execute(
                 "INSERT INTO schema_migrations(version,applied_at) VALUES(9,?)",
                 (now_iso(),),
+            )
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=10").fetchone() is None:
+            stamp = now_iso()
+            conn.execute(
+                """INSERT OR IGNORE INTO detection_settings(
+                   id,mode,revision,worker_status_json,updated_at)
+                   VALUES(1,'off',1,'{}',?)""",
+                (stamp,),
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(10,?)",
+                (stamp,),
             )
         webhook_delivery_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(webhook_deliveries)")
@@ -631,6 +698,60 @@ class ZoneInput(BaseModel):
 class ZonesUpdate(BaseModel):
     revision: int = Field(ge=0)
     zones: list[ZoneInput] = Field(max_length=64)
+
+
+class DetectionScheduleInput(BaseModel):
+    weekday: int = Field(ge=0, le=6)
+    startMinute: int = Field(ge=0, le=1439)
+    endMinute: int = Field(ge=1, le=1440)
+
+    @field_validator("endMinute")
+    @classmethod
+    def detection_schedule_not_empty(cls, value: int, info) -> int:
+        if info.data.get("startMinute") is not None and value == info.data["startMinute"]:
+            raise ValueError("schedule range must not be empty")
+        return value
+
+
+class ZoneDetectionInput(BaseModel):
+    zoneId: str
+    enabled: bool = False
+    sensitivity: int = Field(default=50, ge=1, le=100)
+    minAreaPercent: float = Field(default=1.5, gt=0, le=100)
+    confirmationSeconds: float = Field(default=1, ge=0.1, le=60)
+    quietSeconds: float = Field(default=5, ge=0.5, le=300)
+    cooldownSeconds: float = Field(default=30, ge=0, le=3600)
+    snapshotEnabled: bool = False
+    schedules: list[DetectionScheduleInput] = Field(default_factory=list, max_length=64)
+
+
+class CameraDetectionInput(BaseModel):
+    enabled: bool = False
+    schedules: list[DetectionScheduleInput] = Field(default_factory=list, max_length=64)
+    zones: list[ZoneDetectionInput] = Field(default_factory=list, max_length=64)
+
+
+class DetectionModeInput(BaseModel):
+    mode: Literal["off", "observe", "armed"]
+
+
+class DetectionWorkerStatus(BaseModel):
+    state: Literal["starting", "learning", "active", "paused", "degraded", "error"]
+    activeCameras: int = Field(default=0, ge=0, le=MAX_CAMERAS)
+    processingDelayMs: int = Field(default=0, ge=0, le=600000)
+    cpuPercent: float | None = Field(default=None, ge=0, le=1000)
+    memoryBytes: int | None = Field(default=None, ge=0)
+    lastError: str | None = Field(default=None, max_length=256)
+
+
+class DetectionEventInput(BaseModel):
+    workerEventId: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    cameraId: str = Field(min_length=1, max_length=128)
+    zoneId: str = Field(min_length=1, max_length=128)
+    state: Literal["started", "updated", "ended"]
+    occurredAt: str | None = None
+    motionPercent: float = Field(default=0, ge=0, le=100)
+    strength: float = Field(default=0, ge=0, le=100)
 
 
 class CameraCreate(BaseModel):
@@ -1163,6 +1284,160 @@ def permissions_for(role: str) -> dict:
     }
 
 
+def detection_schedule_active(rows: list[sqlite3.Row], moment: datetime | None = None) -> bool:
+    if not rows:
+        return True
+    local = (moment or datetime.now(timezone.utc)).astimezone(DISPLAY_TIMEZONE)
+    minute = local.hour * 60 + local.minute
+    return any(
+        int(row["weekday"]) == local.weekday()
+        and int(row["start_minute"]) <= minute < int(row["end_minute"])
+        for row in rows
+    )
+
+
+def detection_schedule_payload(rows: list[sqlite3.Row]) -> list[dict]:
+    return [
+        {
+            "weekday": int(row["weekday"]),
+            "startMinute": int(row["start_minute"]),
+            "endMinute": int(row["end_minute"]),
+        }
+        for row in rows
+    ]
+
+
+def replace_detection_schedules(
+    conn: sqlite3.Connection,
+    table: Literal["camera_detection_schedules", "zone_detection_schedules"],
+    foreign_key: Literal["camera_id", "zone_id"],
+    value: str,
+    schedules: list[DetectionScheduleInput],
+) -> None:
+    conn.execute(f"DELETE FROM {table} WHERE {foreign_key}=?", (value,))
+    position = 0
+    for schedule in schedules:
+        parts = (
+            [(schedule.weekday, schedule.startMinute, schedule.endMinute)]
+            if schedule.endMinute > schedule.startMinute
+            else [
+                (schedule.weekday, schedule.startMinute, 1440),
+                ((schedule.weekday + 1) % 7, 0, schedule.endMinute),
+            ]
+        )
+        for weekday, start_minute, end_minute in parts:
+            conn.execute(
+                f"""INSERT INTO {table}(
+                    id,{foreign_key},weekday,start_minute,end_minute,position)
+                    VALUES(?,?,?,?,?,?)""",
+                (
+                    str(uuid.uuid4()), value, weekday,
+                    start_minute, end_minute, position,
+                ),
+            )
+            position += 1
+
+
+def detection_settings_payload(conn: sqlite3.Connection) -> dict:
+    row = conn.execute("SELECT * FROM detection_settings WHERE id=1").fetchone()
+    if not row:
+        stamp = now_iso()
+        conn.execute(
+            """INSERT INTO detection_settings(
+               id,mode,revision,worker_status_json,updated_at)
+               VALUES(1,'off',1,'{}',?)""",
+            (stamp,),
+        )
+        row = conn.execute("SELECT * FROM detection_settings WHERE id=1").fetchone()
+    status = json.loads(row["worker_status_json"] or "{}")
+    last_seen = row["worker_last_seen_at"]
+    online = False
+    if last_seen:
+        try:
+            online = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(last_seen)
+            ).total_seconds() <= DETECTION_STALE_SECONDS
+        except ValueError:
+            pass
+    return {
+        "mode": row["mode"],
+        "revision": int(row["revision"]),
+        "timezone": CAMERA_HUB_TIMEZONE,
+        "worker": {
+            **status,
+            "online": online,
+            "lastSeenAt": last_seen,
+            "state": status.get("state", "offline") if online else "offline",
+        },
+        "updatedAt": row["updated_at"],
+    }
+
+
+def camera_detection_payload(conn: sqlite3.Connection, camera_id: str) -> dict:
+    camera = conn.execute(
+        "SELECT id,name,enabled,on_demand,protocol FROM cameras WHERE id=?",
+        (camera_id,),
+    ).fetchone()
+    if not camera:
+        raise HTTPException(404, "camera-not-found")
+    setting = conn.execute(
+        "SELECT enabled FROM camera_detection_settings WHERE camera_id=?",
+        (camera_id,),
+    ).fetchone()
+    camera_schedules = conn.execute(
+        """SELECT weekday,start_minute,end_minute
+           FROM camera_detection_schedules
+           WHERE camera_id=? ORDER BY position""",
+        (camera_id,),
+    ).fetchall()
+    zones = []
+    for zone in conn.execute(
+        """SELECT z.*,d.enabled AS detection_enabled,d.sensitivity,d.min_area_ratio,
+                  d.confirmation_ms,d.quiet_ms,d.cooldown_ms,d.snapshot_enabled
+           FROM zones z
+           LEFT JOIN zone_detection_settings d ON d.zone_id=z.id
+           WHERE z.camera_id=? ORDER BY z.updated_at,z.id""",
+        (camera_id,),
+    ):
+        schedules = conn.execute(
+            """SELECT weekday,start_minute,end_minute
+               FROM zone_detection_schedules
+               WHERE zone_id=? ORDER BY position""",
+            (zone["id"],),
+        ).fetchall()
+        zones.append(
+            {
+                "zoneId": zone["id"],
+                "name": zone["name"],
+                "kind": zone["kind"],
+                "enabled": bool(zone["detection_enabled"] or 0),
+                "sensitivity": int(zone["sensitivity"] or 50),
+                "minAreaPercent": float(zone["min_area_ratio"] or 0.015) * 100,
+                "confirmationSeconds": float(zone["confirmation_ms"] or 1000) / 1000,
+                "quietSeconds": float(zone["quiet_ms"] or 5000) / 1000,
+                "cooldownSeconds": float(zone["cooldown_ms"] or 30000) / 1000,
+                "snapshotEnabled": bool(zone["snapshot_enabled"] or 0),
+                "schedules": detection_schedule_payload(schedules),
+                "scheduleActive": detection_schedule_active(schedules),
+            }
+        )
+    supported = bool(
+        camera["enabled"]
+        and not camera["on_demand"]
+        and camera["protocol"] not in {"snapshot", "external"}
+    )
+    return {
+        "cameraId": camera_id,
+        "cameraName": camera["name"],
+        "supported": supported,
+        "unsupportedReason": None if supported else "on-demand-or-snapshot-camera",
+        "enabled": bool(setting["enabled"]) if setting else False,
+        "schedules": detection_schedule_payload(camera_schedules),
+        "scheduleActive": detection_schedule_active(camera_schedules),
+        "zones": zones,
+    }
+
+
 NETATMO_AUTH_URL = "https://api.netatmo.com/oauth2/authorize"
 NETATMO_TOKEN_URL = "https://api.netatmo.com/oauth2/token"
 NETATMO_SCOPES = (
@@ -1268,6 +1543,15 @@ def create_backup_archive(passphrase: str) -> bytes:
                 backup.execute("DELETE FROM display_pairing_codes")
                 backup.execute(
                     "UPDATE display_devices SET paired_at=NULL,last_seen_at=NULL"
+                )
+            if backup.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='motion_event_assets'"
+            ).fetchone():
+                backup.execute("DELETE FROM motion_event_assets")
+                backup.execute(
+                    """UPDATE system_events SET details_json=json_remove(
+                       details_json,'$.snapshotAvailable')
+                       WHERE event_type='zone.motion' AND json_valid(details_json)"""
                 )
             backup.commit()
             integrity = backup.execute("PRAGMA integrity_check").fetchone()[0]
@@ -1412,8 +1696,8 @@ def validate_backup_database(database: bytes, source_key: bytes) -> tuple[dict, 
                 for row in candidate.execute("SELECT version FROM schema_migrations")
             }
             schema_version = max(migrations) if migrations else 0
-            if schema_version not in {8, 9} or migrations != set(range(2, schema_version + 1)):
-                if any(version > 9 for version in migrations):
+            if schema_version not in {8, 9, 10} or migrations != set(range(2, schema_version + 1)):
+                if any(version > 10 for version in migrations):
                     raise HTTPException(422, "backup-schema-newer-than-application")
                 raise HTTPException(422, "backup-migrations-incomplete")
             if schema_version >= 9:
@@ -1440,9 +1724,30 @@ def validate_backup_database(database: bytes, source_key: bytes) -> tuple[dict, 
                 }
                 if "stream_mode" not in profile_columns:
                     raise HTTPException(422, "backup-schema-invalid")
+            if schema_version >= 10:
+                detection_signature = {
+                    "detection_settings": {"id", "mode", "revision"},
+                    "camera_detection_settings": {"camera_id", "enabled"},
+                    "zone_detection_settings": {"zone_id", "enabled", "sensitivity"},
+                    "camera_detection_schedules": {
+                        "id", "camera_id", "weekday", "start_minute", "end_minute"
+                    },
+                    "zone_detection_schedules": {
+                        "id", "zone_id", "weekday", "start_minute", "end_minute"
+                    },
+                    "motion_event_assets": {"event_id", "asset_path", "nonce"},
+                }
+                if not set(detection_signature).issubset(tables):
+                    raise HTTPException(422, "backup-schema-invalid")
+                for table, required_columns in detection_signature.items():
+                    columns = {
+                        row["name"] for row in candidate.execute(f"PRAGMA table_info({table})")
+                    }
+                    if not required_columns.issubset(columns):
+                        raise HTTPException(422, "backup-schema-invalid")
             if candidate.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise HTTPException(422, "backup-foreign-keys-invalid")
-            if schema_version > 9:
+            if schema_version > 10:
                 raise HTTPException(422, "backup-schema-newer-than-application")
             sensitive_columns = {
                 "credentials": ("username_ct", "password_ct"),
@@ -1524,11 +1829,16 @@ def restore_backup_database(candidate_path: Path, actor_id: str) -> str:
                 conn.execute("DELETE FROM sessions")
                 conn.execute("DELETE FROM display_device_sessions")
                 conn.execute("DELETE FROM display_pairing_codes")
+                conn.execute("DELETE FROM motion_event_assets")
                 conn.execute(
                     "UPDATE display_devices SET paired_at=NULL,last_seen_at=NULL"
                 )
                 release_display_device_leases()
                 audit(conn, actor_id, "system.backup.restored", "backup")
+            if MOTION_ASSET_ROOT.exists():
+                for target in MOTION_ASSET_ROOT.iterdir():
+                    if target.is_file():
+                        target.unlink(missing_ok=True)
             return rollback_path.name
         except Exception:
             replacement.unlink(missing_ok=True)
@@ -1576,7 +1886,8 @@ def system_event_payload(row: sqlite3.Row) -> dict:
 
 
 def webhook_event_body(event: sqlite3.Row, status: str) -> dict:
-    return {
+    details = json.loads(event["details_json"] or "{}")
+    payload = {
         "eventId": event["id"],
         "type": event["event_type"],
         "status": status,
@@ -1587,6 +1898,16 @@ def webhook_event_body(event: sqlite3.Row, status: str) -> dict:
         "title": event["title"],
         "description": event["description"],
     }
+    if event["event_type"] == "zone.motion":
+        payload["motion"] = {
+            key: details.get(key)
+            for key in (
+                "zoneId", "zoneName", "workerEventId", "motionPercent",
+                "strength", "snapshotAvailable",
+            )
+            if details.get(key) is not None
+        }
+    return payload
 
 
 def enqueue_event_webhooks(conn: sqlite3.Connection, event: sqlite3.Row, status: str) -> None:
@@ -1885,14 +2206,120 @@ def dispatch_due_webhooks(
     return completed
 
 
+def detection_maintenance_once(now_epoch: int | None = None) -> dict:
+    now_epoch = now_epoch if now_epoch is not None else int(time.time())
+    cutoff = datetime.fromtimestamp(
+        now_epoch - DETECTION_STALE_SECONDS, timezone.utc
+    ).isoformat()
+    metadata_cutoff = datetime.fromtimestamp(
+        now_epoch - MOTION_METADATA_RETENTION_SECONDS, timezone.utc
+    ).isoformat()
+    removed_assets: list[str] = []
+    resolved_events = 0
+    with DB_LOCK, connect() as conn:
+        settings = detection_settings_payload(conn)
+        worker_stale = (
+            settings["mode"] == "off"
+            or not settings["worker"]["online"]
+            or (settings["worker"].get("lastSeenAt") or "") < cutoff
+        )
+        if worker_stale:
+            for event in conn.execute(
+                """SELECT * FROM system_events
+                   WHERE event_type='zone.motion' AND status='open'"""
+            ).fetchall():
+                stamp = now_iso()
+                conn.execute(
+                    """UPDATE system_events SET status='resolved',last_seen_at=?,
+                       resolved_at=?,updated_at=? WHERE id=?""",
+                    (stamp, stamp, stamp, event["id"]),
+                )
+                resolved = conn.execute(
+                    "SELECT * FROM system_events WHERE id=?", (event["id"],)
+                ).fetchone()
+                if json.loads(event["details_json"] or "{}").get("notificationsEnabled"):
+                    enqueue_event_webhooks(conn, resolved, "resolved")
+                resolved_events += 1
+        assets = conn.execute(
+            """SELECT event_id,asset_path,plain_size,expires_at
+               FROM motion_event_assets ORDER BY created_at"""
+        ).fetchall()
+        # AES-GCM adds a 16-byte authentication tag to every stored asset.
+        retained_bytes = sum(max(0, int(row["plain_size"])) + 16 for row in assets)
+        for asset in assets:
+            asset_target = (MOTION_ASSET_ROOT / asset["asset_path"]).resolve()
+            asset_missing = (
+                asset_target.parent != MOTION_ASSET_ROOT.resolve()
+                or not asset_target.is_file()
+            )
+            if (
+                asset_missing
+                or asset["expires_at"] <= now_epoch
+                or retained_bytes > MOTION_ASSET_MAX_BYTES
+            ):
+                conn.execute(
+                    "DELETE FROM motion_event_assets WHERE event_id=?", (asset["event_id"],)
+                )
+                event = conn.execute(
+                    "SELECT details_json FROM system_events WHERE id=?",
+                    (asset["event_id"],),
+                ).fetchone()
+                if event:
+                    details = json.loads(event["details_json"] or "{}")
+                    details["snapshotAvailable"] = False
+                    conn.execute(
+                        "UPDATE system_events SET details_json=?,updated_at=? WHERE id=?",
+                        (
+                            json.dumps(details, separators=(",", ":")),
+                            now_iso(),
+                            asset["event_id"],
+                        ),
+                    )
+                retained_bytes -= max(0, int(asset["plain_size"])) + 16
+                removed_assets.append(asset["asset_path"])
+        old_events = conn.execute(
+            """SELECT id FROM system_events
+               WHERE event_type='zone.motion' AND status='resolved' AND resolved_at<?
+               ORDER BY resolved_at""",
+            (metadata_cutoff,),
+        ).fetchall()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM system_events WHERE event_type='zone.motion'"
+        ).fetchone()[0]
+        excess = max(0, count - MOTION_METADATA_MAX_ROWS)
+        if excess:
+            old_events += conn.execute(
+                """SELECT id FROM system_events WHERE event_type='zone.motion'
+                   AND status='resolved' ORDER BY resolved_at LIMIT ?""",
+                (excess,),
+            ).fetchall()
+        for event_id in {row["id"] for row in old_events}:
+            asset = conn.execute(
+                "SELECT asset_path FROM motion_event_assets WHERE event_id=?", (event_id,)
+            ).fetchone()
+            if asset:
+                removed_assets.append(asset["asset_path"])
+            conn.execute("DELETE FROM system_events WHERE id=?", (event_id,))
+    for name in set(removed_assets):
+        target = (MOTION_ASSET_ROOT / name).resolve()
+        if target.parent == MOTION_ASSET_ROOT.resolve():
+            target.unlink(missing_ok=True)
+    return {"resolvedEvents": resolved_events, "removedAssets": len(set(removed_assets))}
+
+
 def operations_loop() -> None:
+    next_operations = 0.0
     while not OPERATIONS_STOP.is_set():
         try:
-            monitor_once()
+            now = time.monotonic()
+            if now >= next_operations:
+                monitor_once()
+                next_operations = now + max(5, OPERATIONS_INTERVAL_SECONDS)
             dispatch_due_webhooks()
+            detection_maintenance_once()
         except Exception:
             pass
-        OPERATIONS_STOP.wait(max(5, OPERATIONS_INTERVAL_SECONDS))
+        OPERATIONS_STOP.wait(5)
 
 
 def issue_session(response: Response, request: FastAPIRequest, user: sqlite3.Row) -> dict:
@@ -2957,6 +3384,7 @@ async def restore_backup(
 @app.get("/api/events")
 def list_system_events(
     status: Literal["active", "open", "resolved", "all"] = "active",
+    eventType: str | None = None,
     limit: int = 100,
     _: sqlite3.Row = Depends(require_session),
 ):
@@ -2968,20 +3396,26 @@ def list_system_events(
         "all": "1=1",
     }[status]
     with connect() as conn:
+        type_clause = " AND e.event_type=?" if eventType else ""
+        params: tuple = (eventType, limit) if eventType else (limit,)
         rows = conn.execute(
             f"""SELECT e.*,c.name AS camera_name,a.label AS account_label
                 FROM system_events e
                 LEFT JOIN cameras c ON c.id=e.camera_id
                 LEFT JOIN cloud_accounts a ON a.id=e.account_id
-                WHERE {where}
+                WHERE {where}{type_clause}
                 ORDER BY CASE e.status WHEN 'open' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
                 e.updated_at DESC LIMIT ?""",
-            (limit,),
+            params,
         ).fetchall()
+        count_clause = " WHERE event_type=?" if eventType else ""
+        count_params = (eventType,) if eventType else ()
         counts = {
             row["status"]: row["count"]
             for row in conn.execute(
-                "SELECT status,COUNT(*) AS count FROM system_events GROUP BY status"
+                f"""SELECT status,COUNT(*) AS count FROM system_events
+                    {count_clause} GROUP BY status""",
+                count_params,
             )
         }
     return {
@@ -2992,6 +3426,208 @@ def list_system_events(
             "resolved": counts.get("resolved", 0),
         },
     }
+
+
+@app.get("/api/detection/status")
+def get_detection_status(_: sqlite3.Row = Depends(require_session)):
+    with connect() as conn:
+        payload = detection_settings_payload(conn)
+        payload["configuredCameras"] = conn.execute(
+            "SELECT COUNT(*) FROM camera_detection_settings WHERE enabled=1"
+        ).fetchone()[0]
+        payload["configuredZones"] = conn.execute(
+            "SELECT COUNT(*) FROM zone_detection_settings WHERE enabled=1"
+        ).fetchone()[0]
+        payload["openMotionEvents"] = conn.execute(
+            "SELECT COUNT(*) FROM system_events WHERE event_type='zone.motion' AND status='open'"
+        ).fetchone()[0]
+    return payload
+
+
+@app.get("/api/motion-events/{event_id}/snapshot")
+def get_motion_snapshot(
+    event_id: str, _: sqlite3.Row = Depends(require_session)
+):
+    with connect() as conn:
+        asset = conn.execute(
+            """SELECT a.* FROM motion_event_assets a
+               JOIN system_events e ON e.id=a.event_id
+               WHERE a.event_id=? AND e.event_type='zone.motion'""",
+            (event_id,),
+        ).fetchone()
+    if not asset or asset["expires_at"] <= int(time.time()):
+        raise HTTPException(404, "motion-snapshot-not-found")
+    target = (MOTION_ASSET_ROOT / asset["asset_path"]).resolve()
+    if target.parent != MOTION_ASSET_ROOT.resolve() or not target.is_file():
+        raise HTTPException(404, "motion-snapshot-not-found")
+    try:
+        plaintext = AESGCM(AES_KEY).decrypt(
+            asset["nonce"], target.read_bytes(),
+            f"camera-hub-motion-v1:{event_id}".encode(),
+        )
+    except Exception as exc:
+        raise HTTPException(500, "motion-snapshot-decryption-failed") from exc
+    if len(plaintext) != asset["plain_size"]:
+        raise HTTPException(500, "motion-snapshot-size-invalid")
+    return Response(
+        plaintext,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.get("/api/detection/events/stream")
+async def stream_detection_events(
+    request: FastAPIRequest, _: sqlite3.Row = Depends(require_session)
+):
+    connected_at = now_iso()
+
+    async def event_stream():
+        seen: set[str] = set()
+        last_keepalive = time.monotonic()
+        yield "retry: 3000\n\n"
+        while not await request.is_disconnected():
+            with connect() as conn:
+                settings = detection_settings_payload(conn)
+                rows = conn.execute(
+                    """SELECT e.*,c.name AS camera_name
+                       FROM system_events e LEFT JOIN cameras c ON c.id=e.camera_id
+                       WHERE e.event_type='zone.motion' AND e.status='open'
+                         AND e.opened_at>=? ORDER BY e.opened_at""",
+                    (connected_at,),
+                ).fetchall()
+            if settings["mode"] == "armed":
+                for row in rows:
+                    if row["id"] in seen:
+                        continue
+                    seen.add(row["id"])
+                    details = json.loads(row["details_json"] or "{}")
+                    payload = {
+                        "eventId": row["id"],
+                        "cameraId": row["camera_id"],
+                        "cameraName": row["camera_name"],
+                        "zoneId": details.get("zoneId"),
+                        "zoneName": details.get("zoneName"),
+                        "startedAt": row["started_at"],
+                        "strength": details.get("strength"),
+                        "snapshotAvailable": details.get("snapshotAvailable", False),
+                    }
+                    yield (
+                        f"id: {row['id']}\nevent: zone.motion\ndata: "
+                        f"{json.dumps(payload, separators=(',', ':'), ensure_ascii=False)}\n\n"
+                    )
+            if time.monotonic() - last_keepalive >= 15:
+                yield ": keepalive\n\n"
+                last_keepalive = time.monotonic()
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.put("/api/owner/detection")
+def set_detection_mode(
+    body: DetectionModeInput,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    stamp = now_iso()
+    with DB_LOCK, connect() as conn:
+        current = detection_settings_payload(conn)
+        conn.execute(
+            """UPDATE detection_settings SET mode=?,revision=revision+1,updated_at=?
+               WHERE id=1""",
+            (body.mode, stamp),
+        )
+        audit(
+            conn, actor["user_id"], "detection.mode.changed", "detection",
+            f"{current['mode']}->{body.mode}",
+        )
+        payload = detection_settings_payload(conn)
+    return payload
+
+
+@app.get("/api/admin/cameras/{camera_id}/detection")
+def get_camera_detection(
+    camera_id: str, _: sqlite3.Row = Depends(require_admin)
+):
+    with connect() as conn:
+        return camera_detection_payload(conn, camera_id)
+
+
+@app.put("/api/admin/cameras/{camera_id}/detection")
+def put_camera_detection(
+    camera_id: str,
+    body: CameraDetectionInput,
+    actor: sqlite3.Row = Depends(require_admin_elevated),
+):
+    stamp = now_iso()
+    with DB_LOCK, connect() as conn:
+        camera = conn.execute(
+            "SELECT enabled,on_demand,protocol FROM cameras WHERE id=?", (camera_id,)
+        ).fetchone()
+        if not camera:
+            raise HTTPException(404, "camera-not-found")
+        if body.enabled and (
+            not camera["enabled"]
+            or camera["on_demand"]
+            or camera["protocol"] in {"snapshot", "external"}
+        ):
+            raise HTTPException(409, "detection-camera-not-supported")
+        zone_ids = {
+            row["id"]
+            for row in conn.execute("SELECT id FROM zones WHERE camera_id=?", (camera_id,))
+        }
+        if {zone.zoneId for zone in body.zones} != zone_ids:
+            raise HTTPException(409, "detection-zone-set-mismatch")
+        conn.execute(
+            """INSERT INTO camera_detection_settings(camera_id,enabled,updated_at)
+               VALUES(?,?,?)
+               ON CONFLICT(camera_id) DO UPDATE SET enabled=excluded.enabled,
+               updated_at=excluded.updated_at""",
+            (camera_id, int(body.enabled), stamp),
+        )
+        replace_detection_schedules(
+            conn, "camera_detection_schedules", "camera_id", camera_id, body.schedules
+        )
+        for zone in body.zones:
+            conn.execute(
+                """INSERT INTO zone_detection_settings(
+                   zone_id,enabled,sensitivity,min_area_ratio,confirmation_ms,quiet_ms,
+                   cooldown_ms,snapshot_enabled,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(zone_id) DO UPDATE SET enabled=excluded.enabled,
+                   sensitivity=excluded.sensitivity,min_area_ratio=excluded.min_area_ratio,
+                   confirmation_ms=excluded.confirmation_ms,quiet_ms=excluded.quiet_ms,
+                   cooldown_ms=excluded.cooldown_ms,snapshot_enabled=excluded.snapshot_enabled,
+                   updated_at=excluded.updated_at""",
+                (
+                    zone.zoneId, int(zone.enabled), zone.sensitivity,
+                    zone.minAreaPercent / 100, round(zone.confirmationSeconds * 1000),
+                    round(zone.quietSeconds * 1000), round(zone.cooldownSeconds * 1000),
+                    int(zone.snapshotEnabled), stamp,
+                ),
+            )
+            replace_detection_schedules(
+                conn, "zone_detection_schedules", "zone_id", zone.zoneId, zone.schedules
+            )
+        conn.execute(
+            "UPDATE detection_settings SET revision=revision+1,updated_at=? WHERE id=1",
+            (stamp,),
+        )
+        audit(conn, actor["user_id"], "detection.camera.updated", "camera", camera_id)
+        payload = camera_detection_payload(conn, camera_id)
+    return payload
 
 
 @app.get("/api/owner/webhooks")
@@ -5505,10 +6141,50 @@ def put_zones(camera_id: str, body: ZonesUpdate, _: sqlite3.Row = Depends(requir
         if current != body.revision:
             raise HTTPException(409, "zone-revision-conflict")
         revision = current + 1
-        conn.execute("DELETE FROM zones WHERE camera_id=?", (camera_id,))
-        for zone in body.zones:
-            conn.execute("INSERT INTO zones VALUES(?,?,?,?,?,?,?,?)", (zone.id or str(uuid.uuid4()), camera_id, zone.name, zone.kind, json.dumps([point.model_dump() for point in zone.points]), int(zone.enabled), revision, now_iso()))
-    return {"cameraId": camera_id, "revision": revision}
+        incoming_ids = [zone.id or str(uuid.uuid4()) for zone in body.zones]
+        if len(set(incoming_ids)) != len(incoming_ids):
+            raise HTTPException(422, "duplicate-zone-id")
+        foreign = conn.execute(
+            f"""SELECT 1 FROM zones WHERE id IN ({','.join('?' for _ in incoming_ids)})
+                AND camera_id<>? LIMIT 1""",
+            (*incoming_ids, camera_id),
+        ).fetchone() if incoming_ids else None
+        if foreign:
+            raise HTTPException(409, "zone-id-owned-by-other-camera")
+        for existing in conn.execute("SELECT id FROM zones WHERE camera_id=?", (camera_id,)):
+            if existing["id"] not in incoming_ids:
+                conn.execute("DELETE FROM zones WHERE id=?", (existing["id"],))
+        for zone_id, zone in zip(incoming_ids, body.zones):
+            conn.execute(
+                """INSERT INTO zones(id,camera_id,name,kind,points_json,enabled,revision,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,
+                   points_json=excluded.points_json,enabled=excluded.enabled,
+                   revision=excluded.revision,updated_at=excluded.updated_at""",
+                (
+                    zone_id, camera_id, zone.name, zone.kind,
+                    json.dumps([point.model_dump() for point in zone.points]),
+                    int(zone.enabled), revision, now_iso(),
+                ),
+            )
+        conn.execute(
+            "UPDATE detection_settings SET revision=revision+1,updated_at=? WHERE id=1",
+            (now_iso(),),
+        )
+        rows = conn.execute(
+            "SELECT * FROM zones WHERE camera_id=? ORDER BY updated_at,id", (camera_id,)
+        ).fetchall()
+    return {
+        "cameraId": camera_id,
+        "revision": revision,
+        "zones": [
+            {
+                "id": row["id"], "name": row["name"], "kind": row["kind"],
+                "points": json.loads(row["points_json"]), "enabled": bool(row["enabled"]),
+            }
+            for row in rows
+        ],
+    }
 
 
 def require_camera_media_access(
@@ -5754,6 +6430,13 @@ def require_netatmo_adapter(authorization: str = Header(default="")) -> None:
         authorization, f"Bearer {NETATMO_ADAPTER_TOKEN}"
     ):
         raise HTTPException(401, "netatmo-adapter-auth-required")
+
+
+def require_detection_adapter(authorization: str = Header(default="")) -> None:
+    if not DETECTION_ADAPTER_TOKEN or not secrets.compare_digest(
+        authorization, f"Bearer {DETECTION_ADAPTER_TOKEN}"
+    ):
+        raise HTTPException(401, "detection-adapter-auth-required")
 
 
 @app.post("/internal/v1/providers/czeview/legacy-account")
@@ -6095,20 +6778,308 @@ def relay_config(_: None = Depends(require_internal)):
     return {"revision": int(now), "cameras": items}
 
 
-@app.get("/internal/v1/detection/cameras")
-def detection_config(_: None = Depends(require_internal)):
-    with connect() as conn:
-        cameras = conn.execute("SELECT id,name,low_path FROM cameras WHERE enabled=1 AND protocol!='snapshot' ORDER BY position").fetchall()
-        zones = conn.execute("SELECT * FROM zones ORDER BY camera_id,id").fetchall()
-    by_camera: dict[str, list] = {}
-    for zone in zones:
-        by_camera.setdefault(zone["camera_id"], []).append({"id": zone["id"], "name": zone["name"], "kind": zone["kind"], "points": json.loads(zone["points_json"]), "enabled": bool(zone["enabled"]), "revision": zone["revision"]})
-    return {"enabled": False, "cameras": [{"id": row["id"], "name": row["name"], "streamPath": row["low_path"], "zones": by_camera.get(row["id"], [])} for row in cameras]}
+@app.get("/internal/v1/detection/config")
+def detection_config(_: None = Depends(require_detection_adapter)):
+    with DB_LOCK, connect() as conn:
+        settings = detection_settings_payload(conn)
+        camera_rows = conn.execute(
+            """SELECT c.id,c.name,c.low_path
+               FROM cameras c
+               JOIN camera_detection_settings d ON d.camera_id=c.id AND d.enabled=1
+               WHERE c.enabled=1 AND c.on_demand=0
+                 AND COALESCE(c.protocol,'rtsp') NOT IN ('snapshot','external')
+               ORDER BY c.position"""
+        ).fetchall()
+        cameras = []
+        if settings["mode"] != "off":
+            for camera in camera_rows:
+                camera_schedules = conn.execute(
+                    """SELECT weekday,start_minute,end_minute
+                       FROM camera_detection_schedules WHERE camera_id=?""",
+                    (camera["id"],),
+                ).fetchall()
+                if not detection_schedule_active(camera_schedules):
+                    continue
+                zones = []
+                for zone in conn.execute(
+                    """SELECT z.*,d.enabled AS detection_enabled,d.sensitivity,
+                              d.min_area_ratio,d.confirmation_ms,d.quiet_ms,
+                              d.cooldown_ms,d.snapshot_enabled
+                       FROM zones z LEFT JOIN zone_detection_settings d ON d.zone_id=z.id
+                       WHERE z.camera_id=? AND z.enabled=1 ORDER BY z.id""",
+                    (camera["id"],),
+                ):
+                    if zone["kind"] == "alarm":
+                        if not zone["detection_enabled"]:
+                            continue
+                        zone_schedules = conn.execute(
+                            """SELECT weekday,start_minute,end_minute
+                               FROM zone_detection_schedules WHERE zone_id=?""",
+                            (zone["id"],),
+                        ).fetchall()
+                        if not detection_schedule_active(zone_schedules):
+                            continue
+                    zones.append(
+                        {
+                            "id": zone["id"],
+                            "name": zone["name"],
+                            "kind": zone["kind"],
+                            "points": json.loads(zone["points_json"]),
+                            "sensitivity": int(zone["sensitivity"] or 50),
+                            "minAreaRatio": float(zone["min_area_ratio"] or 0.015),
+                            "confirmationSeconds": float(zone["confirmation_ms"] or 1000) / 1000,
+                            "quietSeconds": float(zone["quiet_ms"] or 5000) / 1000,
+                            "cooldownSeconds": float(zone["cooldown_ms"] or 30000) / 1000,
+                            "snapshotEnabled": bool(zone["snapshot_enabled"] or 0),
+                        }
+                    )
+                if any(zone["kind"] == "alarm" for zone in zones):
+                    cameras.append(
+                        {
+                            "id": camera["id"],
+                            "name": camera["name"],
+                            "streamPath": camera["low_path"],
+                            "rtspUrl": f"rtsp://mediamtx:8554/{quote(camera['low_path'], safe='/-_.')}",
+                            "zones": zones,
+                        }
+                    )
+        stamp = now_iso()
+        conn.execute(
+            """UPDATE detection_settings SET worker_last_seen_at=?,
+               updated_at=updated_at WHERE id=1""",
+            (stamp,),
+        )
+    return {
+        "enabled": settings["mode"] != "off",
+        "mode": settings["mode"],
+        "revision": settings["revision"],
+        "timezone": CAMERA_HUB_TIMEZONE,
+        "frameRate": 3,
+        "width": 640,
+        "height": 360,
+        "warmupSeconds": 10,
+        "sceneChangeRatio": 0.60,
+        "cameras": cameras,
+    }
 
 
-@app.post("/internal/v1/events")
-def detection_events(_: None = Depends(require_internal)):
-    raise HTTPException(503, "detection-adapter-disabled")
+@app.post("/internal/v1/detection/status")
+def detection_worker_status(
+    body: DetectionWorkerStatus, _: None = Depends(require_detection_adapter)
+):
+    stamp = now_iso()
+    with DB_LOCK, connect() as conn:
+        conn.execute(
+            """UPDATE detection_settings SET worker_last_seen_at=?,
+               worker_status_json=? WHERE id=1""",
+            (stamp, json.dumps(body.model_dump(), separators=(",", ":"))),
+        )
+    return {"accepted": True, "at": stamp}
+
+
+def motion_event_row(conn: sqlite3.Connection, worker_event_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """SELECT * FROM system_events WHERE dedupe_key=?
+           ORDER BY created_at DESC LIMIT 1""",
+        (f"zone.motion:{worker_event_id}",),
+    ).fetchone()
+
+
+@app.post("/internal/v1/detection/events")
+def detection_events(
+    body: DetectionEventInput, _: None = Depends(require_detection_adapter)
+):
+    stamp = now_iso()
+    with DB_LOCK, connect() as conn:
+        settings = detection_settings_payload(conn)
+        existing = motion_event_row(conn, body.workerEventId)
+        if existing and existing["status"] == "resolved":
+            return {
+                "accepted": True, "duplicate": True,
+                "eventId": existing["id"], "status": "resolved",
+            }
+        if body.state != "ended":
+            camera = conn.execute(
+                """SELECT c.id,c.name,c.enabled,c.on_demand,c.protocol,d.enabled AS detection_enabled
+                   FROM cameras c LEFT JOIN camera_detection_settings d ON d.camera_id=c.id
+                   WHERE c.id=?""",
+                (body.cameraId,),
+            ).fetchone()
+            zone = conn.execute(
+                """SELECT z.*,d.enabled AS detection_enabled,d.snapshot_enabled
+                   FROM zones z LEFT JOIN zone_detection_settings d ON d.zone_id=z.id
+                   WHERE z.id=? AND z.camera_id=?""",
+                (body.zoneId, body.cameraId),
+            ).fetchone()
+            if (
+                settings["mode"] == "off" or not camera or not zone
+                or not camera["enabled"] or camera["on_demand"]
+                or camera["protocol"] in {"snapshot", "external"}
+                or not camera["detection_enabled"] or zone["kind"] != "alarm"
+                or not zone["enabled"] or not zone["detection_enabled"]
+            ):
+                raise HTTPException(409, "detection-event-not-authorized")
+            camera_schedules = conn.execute(
+                "SELECT * FROM camera_detection_schedules WHERE camera_id=?",
+                (body.cameraId,),
+            ).fetchall()
+            zone_schedules = conn.execute(
+                "SELECT * FROM zone_detection_schedules WHERE zone_id=?",
+                (body.zoneId,),
+            ).fetchall()
+            if not detection_schedule_active(camera_schedules) or not detection_schedule_active(zone_schedules):
+                raise HTTPException(409, "detection-schedule-inactive")
+        elif not existing:
+            return {"accepted": True, "duplicate": True, "status": "resolved"}
+
+        if body.state == "ended":
+            conn.execute(
+                """UPDATE system_events SET status='resolved',last_seen_at=?,resolved_at=?,
+                   updated_at=? WHERE id=? AND status='open'""",
+                (stamp, stamp, stamp, existing["id"]),
+            )
+            event = conn.execute(
+                "SELECT * FROM system_events WHERE id=?", (existing["id"],)
+            ).fetchone()
+            if (
+                existing["status"] == "open"
+                and json.loads(existing["details_json"] or "{}").get("notificationsEnabled")
+            ):
+                enqueue_event_webhooks(conn, event, "resolved")
+            return {"accepted": True, "eventId": event["id"], "status": event["status"]}
+
+        details = {
+            "workerEventId": body.workerEventId,
+            "zoneId": body.zoneId,
+            "zoneName": zone["name"],
+            "motionPercent": round(body.motionPercent, 3),
+            "strength": round(body.strength, 2),
+            "snapshotEnabled": bool(zone["snapshot_enabled"]),
+            "snapshotAvailable": bool(existing and conn.execute(
+                "SELECT 1 FROM motion_event_assets WHERE event_id=?", (existing["id"],)
+            ).fetchone()),
+            "notificationsEnabled": (
+                json.loads(existing["details_json"] or "{}").get("notificationsEnabled")
+                if existing else settings["mode"] == "armed"
+            ),
+        }
+        if not existing:
+            event_id = str(uuid.uuid4())
+            conn.execute(
+                """INSERT INTO system_events(
+                   id,dedupe_key,event_type,severity,status,camera_id,started_at,last_seen_at,
+                   opened_at,title,description,recommendation,details_json,created_at,updated_at)
+                   VALUES(?,?,'zone.motion','warning','open',?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    event_id, f"zone.motion:{body.workerEventId}", body.cameraId,
+                    stamp, stamp, stamp, f"Bewegung in {zone['name']}",
+                    f"Die Kamera {camera['name']} erkennt Bewegung in der Alarmzone {zone['name']}.",
+                    "Livebild prüfen und den Alarm im aktuellen Browser quittieren.",
+                    json.dumps(details, separators=(",", ":")), stamp, stamp,
+                ),
+            )
+            event = conn.execute(
+                "SELECT * FROM system_events WHERE id=?", (event_id,)
+            ).fetchone()
+            if settings["mode"] == "armed":
+                enqueue_event_webhooks(conn, event, "open")
+        else:
+            conn.execute(
+                """UPDATE system_events SET last_seen_at=?,details_json=?,updated_at=?
+                   WHERE id=? AND status='open'""",
+                (stamp, json.dumps(details, separators=(",", ":")), stamp, existing["id"]),
+            )
+            event = conn.execute(
+                "SELECT * FROM system_events WHERE id=?", (existing["id"],)
+            ).fetchone()
+        return {
+            "accepted": True, "eventId": event["id"], "status": event["status"],
+            "snapshotRequested": bool(details["snapshotEnabled"] and not details["snapshotAvailable"]),
+        }
+
+
+def jpeg_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 4 or data[:2] != b"\xff\xd8" or data[-2:] != b"\xff\xd9":
+        raise HTTPException(415, "motion-snapshot-not-jpeg")
+    offset = 2
+    while offset + 9 < len(data):
+        if data[offset] != 0xFF:
+            offset += 1
+            continue
+        marker = data[offset + 1]
+        offset += 2
+        if marker in {0xD8, 0xD9}:
+            continue
+        if offset + 2 > len(data):
+            break
+        length = int.from_bytes(data[offset:offset + 2], "big")
+        if length < 2 or offset + length > len(data):
+            break
+        if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}:
+            height = int.from_bytes(data[offset + 3:offset + 5], "big")
+            width = int.from_bytes(data[offset + 5:offset + 7], "big")
+            if not width or not height:
+                break
+            return width, height
+        offset += length
+    raise HTTPException(415, "motion-snapshot-invalid-jpeg")
+
+
+@app.post("/internal/v1/detection/events/{event_id}/snapshot")
+async def detection_snapshot(
+    event_id: str,
+    request: FastAPIRequest,
+    _: None = Depends(require_detection_adapter),
+):
+    data = await request.body()
+    if len(data) > 256 * 1024:
+        raise HTTPException(413, "motion-snapshot-too-large")
+    width, height = jpeg_dimensions(data)
+    if width > 640 or height > 360:
+        raise HTTPException(422, "motion-snapshot-dimensions-too-large")
+    MOTION_ASSET_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp, expires = now_iso(), int(time.time()) + MOTION_ASSET_RETENTION_SECONDS
+    nonce = secrets.token_bytes(12)
+    aad = f"camera-hub-motion-v1:{event_id}".encode()
+    ciphertext = AESGCM(AES_KEY).encrypt(nonce, data, aad)
+    filename = f"{event_id}.bin"
+    temp = MOTION_ASSET_ROOT / f".{event_id}.{uuid.uuid4().hex}.tmp"
+    target = MOTION_ASSET_ROOT / filename
+    with DB_LOCK, connect() as conn:
+        event = conn.execute(
+            "SELECT details_json FROM system_events WHERE id=? AND event_type='zone.motion'",
+            (event_id,),
+        ).fetchone()
+        if not event:
+            raise HTTPException(404, "motion-event-not-found")
+        details = json.loads(event["details_json"] or "{}")
+        if not details.get("snapshotEnabled"):
+            raise HTTPException(409, "motion-snapshot-not-enabled")
+        if conn.execute(
+            "SELECT 1 FROM motion_event_assets WHERE event_id=?", (event_id,)
+        ).fetchone():
+            return {"stored": True, "duplicate": True}
+        temp.write_bytes(ciphertext)
+        os.replace(temp, target)
+        try:
+            conn.execute(
+                """INSERT INTO motion_event_assets(
+                   event_id,asset_path,nonce,mime_type,width,height,plain_size,created_at,expires_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    event_id, filename, nonce, "image/jpeg", width, height,
+                    len(data), stamp, expires,
+                ),
+            )
+            details["snapshotAvailable"] = True
+            conn.execute(
+                "UPDATE system_events SET details_json=?,updated_at=? WHERE id=?",
+                (json.dumps(details, separators=(",", ":")), stamp, event_id),
+            )
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+    return {"stored": True, "width": width, "height": height, "bytes": len(data)}
 
 
 @app.on_event("startup")

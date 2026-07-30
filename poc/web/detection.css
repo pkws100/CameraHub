@@ -1,0 +1,25 @@
+.detection-camera-settings{margin-top:1rem;padding:.75rem;border:1px solid var(--line);border-radius:12px;background:#091713}
+.detection-setting-head{display:flex;justify-content:space-between;gap:.5rem;margin-bottom:.65rem}
+.detection-setting-head span{color:var(--muted);font-size:.7rem;text-align:right}
+.detection-camera-settings details,.zone-detection-details{margin-top:.65rem}
+.detection-camera-settings summary,.zone-detection-details summary{cursor:pointer;color:var(--mint);font-weight:750}
+.detection-schedules{display:grid;gap:.4rem;margin:.6rem 0}
+.detection-schedule{display:grid;grid-template-columns:1fr .8fr .8fr auto;gap:.35rem;align-items:end}
+.detection-schedule button{padding:.65rem}
+.zone-entry{grid-template-columns:auto 1fr auto}
+.zone-entry .zone-detection-details{grid-column:1/-1;width:100%}
+.zone-detection-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.45rem;margin-top:.6rem}
+.zone-detection-grid label{margin:0}
+.zone-detection-grid .check-label{grid-column:1/-1}
+.detection-mode-control{display:flex;align-items:end;gap:.45rem}
+.detection-mode-control label{min-width:150px}
+.detection-status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.55rem}
+.detection-status-grid span{padding:.7rem;border:1px solid var(--line);border-radius:11px;color:var(--muted);font-size:.72rem}
+.detection-status-grid strong{display:block;margin-top:.2rem;color:var(--text);font-size:.92rem}
+.detection-browser-controls{display:flex;flex-wrap:wrap;gap:1rem;margin-top:.8rem}
+.motion-alert-banner{position:fixed;z-index:70;top:max(1rem,env(safe-area-inset-top));left:50%;transform:translateX(-50%);width:min(720px,calc(100% - 2rem));display:flex;justify-content:space-between;align-items:center;gap:1rem;padding:1rem;border:1px solid #ff9d67;border-radius:16px;background:#2b1711f5;box-shadow:0 24px 80px #000b}
+.motion-alert-banner[hidden]{display:none}
+.motion-alert-banner strong,.motion-alert-banner span{display:block}
+.motion-alert-banner span{margin-top:.25rem;color:#e2c8bb;font-size:.75rem}
+.motion-alert-actions{display:flex;gap:.5rem}
+@media(max-width:760px){.detection-status-grid{grid-template-columns:1fr 1fr}.detection-mode-control,.motion-alert-banner{align-items:stretch;display:grid}.motion-alert-actions{display:grid}.detection-schedule{grid-template-columns:1fr 1fr}.detection-schedule label:first-child{grid-column:1/-1}.zone-detection-grid{grid-template-columns:1fr}}

@@ -7,7 +7,7 @@ proprietären Hersteller-Plug-ins. Für CZEview-Akku-Kameras und freigegebene
 Netatmo-Sicherheitskameras stehen getrennte, bedarfsgesteuerte Cloud-Adapter
 bereit.
 
-> **Entwicklungsstand 1.4.0:** Dieser Stand ist für einen selbst verwalteten
+> **Entwicklungsstand 1.5.0:** Dieser Stand ist für einen selbst verwalteten
 > privaten Docker-Host vorgesehen. Vor einer Erreichbarkeit über das Internet
 > müssen WireGuard, ein HTTPS-Reverse-Proxy und eine zusätzliche
 > Netzsegmentierung eingerichtet werden.
@@ -24,8 +24,9 @@ den Eigentümer festgelegt. Diese erstmalige Kontoanlage ist ausschließlich üb
 Loopback möglich. Nach der Einrichtung zeigt die App nur noch die normale
 Anmeldung mit Benutzername und Passwort.
 
-Der Start erzeugt zwei lokale Schlüsseldateien unter `poc/runtime/secrets/`.
-Sie verschlüsseln Kamera-Zugangsdaten und schützen interne APIs. Das gesamte
+Der Start erzeugt die benötigten lokalen Schlüsseldateien unter
+`poc/runtime/secrets/`. Sie verschlüsseln Kamera-Zugangsdaten und
+Bewegungsbilder und schützen die voneinander getrennten internen APIs. Das gesamte
 Runtime-Verzeichnis ist ignoriert. Ein Verlust des Kameraschlüssels macht
 verschlüsselte Zugangsdaten unlesbar; deshalb gehört es in ein geschütztes,
 lokales Backup.
@@ -65,6 +66,25 @@ Die Netatmo-App-Einrichtung und die bewusst begrenzten Rechte beschreibt
 Der geprüfte Gesamtstand der Mehrkonto-Verwaltung ist in
 [CLOUD-ACCOUNT-COMPLETION-REPORT.md](CLOUD-ACCOUNT-COMPLETION-REPORT.md)
 dokumentiert.
+
+## Lokale Alarmzonenerkennung
+
+Der optionale Dienst `detection-worker` liest ausschließlich bereits laufende
+MediaMTX-Dauerstreams. Akku-, Cloud-, Snapshot- und andere On-Demand-Kameras
+werden serverseitig ausgeschlossen und dadurch nicht zusätzlich geweckt. Die
+Erkennung startet nach der Migration immer in der Betriebsart **Aus**.
+
+Unter **Alarmzonen** lassen sich unterstützte Kameras und einzelne Alarmzonen
+aktivieren, Empfindlichkeit, Mindestfläche, Bestätigungs-, Ruhe- und Sperrzeit
+festlegen sowie Wochenzeitfenster konfigurieren. Unter **Systemstatus** stehen
+die Betriebsarten **Aus**, **Beobachten** und **Scharf** zur Verfügung.
+Beobachten speichert nur Bewegungsmetadaten; erst Scharf sendet Browseralarme
+und ausgewählte HMAC-Webhooks. Beweisbilder sind je Zone optional, auf
+640×360 Pixel und 256 KB begrenzt, verschlüsselt und nicht Bestandteil von
+Sicherungen.
+
+Architektur, Datenschutzgrenzen, Einführung und Rückfall beschreibt
+[DETECTION-INTEGRATION.md](DETECTION-INTEGRATION.md).
 
 ## Betriebssicherheit
 
