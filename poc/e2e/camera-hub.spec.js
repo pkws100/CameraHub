@@ -56,6 +56,9 @@ async function mockApplication(page, count, {stream = false, profilePayload = nu
     if (url.pathname === '/api/display-profiles') return route.fulfill({json: profilePayload || {profiles: [], cameraOptions: cameras.map(({id, name, enabled, position}) => ({id, name, enabled, position}))}});
     if (url.pathname === '/api/cameras') return route.fulfill({json: {cameras}});
     if (url.pathname === '/api/health') return route.fulfill({json: {mediaMTX: 'online', cameras: cameras.map(item => ({camera: item.id, state: 'live'}))}});
+    if (url.pathname === '/api/detection/status') return route.fulfill({json: {mode: 'off', timezone: 'Europe/Berlin', configuredCameras: 0, configuredZones: 0, openMotionEvents: 0, worker: {state: 'paused', online: true, activeCameras: 0, processingDelayMs: 0}}});
+    if (/^\/api\/admin\/cameras\/[^/]+\/zones$/.test(url.pathname)) return route.fulfill({json: {cameraId: url.pathname.split('/')[4], revision: 0, zones: []}});
+    if (/^\/api\/admin\/cameras\/[^/]+\/detection$/.test(url.pathname)) return route.fulfill({json: {cameraId: url.pathname.split('/')[4], supported: true, enabled: false, schedules: [], zones: []}});
     if (url.pathname.includes('/lease')) {
       return route.request().method() === 'DELETE'
         ? route.fulfill({status: 204})
@@ -67,6 +70,54 @@ async function mockApplication(page, count, {stream = false, profilePayload = nu
     return route.fulfill({status: 404, json: {detail: 'e2e-unhandled'}});
   });
 }
+
+test('Alarmzonenerkennung ist standardmäßig aus und Browseralarm ist lokal quittierbar', async ({page}) => {
+  await page.addInitScript(() => localStorage.setItem('pkws-motion-alerts', '1'));
+  await mockApplication(page, 1);
+  await page.route('**/api/detection/events/stream', route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: 'event: zone.motion\ndata: {"eventId":"motion-1","cameraId":"camera-1","cameraName":"Kamera 1","zoneName":"Tor","startedAt":"2026-07-27T10:00:00Z"}\n\n'
+  }));
+  await page.goto('/index.html#system');
+  await expect(page.locator('#detection-mode')).toHaveValue('off');
+  await expect(page.locator('#detection-worker-state')).toContainText('Pausiert');
+  await expect(page.locator('#motion-alert-banner')).toBeVisible();
+  await expect(page.locator('#motion-alert-title')).toContainText('Kamera 1 · Tor');
+  await page.locator('#motion-alert-dismiss').click();
+  await expect(page.locator('#motion-alert-banner')).toBeHidden();
+});
+
+test('Kamera- und Zonenerkennung bleiben konfigurierbar', async ({page}) => {
+  await mockApplication(page, 1);
+  let savedDetection = null;
+  const zone = {id: 'zone-1', name: 'Tor', kind: 'alarm', enabled: true, points: [{x: .1, y: .1}, {x: .9, y: .1}, {x: .9, y: .9}]};
+  await page.route('**/api/admin/cameras/camera-1/zones', route => route.request().method() === 'PUT'
+    ? route.fulfill({json: {cameraId: 'camera-1', revision: 2, zones: [zone]}})
+    : route.fulfill({json: {cameraId: 'camera-1', revision: 1, zones: [zone]}}));
+  await page.route('**/api/admin/cameras/camera-1/detection', route => {
+    if (route.request().method() === 'PUT') {
+      savedDetection = route.request().postDataJSON();
+      return route.fulfill({json: {cameraId: 'camera-1', supported: true, ...savedDetection}});
+    }
+    return route.fulfill({json: {
+      cameraId: 'camera-1',
+      supported: true,
+      enabled: true,
+      schedules: [],
+      zones: [{zoneId: 'zone-1', name: 'Tor', kind: 'alarm', enabled: true, sensitivity: 50, minAreaPercent: 1.5, confirmationSeconds: 1, quietSeconds: 5, cooldownSeconds: 30, snapshotEnabled: false, schedules: []}]
+    }});
+  });
+  await page.goto('/index.html#zones');
+  await expect(page.locator('#detection-camera-enabled')).toBeChecked();
+  await page.locator('.zone-detection-details').click();
+  await page.locator('[data-field="sensitivity"]').fill('65');
+  await page.locator('#zone-save').click();
+  await expect.poll(() => savedDetection).not.toBeNull();
+  expect(savedDetection.enabled).toBeTruthy();
+  expect(savedDetection.zones[0].sensitivity).toBe(65);
+  expect(savedDetection.zones[0].snapshotEnabled).toBeFalsy();
+});
 
 for (const count of [1, 2, 4, 6, 11]) {
   test(`Leitstellenraster bleibt bei ${count} Kameras gleichmäßig und vollständig`, async ({page}) => {

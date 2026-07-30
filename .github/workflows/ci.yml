@@ -22,8 +22,12 @@ jobs:
           mkdir -p poc/runtime/acceptance
           printf 'ci-only-placeholder\n' > poc/runtime/secrets/zmodo_secret_key
           printf 'ci-only-placeholder\n' > poc/runtime/secrets/zmodo_internal_token
+          printf 'ci-only-placeholder\n' > poc/runtime/secrets/czeview_adapter_token
+          printf 'ci-only-placeholder\n' > poc/runtime/secrets/netatmo_adapter_token
+          printf 'ci-only-placeholder\n' > poc/runtime/secrets/detection_adapter_token
           printf 'ci-only-placeholder\n' > poc/runtime/acceptance/zmodo_secret_key
           printf 'ci-only-placeholder\n' > poc/runtime/acceptance/zmodo_internal_token
+          printf 'ci-only-placeholder\n' > poc/runtime/acceptance/detection_adapter_token
 
       - name: Validate JavaScript
         run: |
@@ -89,6 +93,12 @@ jobs:
           docker run --rm --entrypoint python -e PYTHONPATH=/app camerahub-czeview-ci \
             -m unittest discover -s /app/tests -p 'test_*.py'
 
+      - name: Build and test detection worker
+        run: |
+          docker build -t camerahub-detection-ci poc/detection
+          docker run --rm --entrypoint python -e PYTHONPATH=/app camerahub-detection-ci \
+            -m unittest discover -s /app/tests -p 'test_*.py'
+
       - name: Install browser test dependencies
         run: npm ci
 
@@ -103,6 +113,7 @@ jobs:
           mkdir -p poc/runtime/acceptance
           openssl rand -base64 32 > poc/runtime/acceptance/zmodo_secret_key
           openssl rand -base64 32 > poc/runtime/acceptance/zmodo_internal_token
+          openssl rand -base64 32 > poc/runtime/acceptance/detection_adapter_token
 
       - name: Start real Caddy, MediaMTX and synthetic H.264 stack
         run: docker compose -f poc/acceptance/docker-compose.yml up -d --build --wait

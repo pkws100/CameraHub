@@ -60,7 +60,7 @@ os.environ.update({
 import uvicorn
 import app as camera_app
 
-# Prove the additive 1.3.2/1.3.3 -> 1.4 schema path before the main API test.
+# Prove the additive 1.3.2/1.3.3 -> 1.5 schema path before the main API test.
 legacy_db = os.path.join(TEMP, "legacy-1.3.3.db")
 with sqlite3.connect(legacy_db) as legacy:
     legacy.executescript(
@@ -83,7 +83,7 @@ with camera_app.connect() as migrated:
         row["name"] for row in migrated.execute("PRAGMA table_info(display_profile_cameras)")
     }
     assert migrated.execute(
-        "SELECT 1 FROM schema_migrations WHERE version=9"
+        "SELECT 1 FROM schema_migrations WHERE version=10"
     ).fetchone()
 camera_app.DB_PATH = main_db_path
 
@@ -599,6 +599,177 @@ try:
     assert request("/api/admin/cameras/garten/zones", "PUT", zone_payload, csrf)["revision"] == 1
     zones = request("/api/admin/cameras/garten/zones")
     assert zones["zones"][0]["points"][2] == {"x": .5, "y": .8}
+    zone_id = zones["zones"][0]["id"]
+    detection_camera = request("/api/admin/cameras/garten/detection")
+    assert detection_camera["supported"] is True and detection_camera["enabled"] is False
+    configured_detection = request(
+        "/api/admin/cameras/garten/detection",
+        "PUT",
+        {
+            "enabled": True,
+            "schedules": [],
+            "zones": [{
+                "zoneId": zone_id,
+                "enabled": True,
+                "sensitivity": 50,
+                "minAreaPercent": 1.5,
+                "confirmationSeconds": 1,
+                "quietSeconds": 5,
+                "cooldownSeconds": 30,
+                "snapshotEnabled": True,
+                "schedules": [],
+            }],
+        },
+        csrf,
+    )
+    assert configured_detection["enabled"] is True
+    with camera_app.connect() as conn:
+        camera_app.replace_detection_schedules(
+            conn,
+            "camera_detection_schedules",
+            "camera_id",
+            "garten",
+            [camera_app.DetectionScheduleInput(
+                weekday=0, startMinute=1320, endMinute=120
+            )],
+        )
+        split = conn.execute(
+            """SELECT weekday,start_minute,end_minute
+               FROM camera_detection_schedules
+               WHERE camera_id='garten' ORDER BY position"""
+        ).fetchall()
+        assert [tuple(row) for row in split] == [(0, 1320, 1440), (1, 0, 120)]
+        conn.execute("DELETE FROM camera_detection_schedules WHERE camera_id='garten'")
+    assert request(
+        "/api/owner/detection", "PUT", {"mode": "observe"}, csrf
+    )["mode"] == "observe"
+    internal_config = urllib.request.Request(
+        base + "/internal/v1/detection/config",
+        headers={"Authorization": f"Bearer {camera_app.DETECTION_ADAPTER_TOKEN}"},
+    )
+    with urllib.request.urlopen(internal_config, timeout=5) as response:
+        live_detection = json.load(response)
+    assert live_detection["enabled"] is True
+    assert [item["id"] for item in live_detection["cameras"]] == ["garten"]
+    assert all("sourceUri" not in item for item in live_detection["cameras"])
+    worker_event_id = uuid.uuid4().hex
+    motion_body = {
+        "workerEventId": worker_event_id,
+        "cameraId": "garten",
+        "zoneId": zone_id,
+        "state": "started",
+        "motionPercent": 3.2,
+        "strength": 72,
+    }
+    motion_request = urllib.request.Request(
+        base + "/internal/v1/detection/events",
+        data=json.dumps(motion_body).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {camera_app.DETECTION_ADAPTER_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(motion_request, timeout=5) as response:
+        motion_started = json.load(response)
+    assert motion_started["status"] == "open" and motion_started["snapshotRequested"]
+    motion_view = request("/api/events?status=open&eventType=zone.motion")
+    assert motion_view["summary"]["open"] == 1
+    assert all(item["type"] == "zone.motion" for item in motion_view["events"])
+    tiny_jpeg = bytes.fromhex("ffd8ffc0000b080001000101011100ffd9")
+    snapshot_request = urllib.request.Request(
+        base + f"/internal/v1/detection/events/{motion_started['eventId']}/snapshot",
+        data=tiny_jpeg,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {camera_app.DETECTION_ADAPTER_TOKEN}",
+            "Content-Type": "image/jpeg",
+        },
+    )
+    with urllib.request.urlopen(snapshot_request, timeout=5) as response:
+        assert json.load(response)["stored"] is True
+    motion_snapshot = urllib.request.Request(
+        base + f"/api/motion-events/{motion_started['eventId']}/snapshot",
+        headers={"Host": "127.0.0.1"},
+    )
+    with client.open(motion_snapshot, timeout=5) as response:
+        assert response.read() == tiny_jpeg
+        assert response.headers["Cache-Control"] == "no-store, private"
+    with camera_app.connect() as conn:
+        asset = conn.execute(
+            "SELECT asset_path FROM motion_event_assets WHERE event_id=?",
+            (motion_started["eventId"],),
+        ).fetchone()
+    asset_file = camera_app.MOTION_ASSET_ROOT / asset["asset_path"]
+    encrypted_asset = asset_file.read_bytes()
+    assert tiny_jpeg not in encrypted_asset
+    asset_file.write_bytes(b"corrupted")
+    assert request(
+        f"/api/motion-events/{motion_started['eventId']}/snapshot",
+        expected=500,
+    )["detail"] == "motion-snapshot-decryption-failed"
+    asset_file.unlink()
+    assert request(
+        f"/api/motion-events/{motion_started['eventId']}/snapshot",
+        expected=404,
+    )["detail"] == "motion-snapshot-not-found"
+    asset_file.write_bytes(encrypted_asset)
+    with camera_app.connect() as conn:
+        conn.execute(
+            "UPDATE motion_event_assets SET expires_at=0 WHERE event_id=?",
+            (motion_started["eventId"],),
+        )
+    assert camera_app.detection_maintenance_once()["removedAssets"] == 1
+    assert not asset_file.exists()
+    with camera_app.connect() as conn:
+        cleaned_details = json.loads(conn.execute(
+            "SELECT details_json FROM system_events WHERE id=?",
+            (motion_started["eventId"],),
+        ).fetchone()["details_json"])
+    assert cleaned_details["snapshotAvailable"] is False
+    with urllib.request.urlopen(motion_request, timeout=5) as response:
+        assert json.load(response)["eventId"] == motion_started["eventId"]
+    motion_body["state"] = "ended"
+    motion_end_request = urllib.request.Request(
+        base + "/internal/v1/detection/events",
+        data=json.dumps(motion_body).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {camera_app.DETECTION_ADAPTER_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(motion_end_request, timeout=5) as response:
+        assert json.load(response)["status"] == "resolved"
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM system_events WHERE dedupe_key=?",
+            (f"zone.motion:{worker_event_id}",),
+        ).fetchone()[0] == 1
+    request("/api/owner/detection", "PUT", {"mode": "observe"}, csrf)
+    stale_motion_id = uuid.uuid4().hex
+    stale_motion = camera_app.detection_events(
+        camera_app.DetectionEventInput(
+            workerEventId=stale_motion_id,
+            cameraId="garten",
+            zoneId=zone_id,
+            state="started",
+            motionPercent=2,
+            strength=55,
+        ),
+        None,
+    )
+    with camera_app.connect() as conn:
+        conn.execute(
+            "UPDATE detection_settings SET worker_last_seen_at=? WHERE id=1",
+            ("2020-01-01T00:00:00+00:00",),
+        )
+    assert camera_app.detection_maintenance_once()["resolvedEvents"] >= 1
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT status FROM system_events WHERE id=?", (stale_motion["eventId"],)
+        ).fetchone()["status"] == "resolved"
+    assert request("/api/owner/detection", "PUT", {"mode": "off"}, csrf)["mode"] == "off"
 
     vendor_secret = "Vendor-Only-Test-Secret!"
     original_ffprobe = camera_app.ffprobe_uri
@@ -876,10 +1047,10 @@ try:
     camera_app.capture_rtsp_frame = original_capture_frame
     assert configured_paths == ["garten-low"]
 
-    internal = urllib.request.Request(base + "/internal/v1/detection/cameras", headers={"Authorization": f"Bearer {camera_app.INTERNAL_TOKEN}"})
+    internal = urllib.request.Request(base + "/internal/v1/detection/config", headers={"Authorization": f"Bearer {camera_app.DETECTION_ADAPTER_TOKEN}"})
     with urllib.request.urlopen(internal, timeout=5) as response:
         detection = json.load(response)
-    assert detection["enabled"] is False and detection["cameras"]
+    assert detection["enabled"] is False and detection["cameras"] == []
 
     external_payload = {
         "name": "CZEview Test", "path": "czeview-low", "sourceLabel": "CZEview P2P · bei Bedarf",
@@ -901,6 +1072,13 @@ try:
     assert external_camera["features"]["ptz"] and external_camera["features"]["ptzAxes"] == ["x"]
     external_admin = next(item for item in request("/api/admin/cameras")["cameras"] if item["id"] == "czeview")
     assert external_admin["relayMode"] == "external-on-demand"
+    assert request(
+        "/api/admin/cameras/czeview/detection",
+        "PUT",
+        {"enabled": True, "schedules": [], "zones": []},
+        csrf,
+        expected=409,
+    )["detail"] == "detection-camera-not-supported"
     external_capabilities = request("/api/admin/cameras/czeview/capabilities")
     assert external_capabilities["available"] and external_capabilities["profiles"][0]["token"] == "external"
     assert external_capabilities["ptz"]["axes"] == ["x"]
@@ -1233,7 +1411,12 @@ try:
 
     with camera_app.connect() as conn:
         assert conn.execute("SELECT 1 FROM schema_migrations WHERE version=8").fetchone()
-        for table in ("system_events", "webhook_targets", "webhook_deliveries"):
+        for table in (
+            "system_events", "webhook_targets", "webhook_deliveries",
+            "detection_settings", "camera_detection_settings",
+            "zone_detection_settings", "camera_detection_schedules",
+            "zone_detection_schedules", "motion_event_assets",
+        ):
             assert conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
             ).fetchone()
@@ -1256,7 +1439,7 @@ try:
             "label": "Lokaler Test",
             "url": "http://127.0.0.1:18099/events",
             "enabled": True,
-            "eventTypes": ["camera.offline"],
+            "eventTypes": ["camera.offline", "zone.motion"],
         },
         csrf,
         expected=201,
@@ -1369,6 +1552,74 @@ try:
         assert json.loads(captured_webhooks[-1][0].data)["status"] == "resolved"
     finally:
         camera_app.NO_REDIRECT_OPENER = original_webhook_opener
+
+    assert request(
+        "/api/owner/detection", "PUT", {"mode": "observe"}, csrf
+    )["mode"] == "observe"
+    observe_motion_id = uuid.uuid4().hex
+    observe_motion = camera_app.DetectionEventInput(
+        workerEventId=observe_motion_id,
+        cameraId="garten",
+        zoneId=zone_id,
+        state="started",
+        motionPercent=2,
+        strength=60,
+    )
+    observe_started = camera_app.detection_events(observe_motion, None)
+    observe_motion.state = "ended"
+    camera_app.detection_events(observe_motion, None)
+    with camera_app.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM webhook_deliveries WHERE event_id=?",
+            (observe_started["eventId"],),
+        ).fetchone()[0] == 0
+
+    assert request(
+        "/api/owner/detection", "PUT", {"mode": "armed"}, csrf
+    )["mode"] == "armed"
+    armed_motion_id = uuid.uuid4().hex
+    armed_motion = camera_app.DetectionEventInput(
+        workerEventId=armed_motion_id,
+        cameraId="garten",
+        zoneId=zone_id,
+        state="started",
+        motionPercent=2.4,
+        strength=66,
+    )
+    armed_started = camera_app.detection_events(armed_motion, None)
+    with camera_app.connect() as conn:
+        motion_delivery = conn.execute(
+            """SELECT d.*,e.details_json FROM webhook_deliveries d
+               JOIN system_events e ON e.id=d.event_id
+               WHERE e.dedupe_key=? AND d.event_status='open'""",
+            (f"zone.motion:{armed_motion_id}",),
+        ).fetchone()
+        assert motion_delivery
+    camera_app.NO_REDIRECT_OPENER = TestWebhookOpener()
+    try:
+        assert camera_app.dispatch_due_webhooks(
+            now_epoch=int(time.time()) + 3, delivery_id=motion_delivery["id"]
+        ) == 1
+        motion_payload = json.loads(captured_webhooks[-1][0].data)
+        assert motion_payload["type"] == "zone.motion"
+        assert motion_payload["motion"]["zoneId"] == zone_id
+        assert "url" not in json.dumps(motion_payload).lower()
+        armed_motion.state = "ended"
+        camera_app.detection_events(armed_motion, None)
+        with camera_app.connect() as conn:
+            resolution = conn.execute(
+                """SELECT id FROM webhook_deliveries
+                   WHERE event_id=? AND event_status='resolved'""",
+                (armed_started["eventId"],),
+            ).fetchone()
+        assert resolution
+        assert camera_app.dispatch_due_webhooks(
+            now_epoch=int(time.time()) + 4, delivery_id=resolution["id"]
+        ) == 1
+        assert json.loads(captured_webhooks[-1][0].data)["status"] == "resolved"
+    finally:
+        camera_app.NO_REDIRECT_OPENER = original_webhook_opener
+    request("/api/owner/detection", "PUT", {"mode": "off"}, csrf)
 
     retry_delivery_id, retry_now = str(uuid.uuid4()), int(time.time())
     with camera_app.connect() as conn:
@@ -1554,7 +1805,7 @@ try:
     manifest, backup_database, source_key = camera_app.decode_backup_archive(
         backup_archive, backup_passphrase
     )
-    assert manifest["schemaVersion"] == 9 and manifest["appVersion"] == "1.4.0-dev"
+    assert manifest["schemaVersion"] == 10 and manifest["appVersion"] == "1.5.0-dev"
     assert len(backup_database) <= camera_app.BACKUP_DATABASE_MAX_BYTES
     assert camera_app.BACKUP_EXPANDED_MAX_BYTES > len(base64.b64encode(backup_database))
     for invalid_archive, invalid_passphrase, expected_code in (
@@ -1597,6 +1848,24 @@ try:
                 "SELECT COUNT(*) FROM display_profile_schedules WHERE profile_id=?",
                 (backup_profile["id"],),
             ).fetchone()[0] == 2
+            assert portable.execute(
+                "SELECT COUNT(*) FROM motion_event_assets"
+            ).fetchone()[0] == 0
+            assert portable.execute(
+                "SELECT mode FROM detection_settings WHERE id=1"
+            ).fetchone()["mode"] == "off"
+            assert portable.execute(
+                """SELECT enabled FROM camera_detection_settings
+                   WHERE camera_id='garten'"""
+            ).fetchone()["enabled"] == 1
+            assert portable.execute(
+                """SELECT COUNT(*) FROM zone_detection_settings
+                   WHERE enabled=1"""
+            ).fetchone()[0] >= 1
+            assert portable.execute(
+                """SELECT COUNT(*) FROM system_events
+                   WHERE event_type='zone.motion'"""
+            ).fetchone()[0] >= 1
             assert portable.execute(
                 "SELECT COUNT(*) FROM display_device_sessions"
             ).fetchone()[0] == 0
@@ -1742,7 +2011,7 @@ try:
         opener=second_display_client,
     )["detail"] == "display-pair-rate-limited"
 
-    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration-v9 personal-display-profiles profile-order profile-isolation camera-disable-retention camera-delete-cascade ordering zones vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist display-pair-expiry display-pair-one-use display-pair-rate-limit display-device-disable display-device-revoke display-media-isolation weekly-schedules-midnight-dst-priority operations-schema event-threshold event-dedup event-recovery passive-on-demand-monitor hmac-webhooks backup-encryption backup-corruption backup-restore restore-session-revocation")
+    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration-v10 personal-display-profiles profile-order profile-isolation camera-disable-retention camera-delete-cascade ordering zones detection-default-off detection-dedup encrypted-motion-snapshot on-demand-detection-blocked vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist display-pair-expiry display-pair-one-use display-pair-rate-limit display-device-disable display-device-revoke display-media-isolation weekly-schedules-midnight-dst-priority operations-schema event-threshold event-dedup event-recovery passive-on-demand-monitor hmac-webhooks backup-encryption backup-corruption backup-restore restore-session-revocation")
 finally:
     server.should_exit = True
     thread.join(timeout=5)

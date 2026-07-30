@@ -71,6 +71,7 @@ Initialize-LocalSecret (Join-Path $secretDirectory 'zmodo_secret_key')
 Initialize-LocalSecret (Join-Path $secretDirectory 'zmodo_internal_token')
 Initialize-LocalSecret (Join-Path $secretDirectory 'czeview_adapter_token')
 Initialize-LocalSecret (Join-Path $secretDirectory 'netatmo_adapter_token')
+Initialize-LocalSecret (Join-Path $secretDirectory 'detection_adapter_token')
 
 docker info --format '{{.ServerVersion}}' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Docker Desktop ist nicht erreichbar.' }

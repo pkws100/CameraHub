@@ -14,6 +14,9 @@ services:
       interval: 2s
       timeout: 2s
       retries: 20
+    networks:
+      - default
+      - detection-internal
 
   synthetic-source:
     build: ./synthetic-source
@@ -34,6 +37,7 @@ services:
       DATABASE_PATH: /data/camera-hub.db
       SECRET_KEY_PATH: /run/secrets/zmodo_secret_key
       INTERNAL_TOKEN_PATH: /run/secrets/zmodo_internal_token
+      DETECTION_ADAPTER_TOKEN_PATH: /run/secrets/detection_adapter_token
       DISCOVERY_NETWORK: 192.0.2.0/24
       ALLOW_OWNER_SETUP: "1"
       ALLOW_INSECURE_LOOPBACK_MANAGEMENT: "1"
@@ -46,8 +50,41 @@ services:
     secrets:
       - zmodo_secret_key
       - zmodo_internal_token
+      - detection_adapter_token
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3).read()"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      - default
+      - detection-internal
+
+  detection-worker:
+    build: ../detection
+    depends_on:
+      web:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+    environment:
+      BACKEND_INTERNAL: http://web:8090
+      DETECTION_ADAPTER_TOKEN_PATH: /run/secrets/detection_adapter_token
+      DETECTION_POLL_SECONDS: "2"
+    secrets:
+      - detection_adapter_token
+    networks:
+      - detection-internal
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+      - /run/detection-health:mode=0777,size=1m
+    cpus: "4.0"
+    mem_limit: 1536m
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /run/detection-health/worker"]
       interval: 2s
       timeout: 2s
       retries: 30
@@ -69,6 +106,11 @@ networks:
     ipam:
       config:
         - subnet: 172.29.33.0/24
+  detection-internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.34.0/24
 
 volumes:
   acceptance-data:
@@ -78,3 +120,5 @@ secrets:
     file: ../runtime/acceptance/zmodo_secret_key
   zmodo_internal_token:
     file: ../runtime/acceptance/zmodo_internal_token
+  detection_adapter_token:
+    file: ../runtime/acceptance/detection_adapter_token

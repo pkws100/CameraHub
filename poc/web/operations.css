@@ -2,6 +2,8 @@
 .operations-owner[hidden]{display:none!important}
 .operations-head{display:flex;align-items:end;justify-content:space-between;gap:1rem;margin-bottom:.9rem}
 .operations-head label{width:min(220px,45%)}
+.event-filters{display:flex;align-items:end;justify-content:flex-end;gap:.65rem}
+.event-filters label{width:min(180px,45vw)}
 .event-summary{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:.8rem}
 .event-summary span{padding:.35rem .6rem;border:1px solid var(--line);border-radius:99px;color:var(--muted);font-size:.72rem}
 .event-summary strong{color:var(--text)}
@@ -31,4 +33,4 @@
 .secret-dialog-content{padding:1.3rem}
 .secret-dialog-content output{display:block;margin:1rem 0;padding:.8rem;border:1px solid var(--line);border-radius:10px;background:#07110e;color:var(--mint);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;user-select:all}
 @media(max-width:760px){.operations-cards{grid-template-columns:1fr}.event-entry{grid-template-columns:auto 1fr}.event-state{grid-column:2;justify-self:start}.webhook-entry{grid-template-columns:1fr}.operations-head{align-items:start}.webhook-actions{justify-content:flex-start}}
-@media(max-width:480px){.operations-head{display:grid}.operations-head label{width:100%}.event-entry{padding:.7rem}.operations-actions{display:grid}.operations-actions button{width:100%}}
+@media(max-width:480px){.operations-head{display:grid}.operations-head label{width:100%}.event-filters{display:grid;grid-template-columns:1fr 1fr}.event-filters label{width:100%}.event-entry{padding:.7rem}.operations-actions{display:grid}.operations-actions button{width:100%}}
