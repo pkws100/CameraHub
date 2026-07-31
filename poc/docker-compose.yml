@@ -43,6 +43,7 @@ services:
     networks:
       - default
       - detection-internal
+      - blink-egress
 
   garten-low:
     <<: *relay
@@ -121,6 +122,8 @@ services:
       INTERNAL_TOKEN_PATH: /run/secrets/zmodo_internal_token
       CZEVIEW_ADAPTER_TOKEN_PATH: /run/secrets/czeview_adapter_token
       NETATMO_ADAPTER_TOKEN_PATH: /run/secrets/netatmo_adapter_token
+      BLINK_ADAPTER_TOKEN_PATH: /run/secrets/blink_adapter_token
+      BLINK_BRIDGE_INTERNAL: http://blink-bridge:8788
       DETECTION_ADAPTER_TOKEN_PATH: /run/secrets/detection_adapter_token
       MOTION_ASSET_ROOT: /data/motion-assets
       DISCOVERY_NETWORK: ${CAMERA_HUB_DISCOVERY_NETWORK:-192.168.1.0/24}
@@ -135,6 +138,7 @@ services:
       - zmodo_internal_token
       - czeview_adapter_token
       - netatmo_adapter_token
+      - blink_adapter_token
       - detection_adapter_token
     volumes:
       - ./web:/web:ro
@@ -151,6 +155,7 @@ services:
     networks:
       - default
       - detection-internal
+      - blink-egress
 
   detection-worker:
     build: ./detection
@@ -274,6 +279,47 @@ services:
       retries: 3
       start_period: 30s
 
+  blink-bridge:
+    build: ./blink
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+    logging: *bounded-logging
+    environment:
+      BACKEND_INTERNAL: http://web:8090
+      MEDIAMTX_API: http://mediamtx:9997
+      MEDIAMTX_PUBLISH: rtsp://mediamtx:8554
+      BLINK_ADAPTER_TOKEN_PATH: /run/secrets/blink_adapter_token
+      BLINK_REFRESH_SECONDS: "60"
+      BLINK_LEASE_POLL_SECONDS: "2"
+    secrets:
+      - blink_adapter_token
+    expose:
+      - "8788"
+    networks:
+      - blink-egress
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+      - /run/bridge-health:mode=0777,size=1m
+    cpus: "2.0"
+    mem_limit: 768m
+    pids_limit: 128
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /run/bridge-health/state && test $$(($$(date +%s) - $$(cat /run/bridge-health/state))) -lt 90"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
 networks:
   default:
     ipam:
@@ -284,6 +330,10 @@ networks:
     ipam:
       config:
         - subnet: 172.28.179.0/24
+  blink-egress:
+    ipam:
+      config:
+        - subnet: 172.28.180.0/24
 
 volumes:
   zmodo-data:
@@ -298,6 +348,8 @@ secrets:
     file: ./runtime/secrets/czeview_adapter_token
   netatmo_adapter_token:
     file: ./runtime/secrets/netatmo_adapter_token
+  blink_adapter_token:
+    file: ./runtime/secrets/blink_adapter_token
   detection_adapter_token:
     file: ./runtime/secrets/detection_adapter_token
   czeview_credentials:

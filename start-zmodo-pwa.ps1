@@ -71,6 +71,7 @@ Initialize-LocalSecret (Join-Path $secretDirectory 'zmodo_secret_key')
 Initialize-LocalSecret (Join-Path $secretDirectory 'zmodo_internal_token')
 Initialize-LocalSecret (Join-Path $secretDirectory 'czeview_adapter_token')
 Initialize-LocalSecret (Join-Path $secretDirectory 'netatmo_adapter_token')
+Initialize-LocalSecret (Join-Path $secretDirectory 'blink_adapter_token')
 Initialize-LocalSecret (Join-Path $secretDirectory 'detection_adapter_token')
 
 docker info --format '{{.ServerVersion}}' | Out-Null
@@ -233,6 +234,7 @@ if (-not $allLive) { Write-Warning 'Der Stack läuft, aber noch nicht alle Kamer
 Write-Output "PWA: $browserUrl"
 Write-Output "Bindung: $bindAddress (Modus: $Mode)"
 Write-Output "CZEview-Brücke: aktiv (Konten werden in Camera Hub verwaltet)"
+Write-Output "Blink-Brücke: aktiv (Konten und 2FA werden in Camera Hub verwaltet)"
 if ($Mode -eq 'Https') {
     $projectRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
         Where-Object DisplayName -like 'PKWS-ZMODO-PWA-*')
