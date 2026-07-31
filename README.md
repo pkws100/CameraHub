@@ -3,11 +3,11 @@
 Lokales, herstellerneutrales Multi-Kamera-Gateway für ONVIF-, RTSP-, HLS-,
 Snapshot- und MJPEG-Kameras. Camera Hub verbindet standardisierte Kameras mit
 einer geschützten PWA und WebRTC/HLS-Ausgabe. Der Kern benötigt keine
-proprietären Hersteller-Plug-ins. Für CZEview-Akku-Kameras und freigegebene
-Netatmo-Sicherheitskameras stehen getrennte, bedarfsgesteuerte Cloud-Adapter
-bereit.
+proprietären Hersteller-Plug-ins. Für CZEview- und Blink-Akku-Kameras sowie
+freigegebene Netatmo-Sicherheitskameras stehen getrennte, bedarfsgesteuerte
+Cloud-Adapter bereit.
 
-> **Entwicklungsstand 1.5.0:** Dieser Stand ist für einen selbst verwalteten
+> **Entwicklungsstand 1.6.0:** Dieser Stand ist für einen selbst verwalteten
 > privaten Docker-Host vorgesehen. Vor einer Erreichbarkeit über das Internet
 > müssen WireGuard, ein HTTPS-Reverse-Proxy und eine zusätzliche
 > Netzsegmentierung eingerichtet werden.
@@ -47,13 +47,25 @@ erst beim Öffnen der Ansicht geweckt und nach Freigabe des Leases nicht
 dauerhaft wach gehalten.
 
 Neue Konten werden als Eigentümer unter **Kameras suchen → Cloud-Konten**
-angelegt. Mehrere CZEview- und Netatmo-Konten können parallel aktiviert werden.
-Jede Cloud-Kamera muss vor dem Hinzufügen einen echten Frame-Test bestehen.
-Geräte ohne freigegebenen Livezugriff bleiben sichtbar, aber deaktiviert.
+angelegt. Mehrere CZEview-, Blink- und Netatmo-Konten können parallel aktiviert
+werden. CZEview und Netatmo benötigen vor dem Hinzufügen einen echten
+Frame-Test. Eine Blink-Kamera kann mit ihrem passiv aus der Cloud gelesenen
+Vorschaubild hinzugefügt werden; der optionale Live-Test wird nur nach einem
+ausdrücklichen Klick ausgeführt.
 Konten lassen sich dort umbenennen, einzeln aktivieren oder deaktivieren.
 CZEview-Zugangsdaten können erneuert und bestehende Netatmo-Konten erneut über
 den offiziellen Netatmo-Login verbunden werden, ohne Kamera-Zuordnungen oder
 Kontoduplikate zu erzeugen.
+
+Blink-Konten verwenden E-Mail-Adresse, Passwort und den von Blink angeforderten
+Bestätigungscode. Das Passwort sowie erneuerte OAuth-Token liegen ausschließlich
+verschlüsselt in der Camera-Hub-Datenbank. Übersicht, Leitstellenmodus,
+Anzeigeprofile und gekoppelte Displays zeigen nur das letzte Vorschaubild und
+starten nie selbstständig Live. In der Detailansicht kann ein angemeldeter
+Benutzer Live bewusst für höchstens fünf Minuten starten; pro Konto läuft
+höchstens eine Sitzung. Bewegungsclips werden nur beim Öffnen der Clipliste
+abgerufen. Einzelheiten und technische Grenzen stehen in
+[BLINK-INTEGRATION.md](BLINK-INTEGRATION.md).
 
 Bestehende CZEview-Einträge in der ignorierten `poc/.env` werden einmalig in
 den verschlüsselten Kontospeicher übernommen. Einrichtung, Sicherheitsgrenzen,

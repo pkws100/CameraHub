@@ -24,6 +24,7 @@ jobs:
           printf 'ci-only-placeholder\n' > poc/runtime/secrets/zmodo_internal_token
           printf 'ci-only-placeholder\n' > poc/runtime/secrets/czeview_adapter_token
           printf 'ci-only-placeholder\n' > poc/runtime/secrets/netatmo_adapter_token
+          printf 'ci-only-placeholder\n' > poc/runtime/secrets/blink_adapter_token
           printf 'ci-only-placeholder\n' > poc/runtime/secrets/detection_adapter_token
           printf 'ci-only-placeholder\n' > poc/runtime/acceptance/zmodo_secret_key
           printf 'ci-only-placeholder\n' > poc/runtime/acceptance/zmodo_internal_token
@@ -98,6 +99,15 @@ jobs:
           docker build -t camerahub-detection-ci poc/detection
           docker run --rm --entrypoint python -e PYTHONPATH=/app camerahub-detection-ci \
             -m unittest discover -s /app/tests -p 'test_*.py'
+
+      - name: Build and test Blink bridge
+        run: |
+          docker build -t camerahub-blink-ci poc/blink
+          docker run --rm --entrypoint python \
+            -e PYTHONPATH=/app \
+            -e BLINK_ADAPTER_TOKEN_PATH=/run/test-token \
+            -v "$PWD/poc/runtime/secrets/blink_adapter_token:/run/test-token:ro" \
+            camerahub-blink-ci -m unittest discover -s /app/tests -p 'test_*.py'
 
       - name: Install browser test dependencies
         run: npm ci

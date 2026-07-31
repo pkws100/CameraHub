@@ -134,3 +134,39 @@ test('aktive Anzeige beachtet auto, high, low und hls ohne stillen Qualitätswec
   expect(new Set(boxes.map(box => box.width)).size).toBe(1);
   expect(new Set(boxes.map(box => box.height)).size).toBe(1);
 });
+
+test('gekoppeltes Display zeigt Blink nur passiv und fordert keinen Live-Lease an', async ({page}) => {
+  const mock = await mockDisplayApi(page, {
+    paired: true,
+    device: {id: 'display-1', name: 'Leitstellen-TV'},
+    timezone: 'Europe/Berlin',
+    active: true,
+    profile: {id: 'profile-1', name: 'Einfahrt'},
+    nextProfileStart: null,
+    nextProfileName: null
+  }, [{
+    id: 'blink-1',
+    name: 'Blink Einfahrt',
+    source: 'Blink Cloud · bei Bedarf',
+    enabled: true,
+    externalSource: true,
+    onDemand: true,
+    displayMode: 'explicit',
+    explicitLiveOnly: true,
+    lowPath: 'blink-1-low',
+    highPath: 'blink-1-low',
+    snapshotPath: '/blink-thumbnail.jpg',
+    streamMode: 'auto',
+    features: {audio: false, ptz: false, ptzAxes: [], clips: true}
+  }]);
+  await page.route('**/blink-thumbnail.jpg*', route => route.fulfill({
+    status: 200,
+    contentType: 'image/jpeg',
+    body: Buffer.from('/9j/2Q==', 'base64')
+  }));
+  await page.goto('/display.html');
+  await expect(page.locator('.display-camera')).toHaveCount(1);
+  await expect(page.locator('.display-camera img')).toBeVisible();
+  await page.waitForTimeout(250);
+  expect(mock.leaseRequests()).toBe(0);
+});

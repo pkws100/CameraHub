@@ -45,9 +45,11 @@ SECRET_PATH = Path(os.environ.get("SECRET_KEY_PATH", "/run/secrets/zmodo_secret_
 INTERNAL_TOKEN_PATH = Path(os.environ.get("INTERNAL_TOKEN_PATH", "/run/secrets/zmodo_internal_token"))
 CZEVIEW_ADAPTER_TOKEN_PATH = Path(os.environ.get("CZEVIEW_ADAPTER_TOKEN_PATH", "/run/secrets/czeview_adapter_token"))
 NETATMO_ADAPTER_TOKEN_PATH = Path(os.environ.get("NETATMO_ADAPTER_TOKEN_PATH", "/run/secrets/netatmo_adapter_token"))
+BLINK_ADAPTER_TOKEN_PATH = Path(os.environ.get("BLINK_ADAPTER_TOKEN_PATH", "/run/secrets/blink_adapter_token"))
 DETECTION_ADAPTER_TOKEN_PATH = Path(os.environ.get("DETECTION_ADAPTER_TOKEN_PATH", "/run/secrets/detection_adapter_token"))
 MOTION_ASSET_ROOT = Path(os.environ.get("MOTION_ASSET_ROOT", "/data/motion-assets"))
 MEDIAMTX_API = os.environ.get("MEDIAMTX_API", "http://mediamtx:9997")
+BLINK_BRIDGE_INTERNAL = os.environ.get("BLINK_BRIDGE_INTERNAL", "http://blink-bridge:8788").rstrip("/")
 ALLOWED_NETWORK = ipaddress.ip_network(os.environ.get("DISCOVERY_NETWORK", "192.168.1.0/24"), strict=True)
 MAX_CAMERAS = int(os.environ.get("MAX_CAMERAS", "32"))
 SESSION_SECONDS = 8 * 60 * 60
@@ -62,6 +64,7 @@ SCAN_LOCK = threading.Lock()
 SCANS: dict[str, dict] = {}
 LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 LEASES: dict[str, dict[str, float]] = {}
+BLINK_LEASE_STARTED: dict[tuple[str, str], float] = {}
 PTZ_ATTEMPTS: dict[str, list[float]] = {}
 CONNECTION_TESTS: dict[str, tuple[float, str, dict]] = {}
 ACTIVATION_LOCK = threading.Lock()
@@ -90,7 +93,9 @@ BACKUP_SCRYPT_N = 2**17
 BACKUP_LEGACY_SCRYPT_N = 2**14
 BACKUP_FORMAT = "pkws-camera-hub-backup"
 BACKUP_VERSION = 1
-APP_VERSION = "1.5.0-dev"
+APP_VERSION = "1.6.0-dev"
+BLINK_LIVE_MAX_SECONDS = 5 * 60
+BLINK_MEDIA_MAX_BYTES = 128 * 1024 * 1024
 MOTION_ASSET_MAX_BYTES = int(os.environ.get("MOTION_ASSET_MAX_BYTES", str(500 * 1024 * 1024)))
 MOTION_ASSET_RETENTION_SECONDS = int(os.environ.get("MOTION_ASSET_RETENTION_SECONDS", str(7 * 24 * 60 * 60)))
 MOTION_METADATA_RETENTION_SECONDS = int(os.environ.get("MOTION_METADATA_RETENTION_SECONDS", str(90 * 24 * 60 * 60)))
@@ -200,6 +205,7 @@ def read_optional_service_token(path: Path, test_name: str) -> str:
 
 CZEVIEW_ADAPTER_TOKEN = read_optional_service_token(CZEVIEW_ADAPTER_TOKEN_PATH, "czeview-adapter")
 NETATMO_ADAPTER_TOKEN = read_optional_service_token(NETATMO_ADAPTER_TOKEN_PATH, "netatmo-adapter")
+BLINK_ADAPTER_TOKEN = read_optional_service_token(BLINK_ADAPTER_TOKEN_PATH, "blink-adapter")
 DETECTION_ADAPTER_TOKEN = read_optional_service_token(DETECTION_ADAPTER_TOKEN_PATH, "detection-adapter")
 
 
@@ -294,7 +300,7 @@ CREATE TABLE IF NOT EXISTS cloud_provider_configs(
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS cloud_accounts(
- id TEXT PRIMARY KEY, provider TEXT NOT NULL CHECK(provider IN ('czeview','netatmo')),
+ id TEXT PRIMARY KEY, provider TEXT NOT NULL CHECK(provider IN ('czeview','netatmo','blink')),
  label TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, auth_payload_ct TEXT NOT NULL,
  auth_revision INTEGER NOT NULL DEFAULT 1,
  scopes_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'pending',
@@ -447,6 +453,58 @@ CREATE INDEX IF NOT EXISTS webhook_deliveries_due_idx
 """
 
 
+def ensure_blink_cloud_account_constraint(conn: sqlite3.Connection) -> None:
+    """Widen the provider constraint without changing account or device identifiers."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='cloud_accounts'"
+    ).fetchone()
+    if row and "'blink'" in (row["sql"] or "").lower():
+        return
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """CREATE TABLE cloud_accounts_v11(
+               id TEXT PRIMARY KEY,
+               provider TEXT NOT NULL CHECK(provider IN ('czeview','netatmo','blink')),
+               label TEXT NOT NULL,
+               enabled INTEGER NOT NULL DEFAULT 1,
+               auth_payload_ct TEXT NOT NULL,
+               auth_revision INTEGER NOT NULL DEFAULT 1,
+               scopes_json TEXT NOT NULL DEFAULT '[]',
+               status TEXT NOT NULL DEFAULT 'pending',
+               last_error_code TEXT,
+               last_verified_at TEXT,
+               legacy_source TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO cloud_accounts_v11(
+               id,provider,label,enabled,auth_payload_ct,auth_revision,scopes_json,status,
+               last_error_code,last_verified_at,legacy_source,created_at,updated_at)
+               SELECT id,provider,label,enabled,auth_payload_ct,auth_revision,scopes_json,status,
+                      last_error_code,last_verified_at,legacy_source,created_at,updated_at
+               FROM cloud_accounts"""
+        )
+        conn.execute("DROP TABLE cloud_accounts")
+        conn.execute("ALTER TABLE cloud_accounts_v11 RENAME TO cloud_accounts")
+        conn.execute(
+            "CREATE INDEX cloud_accounts_provider_idx ON cloud_accounts(provider,enabled)"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError("cloud account provider migration broke foreign keys")
+
+
 def initialize_database() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
@@ -527,6 +585,12 @@ def initialize_database() -> None:
             conn.execute(
                 "INSERT INTO schema_migrations(version,applied_at) VALUES(10,?)",
                 (stamp,),
+            )
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=11").fetchone() is None:
+            ensure_blink_cloud_account_constraint(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(11,?)",
+                (now_iso(),),
             )
         webhook_delivery_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(webhook_deliveries)")
@@ -946,6 +1010,30 @@ class CzeviewAccountCreate(BaseModel):
     sourceApp: str = Field(default="141", min_length=1, max_length=16)
     deviceSerial: str = Field(default="", max_length=256)
     cameraName: str = Field(default="", max_length=80)
+
+
+class BlinkAccountCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=256)
+
+    @field_validator("email")
+    @classmethod
+    def clean_email(cls, value: str) -> str:
+        value = value.strip()
+        if "@" not in value or any(character in value for character in "\r\n"):
+            raise ValueError("invalid Blink email")
+        return value
+
+
+class BlinkVerificationInput(BaseModel):
+    code: str = Field(min_length=4, max_length=12, pattern=r"^[A-Za-z0-9]+$")
+
+
+class BlinkAuthStateUpdate(BaseModel):
+    status: Literal["pending", "active", "reauth-required", "error"]
+    errorCode: str | None = Field(default=None, max_length=128)
+    authData: dict | None = None
 
 
 class NetatmoProviderConfigInput(BaseModel):
@@ -1504,6 +1592,90 @@ def form_request_json(url: str, values: dict[str, str], timeout: float = 10) -> 
         raise HTTPException(502, "provider-unavailable") from error
 
 
+def blink_bridge_request(
+    path: str,
+    method: str = "GET",
+    payload: dict | None = None,
+    timeout: float = 30,
+):
+    if not BLINK_ADAPTER_TOKEN:
+        raise HTTPException(503, "blink-bridge-not-configured")
+    if not path.startswith("/") or any(character in path for character in "\r\n"):
+        raise HTTPException(500, "blink-bridge-path-invalid")
+    data = json.dumps(payload, separators=(",", ":")).encode() if payload is not None else None
+    headers = {
+        "Authorization": f"Bearer {BLINK_ADAPTER_TOKEN}",
+        "Accept": "application/json",
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(
+        f"{BLINK_BRIDGE_INTERNAL}{path}",
+        data=data,
+        method=method,
+        headers=headers,
+    )
+    try:
+        return urlopen(request, timeout=timeout)
+    except HTTPError as error:
+        try:
+            body = json.loads(error.read().decode("utf-8", "replace"))
+            code = str(body.get("error") or body.get("detail") or "blink-bridge-request-failed")
+        except Exception:
+            code = "blink-bridge-request-failed"
+        status = error.code if error.code in {400, 404, 409, 410, 422, 429, 503, 504} else 502
+        raise HTTPException(status, code) from error
+    except (URLError, TimeoutError, OSError, ValueError) as error:
+        raise HTTPException(503, "blink-bridge-unavailable") from error
+
+
+def blink_bridge_json(
+    path: str,
+    method: str = "GET",
+    payload: dict | None = None,
+    timeout: float = 30,
+) -> dict:
+    with blink_bridge_request(path, method, payload, timeout) as response:
+        try:
+            return json.load(response)
+        except (ValueError, json.JSONDecodeError) as error:
+            raise HTTPException(502, "blink-bridge-response-invalid") from error
+
+
+def blink_thumbnail_bytes(device_id: str) -> bytes:
+    with blink_bridge_request(
+        f"/internal/v1/devices/{quote(device_id, safe='')}/thumbnail",
+        timeout=20,
+    ) as response:
+        content_type = response.headers.get("Content-Type", "").lower()
+        data = response.read(4 * 1024 * 1024 + 1)
+    if (
+        len(data) > 4 * 1024 * 1024
+        or not content_type.startswith("image/jpeg")
+        or not data.startswith(b"\xff\xd8")
+    ):
+        raise HTTPException(502, "blink-thumbnail-invalid")
+    return data
+
+
+def blink_cloud_device(camera_id: str) -> sqlite3.Row:
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT d.*,a.provider,a.status AS account_status,a.enabled AS account_enabled
+               FROM cameras c JOIN cloud_devices d ON d.id=c.cloud_device_id
+               JOIN cloud_accounts a ON a.id=d.account_id
+               WHERE c.id=? AND a.provider='blink'""",
+            (camera_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "blink-camera-not-found")
+    if not row["account_enabled"]:
+        raise HTTPException(409, "blink-account-disabled")
+    if row["account_status"] != "active":
+        raise HTTPException(409, "blink-account-reauth-required")
+    return row
+
+
 def audit(conn: sqlite3.Connection, actor_id: str | None, action: str, target_type: str, target_id: str | None = None) -> None:
     conn.execute(
         "INSERT INTO audit_log(actor_user_id,action,target_type,target_id,created_at) VALUES(?,?,?,?,?)",
@@ -1696,8 +1868,8 @@ def validate_backup_database(database: bytes, source_key: bytes) -> tuple[dict, 
                 for row in candidate.execute("SELECT version FROM schema_migrations")
             }
             schema_version = max(migrations) if migrations else 0
-            if schema_version not in {8, 9, 10} or migrations != set(range(2, schema_version + 1)):
-                if any(version > 10 for version in migrations):
+            if schema_version not in {8, 9, 10, 11} or migrations != set(range(2, schema_version + 1)):
+                if any(version > 11 for version in migrations):
                     raise HTTPException(422, "backup-schema-newer-than-application")
                 raise HTTPException(422, "backup-migrations-incomplete")
             if schema_version >= 9:
@@ -1747,7 +1919,7 @@ def validate_backup_database(database: bytes, source_key: bytes) -> tuple[dict, 
                         raise HTTPException(422, "backup-schema-invalid")
             if candidate.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise HTTPException(422, "backup-foreign-keys-invalid")
-            if schema_version > 10:
+            if schema_version > 11:
                 raise HTTPException(422, "backup-schema-newer-than-application")
             sensitive_columns = {
                 "credentials": ("username_ct", "password_ct"),
@@ -2357,6 +2529,8 @@ def public_camera(row: sqlite3.Row, stream_mode: str = "auto") -> dict:
         if capability_row
         else {}
     )
+    cloud_provider = str(capabilities.get("provider") or "")
+    explicit_live_only = bool(capabilities.get("explicitLiveOnly"))
     active_stream_credentials = bool(
         current and (
             current["stream_credential_id"]
@@ -2375,11 +2549,24 @@ def public_camera(row: sqlite3.Row, stream_mode: str = "auto") -> dict:
         "enabled": bool(row["enabled"]), "position": row["position"], "managed": bool(row["managed"]),
         "usesCredentials": uses_credentials, "externalSource": external_source,
         "onDemand": bool(row["on_demand"]),
+        "cloudProvider": cloud_provider or None,
+        "explicitLiveOnly": explicit_live_only,
+        "liveMaxSeconds": capabilities.get("liveMaxSeconds"),
         "highWebRTCCompatible": bool(row["high_webrtc_compatible"]),
         "compatibilityRelay": bool(row["force_transcode"]),
         "streamMode": stream_mode,
-        "displayMode": "snapshot" if row["protocol"] == "snapshot" else "stream",
-        "snapshotPath": f"/api/cameras/{row['id']}/snapshot" if row["protocol"] == "snapshot" else None,
+        "displayMode": (
+            "explicit"
+            if explicit_live_only
+            else "snapshot"
+            if row["protocol"] == "snapshot"
+            else "stream"
+        ),
+        "snapshotPath": (
+            f"/api/cameras/{row['id']}/snapshot"
+            if row["protocol"] == "snapshot" or capabilities.get("cachedThumbnail")
+            else None
+        ),
         "features": {
             "audio": bool(
                 capabilities.get("audio", {}).get("supported")
@@ -2387,6 +2574,7 @@ def public_camera(row: sqlite3.Row, stream_mode: str = "auto") -> dict:
             ),
             "ptz": bool(capabilities.get("ptz", {}).get("supported")),
             "ptzAxes": capabilities.get("ptz", {}).get("axes", []),
+            "clips": bool(capabilities.get("clips")),
         },
     }
 
@@ -3069,6 +3257,11 @@ def list_cloud_providers(_: sqlite3.Row = Depends(require_owner)):
                 "redirectUri": netatmo["redirect_uri"] if netatmo else None,
                 "updatedAt": netatmo["updated_at"] if netatmo else None,
             },
+            {
+                "id": "blink",
+                "configured": bool(BLINK_ADAPTER_TOKEN),
+                "authentication": "credentials-2fa",
+            },
         ]
     }
 
@@ -3171,6 +3364,132 @@ def replace_czeview_account_credentials(
         audit(conn, actor["user_id"], "cloud.account.credentials.replaced", "cloud-account", account_id)
         row = conn.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
     return cloud_account_payload(row)
+
+
+def start_blink_auth(account_id: str, *, reconnect: bool = False) -> dict:
+    endpoint = "reconnect" if reconnect else "login"
+    return blink_bridge_json(
+        f"/internal/v1/accounts/{quote(account_id, safe='')}/{endpoint}",
+        method="POST",
+        payload={},
+        timeout=45,
+    )
+
+
+@app.post("/api/admin/cloud/accounts/blink")
+def create_blink_account(
+    body: BlinkAccountCreate,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    account_id, stamp = str(uuid.uuid4()), now_iso()
+    auth = {
+        "username": body.email,
+        "password": body.password,
+    }
+    with DB_LOCK, connect() as conn:
+        conn.execute(
+            """INSERT INTO cloud_accounts(
+               id,provider,label,enabled,auth_payload_ct,scopes_json,status,created_at,updated_at)
+               VALUES(?,'blink',?,1,?,'[]','pending',?,?)""",
+            (account_id, body.label.strip(), encrypt_json(auth), stamp, stamp),
+        )
+        audit(conn, actor["user_id"], "cloud.account.created", "cloud-account", account_id)
+    try:
+        auth_result = start_blink_auth(account_id)
+    except HTTPException as error:
+        auth_result = {"state": "error", "errorCode": str(error.detail)}
+        with DB_LOCK, connect() as conn:
+            conn.execute(
+                """UPDATE cloud_accounts SET status='error',last_error_code=?,updated_at=?
+                   WHERE id=? AND provider='blink'""",
+                (str(error.detail), now_iso(), account_id),
+            )
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
+    result = cloud_account_payload(row)
+    result["authStep"] = auth_result.get("state", row["status"])
+    return result
+
+
+@app.put("/api/admin/cloud/accounts/{account_id}/blink")
+def replace_blink_account_credentials(
+    account_id: str,
+    body: BlinkAccountCreate,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    auth = {"username": body.email, "password": body.password}
+    with DB_LOCK, connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM cloud_accounts WHERE id=? AND provider='blink'",
+            (account_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "blink-account-not-found")
+        conn.execute(
+            """UPDATE cloud_accounts SET label=?,auth_payload_ct=?,auth_revision=auth_revision+1,
+               enabled=1,status='pending',last_error_code=NULL,last_verified_at=NULL,updated_at=?
+               WHERE id=?""",
+            (body.label.strip(), encrypt_json(auth), now_iso(), account_id),
+        )
+        audit(
+            conn,
+            actor["user_id"],
+            "cloud.account.credentials.replaced",
+            "cloud-account",
+            account_id,
+        )
+    auth_result = start_blink_auth(account_id, reconnect=True)
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
+    result = cloud_account_payload(row)
+    result["authStep"] = auth_result.get("state", row["status"])
+    return result
+
+
+@app.post("/api/admin/cloud/accounts/{account_id}/blink/verify")
+def verify_blink_account(
+    account_id: str,
+    body: BlinkVerificationInput,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    with connect() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM cloud_accounts WHERE id=? AND provider='blink' AND enabled=1",
+            (account_id,),
+        ).fetchone():
+            raise HTTPException(404, "blink-account-not-found")
+    result = blink_bridge_json(
+        f"/internal/v1/accounts/{quote(account_id, safe='')}/verify",
+        method="POST",
+        payload={"code": body.code},
+        timeout=45,
+    )
+    with DB_LOCK, connect() as conn:
+        audit(conn, actor["user_id"], "cloud.account.verified", "cloud-account", account_id)
+        row = conn.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
+    payload = cloud_account_payload(row)
+    payload["authStep"] = result.get("state", row["status"])
+    return payload
+
+
+@app.post("/api/admin/cloud/accounts/{account_id}/blink/reconnect")
+def reconnect_blink_account(
+    account_id: str,
+    actor: sqlite3.Row = Depends(require_owner_elevated),
+):
+    with connect() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM cloud_accounts WHERE id=? AND provider='blink' AND enabled=1",
+            (account_id,),
+        ).fetchone():
+            raise HTTPException(404, "blink-account-not-found")
+    result = start_blink_auth(account_id, reconnect=True)
+    with DB_LOCK, connect() as conn:
+        audit(conn, actor["user_id"], "cloud.account.reconnect-requested", "cloud-account", account_id)
+        row = conn.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
+    payload = cloud_account_payload(row)
+    payload["authStep"] = result.get("state", row["status"])
+    return payload
 
 
 @app.post("/api/admin/cloud/accounts/netatmo/authorize")
@@ -4701,14 +5020,33 @@ def update_cloud_inventory(
 
 def cloud_discovery_results() -> list[dict]:
     with connect() as conn:
-        accounts = conn.execute(
+        netatmo_accounts = conn.execute(
             "SELECT id FROM cloud_accounts WHERE provider='netatmo' AND enabled=1"
         ).fetchall()
-    for account in accounts:
+        blink_accounts = conn.execute(
+            "SELECT id FROM cloud_accounts WHERE provider='blink' AND enabled=1"
+        ).fetchall()
+    for account in netatmo_accounts:
         try:
             refresh_netatmo_inventory(account["id"])
         except HTTPException:
             continue
+    def refresh_blink_account(account_id: str) -> None:
+        try:
+            blink_bridge_json(
+                f"/internal/v1/accounts/{quote(account_id, safe='')}/refresh",
+                method="POST",
+                payload={},
+                timeout=30,
+            )
+        except HTTPException:
+            pass
+
+    if blink_accounts:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(4, len(blink_accounts))) as pool:
+            list(pool.map(refresh_blink_account, (row["id"] for row in blink_accounts)))
     with connect() as conn:
         rows = conn.execute(
             """SELECT d.*,a.provider,a.label AS account_label,a.status AS account_status,
@@ -4717,8 +5055,16 @@ def cloud_discovery_results() -> list[dict]:
                LEFT JOIN cameras c ON c.cloud_device_id=d.id
                WHERE a.enabled=1 ORDER BY a.provider,a.label,d.name"""
         ).fetchall()
-    return [
-        {
+    results = []
+    for row in rows:
+        capabilities = json.loads(row["capabilities_json"] or "{}")
+        cached_thumbnail = bool(capabilities.get("cachedThumbnail"))
+        blink_importable = (
+            row["provider"] == "blink"
+            and cached_thumbnail
+            and row["account_status"] == "active"
+        )
+        results.append({
             "id": str(uuid.uuid4()),
             "origin": "cloud",
             "provider": row["provider"],
@@ -4729,15 +5075,20 @@ def cloud_discovery_results() -> list[dict]:
             "manufacturer": row["manufacturer"] or row["provider"],
             "model": row["model"] or "Unbekannt",
             "streamSupport": row["stream_support"],
-            "available": row["stream_support"] != "unsupported" and row["account_status"] == "active",
+            "available": (
+                row["stream_support"] != "unsupported" or blink_importable
+            )
+            and row["account_status"] == "active",
             "reason": row["last_error_code"],
             "configuredCameraId": row["configured_camera_id"],
             "configuredName": row["configured_name"],
-            "previewAvailable": bool(row["configured_camera_id"]),
-            "previewVerified": row["stream_support"] == "verified",
-        }
-        for row in rows
-    ]
+            "previewAvailable": bool(row["configured_camera_id"]) or cached_thumbnail,
+            "previewVerified": row["stream_support"] == "verified" or cached_thumbnail,
+            "liveVerified": row["stream_support"] == "verified",
+            "importAllowed": row["stream_support"] == "verified" or blink_importable,
+            "explicitLiveOnly": bool(capabilities.get("explicitLiveOnly")),
+        })
+    return results
 
 
 def safe_netatmo_stream_base(value: str) -> str | None:
@@ -5321,7 +5672,12 @@ def import_cloud_discovery_device(
         ).fetchone()
         if not device:
             raise HTTPException(404, "cloud-device-not-found")
-        if device["stream_support"] != "verified":
+        provider_capabilities = json.loads(device["capabilities_json"] or "{}")
+        blink_cached = bool(
+            device["provider"] == "blink"
+            and provider_capabilities.get("cachedThumbnail")
+        )
+        if device["stream_support"] != "verified" and not blink_cached:
             raise HTTPException(409, "cloud-device-frame-proof-required")
         existing = conn.execute("SELECT * FROM cameras WHERE cloud_device_id=?", (device["id"],)).fetchone()
         if existing:
@@ -5332,6 +5688,13 @@ def import_cloud_discovery_device(
         stream_path = f"{camera_id}-low"
         stamp = now_iso()
         capabilities = {
+            "provider": device["provider"],
+            "explicitLiveOnly": bool(provider_capabilities.get("explicitLiveOnly")),
+            "cachedThumbnail": bool(provider_capabilities.get("cachedThumbnail")),
+            "clips": bool(provider_capabilities.get("clips")),
+            "liveMaxSeconds": (
+                BLINK_LIVE_MAX_SECONDS if device["provider"] == "blink" else None
+            ),
             "device": {
                 "manufacturer": device["manufacturer"],
                 "model": device["model"],
@@ -5342,7 +5705,11 @@ def import_cloud_discovery_device(
             "profiles": [
                 {
                     "token": "cloud",
-                    "name": "Cloud-Livebild",
+                    "name": (
+                        "Blink Livebild · bewusst starten"
+                        if device["provider"] == "blink"
+                        else "Cloud-Livebild"
+                    ),
                     "codec": "h264",
                     "width": None,
                     "height": None,
@@ -5382,7 +5749,11 @@ def import_cloud_discovery_device(
                 f"{device['provider'].title()} Cloud · bei Bedarf",
                 stream_path,
                 stream_path,
-                "Frame-geprüfter Cloud-Stream",
+                (
+                    "Blink Live · maximal 5 Minuten"
+                    if device["provider"] == "blink"
+                    else "Frame-geprüfter Cloud-Stream"
+                ),
                 device["manufacturer"],
                 device["model"],
                 json.dumps(capabilities, separators=(",", ":")),
@@ -5403,6 +5774,14 @@ def discovery_preview(scan_id: str, device_id: str, _: sqlite3.Row = Depends(req
     cached = DISCOVERY_PREVIEW_CACHE.get((scan_id, device_id))
     if cached and cached[0] > time.time():
         return Response(cached[1], media_type="image/jpeg", headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
+    if item.get("origin") == "cloud" and item.get("provider") == "blink":
+        frame = blink_thumbnail_bytes(str(item["cloudDeviceId"]))
+        DISCOVERY_PREVIEW_CACHE[(scan_id, device_id)] = (time.time() + 60, frame)
+        return Response(
+            frame,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"},
+        )
     configured_path = item.get("_configuredPreviewPath")
     if configured_path:
         frame = capture_rtsp_frame(configured_path)
@@ -6199,6 +6578,79 @@ def require_camera_media_access(
     return display
 
 
+@app.get("/api/cameras/{camera_id}/clips")
+def list_blink_clips(camera_id: str, _: sqlite3.Row = Depends(require_session)):
+    device = blink_cloud_device(camera_id)
+    result = blink_bridge_json(
+        f"/internal/v1/devices/{quote(device['id'], safe='')}/clips",
+        timeout=20,
+    )
+    clips = []
+    for item in list(result.get("clips") or [])[:50]:
+        clip_id = str(item.get("id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", clip_id):
+            continue
+        clips.append(
+            {
+                "id": clip_id,
+                "createdAt": str(item.get("createdAt") or ""),
+                "kind": str(item.get("kind") or "motion")[:32],
+                "durationSeconds": item.get("durationSeconds"),
+            }
+        )
+    return {"cameraId": camera_id, "clips": clips}
+
+
+@app.get("/api/cameras/{camera_id}/clips/{clip_id}")
+def play_blink_clip(
+    camera_id: str,
+    clip_id: str,
+    _: sqlite3.Row = Depends(require_session),
+):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", clip_id):
+        raise HTTPException(404, "blink-clip-not-found")
+    device = blink_cloud_device(camera_id)
+    response = blink_bridge_request(
+        f"/internal/v1/devices/{quote(device['id'], safe='')}/clips/{quote(clip_id, safe='')}",
+        timeout=30,
+    )
+    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+    try:
+        content_length = int(response.headers.get("Content-Length", "0"))
+    except ValueError:
+        content_length = 0
+    if content_type not in {"video/mp4", "video/mpeg", "application/octet-stream"}:
+        response.close()
+        raise HTTPException(502, "blink-clip-invalid")
+    if content_length > BLINK_MEDIA_MAX_BYTES:
+        response.close()
+        raise HTTPException(413, "blink-clip-too-large")
+
+    def chunks():
+        total = 0
+        try:
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > BLINK_MEDIA_MAX_BYTES:
+                    break
+                yield chunk
+        finally:
+            response.close()
+
+    return StreamingResponse(
+        chunks(),
+        media_type="video/mp4" if content_type == "application/octet-stream" else content_type,
+        headers={
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @app.get("/api/cameras/{camera_id}/snapshot")
 @app.get("/api/admin/cameras/{camera_id}/preview")
 def preview(camera_id: str, _: sqlite3.Row = Depends(require_camera_media_access)):
@@ -6206,11 +6658,26 @@ def preview(camera_id: str, _: sqlite3.Row = Depends(require_camera_media_access
     if cached and cached[0] > time.time():
         return Response(cached[1], media_type="image/jpeg", headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"})
     with connect() as conn:
-        row = conn.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
+        row = conn.execute(
+            """SELECT c.*,a.provider AS cloud_provider,d.id AS cloud_device_ref
+               FROM cameras c
+               LEFT JOIN cloud_devices d ON d.id=c.cloud_device_id
+               LEFT JOIN cloud_accounts a ON a.id=d.account_id
+               WHERE c.id=?""",
+            (camera_id,),
+        ).fetchone()
         connection = active_connection(conn, camera_id) if row else None
         snapshot_credentials = connection_credentials(conn, connection, "stream") if connection and row["protocol"] == "snapshot" else ("", "")
     if not row:
         raise HTTPException(404, "preview-unavailable")
+    if row["cloud_provider"] == "blink" and row["cloud_device_ref"]:
+        frame = blink_thumbnail_bytes(row["cloud_device_ref"])
+        PREVIEW_CACHE[camera_id] = (time.time() + 60, frame)
+        return Response(
+            frame,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"},
+        )
     if row["protocol"] == "snapshot":
         if not row["address"] or not connection:
             raise HTTPException(404, "preview-unavailable")
@@ -6290,6 +6757,7 @@ def active_camera_leases(camera_id: str) -> dict[str, float]:
     for key, expiry in list(leases.items()):
         if expiry <= now:
             leases.pop(key, None)
+            BLINK_LEASE_STARTED.pop((camera_id, key), None)
     if not leases:
         LEASES.pop(camera_id, None)
     return leases
@@ -6298,13 +6766,39 @@ def active_camera_leases(camera_id: str) -> dict[str, float]:
 @app.post("/api/cameras/{camera_id}/lease")
 def acquire_lease(camera_id: str, _: sqlite3.Row = Depends(require_csrf)):
     with connect() as conn:
-        if not conn.execute("SELECT 1 FROM cameras WHERE id=? AND enabled=1", (camera_id,)).fetchone():
+        camera = conn.execute(
+            """SELECT c.id,a.provider AS cloud_provider,d.account_id
+               FROM cameras c
+               LEFT JOIN cloud_devices d ON d.id=c.cloud_device_id
+               LEFT JOIN cloud_accounts a ON a.id=d.account_id
+               WHERE c.id=? AND c.enabled=1""",
+            (camera_id,),
+        ).fetchone()
+        if not camera:
             raise HTTPException(404, "camera-not-found")
+        if camera["cloud_provider"] == "blink" and camera["account_id"]:
+            sibling_ids = [
+                row["id"]
+                for row in conn.execute(
+                    """SELECT c.id FROM cameras c
+                       JOIN cloud_devices d ON d.id=c.cloud_device_id
+                       WHERE d.account_id=? AND c.id<>?""",
+                    (camera["account_id"], camera_id),
+                ).fetchall()
+            ]
+            if any(active_camera_leases(sibling_id) for sibling_id in sibling_ids):
+                raise HTTPException(409, "blink-system-busy")
     lease_id = secrets.token_urlsafe(18)
     active_camera_leases(camera_id)
     leases = LEASES.setdefault(camera_id, {})
     leases[lease_id] = time.time() + 90
-    return {"cameraId": camera_id, "leaseId": lease_id, "expiresIn": 90}
+    result = {"cameraId": camera_id, "leaseId": lease_id, "expiresIn": 90}
+    if camera["cloud_provider"] == "blink":
+        started = time.time()
+        BLINK_LEASE_STARTED[(camera_id, lease_id)] = started
+        result["maxExpiresAt"] = int(started + BLINK_LIVE_MAX_SECONDS)
+        result["maxDurationSeconds"] = BLINK_LIVE_MAX_SECONDS
+    return result
 
 
 @app.put("/api/cameras/{camera_id}/lease")
@@ -6314,7 +6808,24 @@ def renew_lease(camera_id: str, leaseId: str | None = None, _: sqlite3.Row = Dep
     leases = active_camera_leases(camera_id)
     if leaseId not in leases:
         raise HTTPException(404, "lease-not-found")
-    leases[leaseId] = time.time() + 90
+    now = time.time()
+    started = BLINK_LEASE_STARTED.get((camera_id, leaseId))
+    if started is not None:
+        hard_expiry = started + BLINK_LIVE_MAX_SECONDS
+        if hard_expiry <= now:
+            leases.pop(leaseId, None)
+            BLINK_LEASE_STARTED.pop((camera_id, leaseId), None)
+            raise HTTPException(410, "blink-live-session-expired")
+        expires_in = max(1, min(90, int(hard_expiry - now)))
+        leases[leaseId] = now + expires_in
+        return {
+            "cameraId": camera_id,
+            "leaseId": leaseId,
+            "expiresIn": expires_in,
+            "maxExpiresAt": int(hard_expiry),
+            "maxDurationSeconds": BLINK_LIVE_MAX_SECONDS,
+        }
+    leases[leaseId] = now + 90
     return {"cameraId": camera_id, "leaseId": leaseId, "expiresIn": 90}
 
 
@@ -6327,6 +6838,7 @@ def release_lease(camera_id: str, leaseId: str | None = None, _: sqlite3.Row = D
         leases.pop(leaseId, None)
         if not leases:
             LEASES.pop(camera_id, None)
+    BLINK_LEASE_STARTED.pop((camera_id, leaseId), None)
     return Response(status_code=204)
 
 
@@ -6344,6 +6856,14 @@ def acquire_display_lease(
 ):
     with connect() as conn:
         require_active_display_camera(conn, display, camera_id)
+        camera = conn.execute(
+            """SELECT a.provider FROM cameras c
+               LEFT JOIN cloud_devices d ON d.id=c.cloud_device_id
+               LEFT JOIN cloud_accounts a ON a.id=d.account_id WHERE c.id=?""",
+            (camera_id,),
+        ).fetchone()
+        if camera and camera["provider"] == "blink":
+            raise HTTPException(409, "blink-live-requires-interactive-user")
     lease_id = f"display-{display['device_id']}-{secrets.token_urlsafe(12)}"
     active_camera_leases(camera_id)
     LEASES.setdefault(camera_id, {})[lease_id] = time.time() + 90
@@ -6432,11 +6952,193 @@ def require_netatmo_adapter(authorization: str = Header(default="")) -> None:
         raise HTTPException(401, "netatmo-adapter-auth-required")
 
 
+def require_blink_adapter(authorization: str = Header(default="")) -> None:
+    if not BLINK_ADAPTER_TOKEN or not secrets.compare_digest(
+        authorization, f"Bearer {BLINK_ADAPTER_TOKEN}"
+    ):
+        raise HTTPException(401, "blink-adapter-auth-required")
+
+
 def require_detection_adapter(authorization: str = Header(default="")) -> None:
     if not DETECTION_ADAPTER_TOKEN or not secrets.compare_digest(
         authorization, f"Bearer {DETECTION_ADAPTER_TOKEN}"
     ):
         raise HTTPException(401, "detection-adapter-auth-required")
+
+
+@app.get("/internal/v1/providers/blink/accounts")
+def blink_adapter_accounts(_: None = Depends(require_blink_adapter)):
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM cloud_accounts WHERE provider='blink' AND enabled=1 ORDER BY created_at"
+        ).fetchall()
+    return {
+        "accounts": [
+            {
+                "id": row["id"],
+                "label": row["label"],
+                "status": row["status"],
+                "authRevision": row["auth_revision"],
+                "credentials": decrypt_json(row["auth_payload_ct"]),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/internal/v1/providers/blink/accounts/{account_id}/auth-state")
+def update_blink_auth_state(
+    account_id: str,
+    body: BlinkAuthStateUpdate,
+    _: None = Depends(require_blink_adapter),
+):
+    allowed_auth_keys = {
+        "username",
+        "password",
+        "token",
+        "refresh_token",
+        "expires_in",
+        "expiration_date",
+        "host",
+        "region_id",
+        "client_id",
+        "account_id",
+        "user_id",
+        "hardware_id",
+    }
+    stamp = now_iso()
+    with DB_LOCK, connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM cloud_accounts WHERE id=? AND provider='blink'",
+            (account_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "blink-account-not-found")
+        encrypted = row["auth_payload_ct"]
+        if body.authData is not None:
+            if len(json.dumps(body.authData, separators=(",", ":"))) > 64 * 1024:
+                raise HTTPException(413, "blink-auth-state-too-large")
+            unexpected = set(body.authData) - allowed_auth_keys
+            if unexpected:
+                raise HTTPException(422, "blink-auth-state-invalid")
+            auth = decrypt_json(row["auth_payload_ct"])
+            auth.update(body.authData)
+            encrypted = encrypt_json(auth)
+        conn.execute(
+            """UPDATE cloud_accounts SET auth_payload_ct=?,status=?,last_error_code=?,
+               last_verified_at=?,updated_at=? WHERE id=?""",
+            (
+                encrypted,
+                body.status,
+                body.errorCode,
+                stamp if body.status == "active" else row["last_verified_at"],
+                stamp,
+                account_id,
+            ),
+        )
+    return {"accountId": account_id, "status": body.status}
+
+
+@app.post("/internal/v1/providers/blink/inventory")
+def update_blink_inventory(
+    body: CloudInventoryUpdate,
+    _: None = Depends(require_blink_adapter),
+):
+    stamp = now_iso()
+    result = []
+    with DB_LOCK, connect() as conn:
+        account = conn.execute(
+            "SELECT * FROM cloud_accounts WHERE id=? AND provider='blink'",
+            (body.accountId,),
+        ).fetchone()
+        if not account:
+            raise HTTPException(404, "cloud-account-not-found")
+        conn.execute(
+            """UPDATE cloud_accounts SET status=?,last_error_code=?,last_verified_at=?,
+               updated_at=? WHERE id=?""",
+            (
+                body.status,
+                body.errorCode,
+                stamp if body.status == "active" else account["last_verified_at"],
+                stamp,
+                body.accountId,
+            ),
+        )
+        for device in body.devices:
+            external_hash = hashlib.blake2b(
+                f"blink:{body.accountId}:{device.externalId}".encode(),
+                key=AES_KEY,
+                digest_size=32,
+            ).hexdigest()
+            existing = conn.execute(
+                "SELECT id,stream_support FROM cloud_devices WHERE account_id=? AND external_id_hash=?",
+                (body.accountId, external_hash),
+            ).fetchone()
+            device_id = existing["id"] if existing else str(uuid.uuid4())
+            stream_support = (
+                "verified"
+                if existing and existing["stream_support"] == "verified"
+                else device.streamSupport
+            )
+            conn.execute(
+                """INSERT INTO cloud_devices(
+                   id,account_id,external_id_hash,external_id_ct,home_id_ct,name,model,manufacturer,
+                   capabilities_json,stream_support,last_error_code,last_seen_at,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(account_id,external_id_hash) DO UPDATE SET
+                   external_id_ct=excluded.external_id_ct,home_id_ct=excluded.home_id_ct,
+                   name=excluded.name,model=excluded.model,manufacturer=excluded.manufacturer,
+                   capabilities_json=excluded.capabilities_json,stream_support=excluded.stream_support,
+                   last_error_code=excluded.last_error_code,last_seen_at=excluded.last_seen_at,
+                   updated_at=excluded.updated_at""",
+                (
+                    device_id,
+                    body.accountId,
+                    external_hash,
+                    encrypt_text(device.externalId),
+                    encrypt_text(device.homeId) if device.homeId else None,
+                    device.name,
+                    device.model,
+                    device.manufacturer,
+                    json.dumps(device.capabilities, separators=(",", ":")),
+                    stream_support,
+                    device.errorCode,
+                    stamp,
+                    stamp,
+                    stamp,
+                ),
+            )
+            result.append({"externalId": device.externalId, "deviceId": device_id})
+    return {"accountId": body.accountId, "devices": result}
+
+
+@app.get("/internal/v1/providers/blink/leases")
+def blink_adapter_leases(_: None = Depends(require_blink_adapter)):
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT c.id AS camera_id,c.low_path,c.enabled,d.id AS device_id,d.account_id
+               FROM cameras c JOIN cloud_devices d ON d.id=c.cloud_device_id
+               JOIN cloud_accounts a ON a.id=d.account_id
+               WHERE a.provider='blink' AND a.enabled=1"""
+        ).fetchall()
+    cameras = [
+        {
+            "cameraId": row["camera_id"],
+            "path": row["low_path"],
+            "deviceId": row["device_id"],
+            "accountId": row["account_id"],
+            "active": bool(row["enabled"] and active_camera_leases(row["camera_id"])),
+        }
+        for row in rows
+    ]
+    now = time.time()
+    for device_id, probe in list(CLOUD_PROBE_LEASES.items()):
+        if probe["expiresAt"] <= now:
+            CLOUD_PROBE_LEASES.pop(device_id, None)
+            continue
+        if probe["provider"] == "blink":
+            cameras.append(probe["lease"].copy())
+    return {"cameras": cameras}
 
 
 @app.post("/internal/v1/providers/czeview/legacy-account")
