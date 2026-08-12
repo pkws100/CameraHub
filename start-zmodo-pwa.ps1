@@ -199,7 +199,19 @@ $state = [ordered]@{ mode=$Mode; bindAddress=$bindAddress; composeFiles=$compose
 $composeArgs = @()
 if (Test-Path -LiteralPath $localEnv) { $composeArgs += @('--env-file', $localEnv) }
 $composeArgs += @('--env-file', $composeEnv)
-$composeArgs += @('--profile', 'czeview')
+$requestedProfiles = @('czeview')
+if (Test-Path -LiteralPath $localEnv) {
+    $profileLine = @(Get-Content -LiteralPath $localEnv |
+        Where-Object { $_ -match '^\s*COMPOSE_PROFILES\s*=' } |
+        Select-Object -Last 1)
+    if ($profileLine) {
+        $profileValue = ($profileLine -split '=', 2)[1].Trim().Trim('"').Trim("'")
+        $requestedProfiles += @($profileValue -split '[,\s]+' | Where-Object { $_ })
+    }
+}
+foreach ($profile in @($requestedProfiles | Sort-Object -Unique)) {
+    $composeArgs += @('--profile', $profile)
+}
 foreach ($file in $composeFiles) { $composeArgs += @('-f', $file) }
 $upArgs = @($composeArgs) + @('up', '-d', '--build', '--remove-orphans')
 Push-Location $poc
