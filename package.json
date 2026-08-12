@@ -1,7 +1,7 @@
 {
   "name": "pkws-camera-hub-acceptance",
   "private": true,
-  "version": "1.5.0-dev.0",
+  "version": "1.6.0-dev.0",
   "scripts": {
     "test:e2e": "playwright test",
     "serve:e2e": "http-server poc/web -p 4173 -c-1"

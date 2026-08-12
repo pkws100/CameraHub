@@ -124,10 +124,14 @@
     const camera = state.camera;
     const mode = camera.streamMode || 'auto';
     state.mode = mode;
-    if (camera.displayMode === 'snapshot') {
+    if (camera.displayMode === 'snapshot' || camera.displayMode === 'explicit') {
       state.video.hidden = true;
       state.snapshot.hidden = false;
-      state.snapshot.onload = () => status(state, 'Live', `${mode} · Snapshot`);
+      state.snapshot.onload = () => status(
+        state,
+        camera.displayMode === 'explicit' ? 'Letzte Vorschau' : 'Live',
+        camera.displayMode === 'explicit' ? 'Blink · kein automatischer Livezugriff' : `${mode} · Snapshot`
+      );
       state.snapshot.onerror = () => status(state, 'Vorschau nicht verfügbar', `${mode} · Snapshot`);
       state.snapshot.src = `${camera.snapshotPath}?t=${Date.now()}`;
       return;

@@ -1,4 +1,4 @@
-const CACHE='pkws-camera-hub-v1.5.0-dev';
+const CACHE='pkws-camera-hub-v1.6.0-dev';
 const STATIC=new Set(['/','/index.html','/display.html','/styles.css','/discovery.css','/media-modes.css','/users.css','/camera-connections.css','/audit-fixes.css','/wall-mode.css','/display-profiles.css','/display-device.css','/auth-badges.css','/operations.css','/detection.css','/app.js','/display-device.js','/reader.js','/manifest.webmanifest','/icons/icon-192.png','/icons/icon-512.png']);
 self.addEventListener('install',event=>{event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll([...STATIC])));self.skipWaiting();});
 self.addEventListener('activate',event=>{event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(key=>key!==CACHE).map(key=>caches.delete(key)))));self.clients.claim();});

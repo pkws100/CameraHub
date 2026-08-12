@@ -73,6 +73,50 @@ with sqlite3.connect(legacy_db) as legacy:
           position INTEGER NOT NULL,
           PRIMARY KEY(profile_id,camera_id)
         );
+        CREATE TABLE cloud_accounts(
+          id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL CHECK(provider IN ('czeview','netatmo')),
+          label TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          auth_payload_ct TEXT NOT NULL,
+          auth_revision INTEGER NOT NULL DEFAULT 1,
+          scopes_json TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL DEFAULT 'pending',
+          last_error_code TEXT,
+          last_verified_at TEXT,
+          legacy_source TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO cloud_accounts(
+          id,provider,label,auth_payload_ct,created_at,updated_at
+        ) VALUES(
+          'legacy-cloud','netatmo','Legacy','encrypted-placeholder',
+          '2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'
+        );
+        CREATE TABLE cloud_devices(
+          id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES cloud_accounts(id) ON DELETE CASCADE,
+          external_id_hash TEXT NOT NULL,
+          external_id_ct TEXT NOT NULL,
+          home_id_ct TEXT,
+          name TEXT NOT NULL,
+          model TEXT,
+          manufacturer TEXT,
+          capabilities_json TEXT NOT NULL DEFAULT '{}',
+          stream_support TEXT NOT NULL DEFAULT 'unknown',
+          last_error_code TEXT,
+          last_seen_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(account_id,external_id_hash)
+        );
+        INSERT INTO cloud_devices(
+          id,account_id,external_id_hash,external_id_ct,name,created_at,updated_at
+        ) VALUES(
+          'legacy-device','legacy-cloud','legacy-hash','encrypted-placeholder',
+          'Legacy Camera','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'
+        );
         """
     )
 main_db_path = camera_app.DB_PATH
@@ -85,6 +129,17 @@ with camera_app.connect() as migrated:
     assert migrated.execute(
         "SELECT 1 FROM schema_migrations WHERE version=10"
     ).fetchone()
+    assert migrated.execute(
+        "SELECT 1 FROM schema_migrations WHERE version=11"
+    ).fetchone()
+    cloud_accounts_sql = migrated.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='cloud_accounts'"
+    ).fetchone()["sql"]
+    assert "'blink'" in cloud_accounts_sql.lower()
+    assert migrated.execute(
+        "SELECT 1 FROM cloud_devices WHERE id='legacy-device' AND account_id='legacy-cloud'"
+    ).fetchone()
+    assert migrated.execute("PRAGMA foreign_key_check").fetchone() is None
 camera_app.DB_PATH = main_db_path
 
 
@@ -1296,6 +1351,185 @@ try:
         csrf=csrf,
         expected=409,
     )["detail"] == "cloud-account-has-linked-cameras"
+
+    original_blink_bridge_json = camera_app.blink_bridge_json
+    camera_app.blink_bridge_json = (
+        lambda *_args, **_kwargs: {"state": "verification-required"}
+    )
+    blink_password = "Blink-Secret-42!"
+    try:
+        blink_account = request(
+            "/api/admin/cloud/accounts/blink",
+            "POST",
+            {
+                "label": "Blink Testhaus",
+                "email": "blink@example.invalid",
+                "password": blink_password,
+            },
+            csrf,
+        )
+    finally:
+        camera_app.blink_bridge_json = original_blink_bridge_json
+    assert blink_account["provider"] == "blink"
+    assert blink_account["status"] == "pending"
+    assert blink_account["authStep"] == "verification-required"
+    assert blink_password.encode() not in open(os.environ["DATABASE_PATH"], "rb").read()
+
+    blink_accounts_request = urllib.request.Request(
+        base + "/internal/v1/providers/blink/accounts",
+        headers={"Authorization": f"Bearer {camera_app.BLINK_ADAPTER_TOKEN}"},
+    )
+    with urllib.request.urlopen(blink_accounts_request, timeout=5) as response:
+        blink_internal = json.load(response)
+    blink_credentials = blink_internal["accounts"][0]["credentials"]
+    assert blink_credentials["username"] == "blink@example.invalid"
+    assert blink_credentials["password"] == blink_password
+
+    blink_auth_request = urllib.request.Request(
+        base
+        + f"/internal/v1/providers/blink/accounts/{blink_account['id']}/auth-state",
+        data=json.dumps(
+            {
+                "status": "active",
+                "authData": {
+                    "token": "blink-access-token",
+                    "refresh_token": "blink-refresh-token",
+                    "hardware_id": str(uuid.uuid4()),
+                },
+            }
+        ).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {camera_app.BLINK_ADAPTER_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(blink_auth_request, timeout=5) as response:
+        assert json.load(response)["status"] == "active"
+
+    blink_inventory_request = urllib.request.Request(
+        base + "/internal/v1/providers/blink/inventory",
+        data=json.dumps(
+            {
+                "accountId": blink_account["id"],
+                "status": "active",
+                "devices": [
+                    {
+                        "externalId": "21:7",
+                        "homeId": "21",
+                        "name": "Blink Einfahrt",
+                        "model": "catalina",
+                        "manufacturer": "Blink",
+                        "capabilities": {
+                            "cachedThumbnail": True,
+                            "clips": True,
+                            "liveCandidate": True,
+                            "explicitLiveOnly": True,
+                            "liveMaxSeconds": 300,
+                            "syncModule": "Sync Module",
+                        },
+                        "streamSupport": "candidate",
+                    }
+                ],
+            }
+        ).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {camera_app.BLINK_ADAPTER_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(blink_inventory_request, timeout=5) as response:
+        blink_device_id = json.load(response)["devices"][0]["deviceId"]
+
+    blink_scan_id, blink_scan_device_id = "blink-scan", "blink-result"
+    camera_app.SCANS[blink_scan_id] = {
+        "id": blink_scan_id,
+        "state": "complete",
+        "createdAt": camera_app.now_iso(),
+        "createdEpoch": time.time(),
+        "results": [
+            {
+                "id": blink_scan_device_id,
+                "origin": "cloud",
+                "provider": "blink",
+                "accountId": blink_account["id"],
+                "accountLabel": "Blink Testhaus",
+                "cloudDeviceId": blink_device_id,
+                "name": "Blink Einfahrt",
+                "manufacturer": "Blink",
+                "model": "catalina",
+                "streamSupport": "candidate",
+                "available": True,
+                "previewAvailable": True,
+                "previewVerified": True,
+                "importAllowed": True,
+                "configuredCameraId": None,
+                "configuredName": None,
+            }
+        ],
+    }
+    imported_blink = request(
+        f"/api/admin/discovery/scans/{blink_scan_id}/devices/{blink_scan_device_id}/import",
+        "POST",
+        {"name": "Blink Einfahrt"},
+        csrf,
+    )
+    assert imported_blink["displayMode"] == "explicit"
+    assert imported_blink["explicitLiveOnly"] is True
+    assert imported_blink["liveMaxSeconds"] == 300
+    assert imported_blink["features"]["clips"] is True
+
+    original_blink_thumbnail = camera_app.blink_thumbnail_bytes
+    camera_app.blink_thumbnail_bytes = (
+        lambda device_id: b"\xff\xd8blink-cached-thumbnail\xff\xd9"
+        if device_id == blink_device_id
+        else b""
+    )
+    try:
+        blink_preview = camera_app.preview(imported_blink["id"], None)
+    finally:
+        camera_app.blink_thumbnail_bytes = original_blink_thumbnail
+    assert blink_preview.body.startswith(b"\xff\xd8")
+    assert imported_blink["id"] not in camera_app.LEASES
+
+    blink_lease = request(
+        f"/api/cameras/{imported_blink['id']}/lease", "POST", csrf=csrf
+    )
+    assert blink_lease["maxDurationSeconds"] == 300
+    blink_leases_request = urllib.request.Request(
+        base + "/internal/v1/providers/blink/leases",
+        headers={"Authorization": f"Bearer {camera_app.BLINK_ADAPTER_TOKEN}"},
+    )
+    with urllib.request.urlopen(blink_leases_request, timeout=5) as response:
+        blink_leases = json.load(response)["cameras"]
+    assert any(
+        item["deviceId"] == blink_device_id and item["active"]
+        for item in blink_leases
+    )
+    request(
+        f"/api/cameras/{imported_blink['id']}/lease?leaseId={blink_lease['leaseId']}",
+        "DELETE",
+        csrf=csrf,
+        expected=204,
+    )
+
+    camera_app.blink_bridge_json = (
+        lambda *_args, **_kwargs: {
+            "clips": [
+                {
+                    "id": "a" * 32,
+                    "createdAt": "2026-07-31T10:00:00+00:00",
+                }
+            ]
+        }
+    )
+    try:
+        blink_clips = camera_app.list_blink_clips(imported_blink["id"], None)
+    finally:
+        camera_app.blink_bridge_json = original_blink_bridge_json
+    assert blink_clips["clips"][0]["id"] == "a" * 32
+
     assert request(
         "/api/admin/cloud/providers/netatmo",
         "PUT",
@@ -1805,7 +2039,7 @@ try:
     manifest, backup_database, source_key = camera_app.decode_backup_archive(
         backup_archive, backup_passphrase
     )
-    assert manifest["schemaVersion"] == 10 and manifest["appVersion"] == "1.5.0-dev"
+    assert manifest["schemaVersion"] == 11 and manifest["appVersion"] == "1.6.0-dev"
     assert len(backup_database) <= camera_app.BACKUP_DATABASE_MAX_BYTES
     assert camera_app.BACKUP_EXPANDED_MAX_BYTES > len(base64.b64encode(backup_database))
     for invalid_archive, invalid_passphrase, expected_code in (
@@ -2011,7 +2245,7 @@ try:
         opener=second_display_client,
     )["detail"] == "display-pair-rate-limited"
 
-    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration-v10 personal-display-profiles profile-order profile-isolation camera-disable-retention camera-delete-cascade ordering zones detection-default-off detection-dedup encrypted-motion-snapshot on-demand-detection-blocked vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist display-pair-expiry display-pair-one-use display-pair-rate-limit display-device-disable display-device-revoke display-media-isolation weekly-schedules-midnight-dst-priority operations-schema event-threshold event-dedup event-recovery passive-on-demand-monitor hmac-webhooks backup-encryption backup-corruption backup-restore restore-session-revocation")
+    print("integration-ok: password-only-setup rbac-owner-admin-viewer session-revocation auth csrf encryption migration-v11 personal-display-profiles profile-order profile-isolation camera-disable-retention camera-delete-cascade ordering zones detection-default-off detection-dedup encrypted-motion-snapshot on-demand-detection-blocked vendor-snapshot-crud connection-revisions encrypted-shared-auth dynamic-relay-active-credentials activation-rollback capabilities ptz wsse-password-digest network-boundary onvif-profile-mock authenticated-discovery-preview configured-discovery-preview internal-adapter external-on-demand-camera external-ptz transient-snapshot renewable-leases encrypted-cloud-accounts cloud-credential-replacement provider-isolation cloud-frame-gated-import blink-2fa-encrypted-account blink-passive-thumbnail blink-explicit-live-lease blink-clips netatmo-private-callback netatmo-account-reconnect netatmo-inventory-models netatmo-stream-allowlist display-pair-expiry display-pair-one-use display-pair-rate-limit display-device-disable display-device-revoke display-media-isolation weekly-schedules-midnight-dst-priority operations-schema event-threshold event-dedup event-recovery passive-on-demand-monitor hmac-webhooks backup-encryption backup-corruption backup-restore restore-session-revocation")
 finally:
     server.should_exit = True
     thread.join(timeout=5)

@@ -28,8 +28,20 @@ function camera(index, stream = false) {
   };
 }
 
-async function mockApplication(page, count, {stream = false, profilePayload = null} = {}) {
+async function mockApplication(page, count, {stream = false, profilePayload = null, explicitBlink = false} = {}) {
   const cameras = Array.from({length: count}, (_, index) => camera(index + 1, stream));
+  if (explicitBlink && cameras[0]) Object.assign(cameras[0], {
+    name: 'Blink Einfahrt',
+    source: 'Blink Cloud · bei Bedarf',
+    externalSource: true,
+    onDemand: true,
+    cloudProvider: 'blink',
+    explicitLiveOnly: true,
+    liveMaxSeconds: 300,
+    displayMode: 'explicit',
+    snapshotPath: '/synthetic/1.jpg',
+    features: {audio: false, ptz: false, ptzAxes: [], clips: true}
+  });
   await page.route('**/synthetic/*.jpg*', route => route.fulfill({status: 200, contentType: 'image/jpeg', body: pixel}));
   await page.route('**/hls/**', route => route.fulfill({
     status: 200,
@@ -151,6 +163,30 @@ test('HLS meldet Live erst nach einem nachgewiesenen Videoframe', async ({page})
   expect(await page.locator('#detail-status').getAttribute('data-state')).not.toBe('live');
   await expect(page.locator('#detail-status')).toHaveAttribute('data-state', 'live', {timeout: 5000});
   await expect(page.locator('#detail-status')).toContainText('HLS');
+});
+
+test('Blink bleibt in Übersicht und Leitstelle passiv und startet Live nur per Klick', async ({page}) => {
+  const leases = [];
+  page.on('request', request => {
+    if (new URL(request.url()).pathname.endsWith('/lease') && request.method() === 'POST') {
+      leases.push(request.url());
+    }
+  });
+  await mockApplication(page, 1, {explicitBlink: true});
+  await page.goto('/index.html#overview');
+  await expect(page.locator('.card-snapshot')).toBeVisible();
+  expect(leases).toHaveLength(0);
+  await page.locator('#enter-wall-mode').click();
+  await expect(page.locator('body')).toHaveClass(/wall-mode/);
+  await page.waitForTimeout(250);
+  expect(leases).toHaveLength(0);
+  await page.locator('#exit-wall-mode').click();
+  await page.locator('.open-camera').click();
+  await expect(page.locator('#detail-start-explicit')).toBeVisible();
+  await expect(page.locator('#detail-snapshot')).toBeVisible();
+  expect(leases).toHaveLength(0);
+  await page.locator('#detail-start-explicit').click();
+  await expect.poll(() => leases.length).toBe(1);
 });
 
 test('deaktivierte Kameras bleiben im Profil-Editor sichtbar', async ({page}) => {

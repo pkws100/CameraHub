@@ -71,6 +71,7 @@ Initialize-LocalSecret (Join-Path $secretDirectory 'zmodo_secret_key')
 Initialize-LocalSecret (Join-Path $secretDirectory 'zmodo_internal_token')
 Initialize-LocalSecret (Join-Path $secretDirectory 'czeview_adapter_token')
 Initialize-LocalSecret (Join-Path $secretDirectory 'netatmo_adapter_token')
+Initialize-LocalSecret (Join-Path $secretDirectory 'blink_adapter_token')
 Initialize-LocalSecret (Join-Path $secretDirectory 'detection_adapter_token')
 
 docker info --format '{{.ServerVersion}}' | Out-Null
@@ -198,7 +199,19 @@ $state = [ordered]@{ mode=$Mode; bindAddress=$bindAddress; composeFiles=$compose
 $composeArgs = @()
 if (Test-Path -LiteralPath $localEnv) { $composeArgs += @('--env-file', $localEnv) }
 $composeArgs += @('--env-file', $composeEnv)
-$composeArgs += @('--profile', 'czeview')
+$requestedProfiles = @('czeview')
+if (Test-Path -LiteralPath $localEnv) {
+    $profileLine = @(Get-Content -LiteralPath $localEnv |
+        Where-Object { $_ -match '^\s*COMPOSE_PROFILES\s*=' } |
+        Select-Object -Last 1)
+    if ($profileLine) {
+        $profileValue = ($profileLine -split '=', 2)[1].Trim().Trim('"').Trim("'")
+        $requestedProfiles += @($profileValue -split '[,\s]+' | Where-Object { $_ })
+    }
+}
+foreach ($profile in @($requestedProfiles | Sort-Object -Unique)) {
+    $composeArgs += @('--profile', $profile)
+}
 foreach ($file in $composeFiles) { $composeArgs += @('-f', $file) }
 $upArgs = @($composeArgs) + @('up', '-d', '--build', '--remove-orphans')
 Push-Location $poc
@@ -233,6 +246,7 @@ if (-not $allLive) { Write-Warning 'Der Stack läuft, aber noch nicht alle Kamer
 Write-Output "PWA: $browserUrl"
 Write-Output "Bindung: $bindAddress (Modus: $Mode)"
 Write-Output "CZEview-Brücke: aktiv (Konten werden in Camera Hub verwaltet)"
+Write-Output "Blink-Brücke: aktiv (Konten und 2FA werden in Camera Hub verwaltet)"
 if ($Mode -eq 'Https') {
     $projectRules = @(Get-NetFirewallRule -ErrorAction SilentlyContinue |
         Where-Object DisplayName -like 'PKWS-ZMODO-PWA-*')
