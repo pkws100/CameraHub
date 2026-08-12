@@ -1,0 +1,7 @@
+# Sichere, repositorybezogene Codex-Defaults. Modell, Reasoning und Freigaben
+# bleiben persönliche bzw. sitzungsbezogene Entscheidungen.
+web_search = "cached"
+
+[shell_environment_policy]
+# Standardfilter für Variablennamen mit KEY, SECRET oder TOKEN aktiv lassen.
+ignore_default_excludes = false

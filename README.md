@@ -12,6 +12,14 @@ Cloud-Adapter bereit.
 > müssen WireGuard, ein HTTPS-Reverse-Proxy und eine zusätzliche
 > Netzsegmentierung eingerichtet werden.
 
+## Codex-Projekt
+
+Für die Weiterentwicklung als lokales Codex-Projekt stehen dauerhafte
+Repositoryregeln in [AGENTS.md](AGENTS.md), ein vollständiger
+[Projekt-Start-Prompt](CODEX-PROJECT-PROMPT.md) und eine
+[Einrichtungsanleitung](CODEX-PROJECT-SETUP.md) bereit. Als primärer
+Codex-Projektordner muss der Git-Root dieses Repositorys ausgewählt werden.
+
 ## Lokaler Start
 
 ```powershell
