@@ -40,6 +40,9 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    networks:
+      - default
+      - detection-internal
 
   garten-low:
     <<: *relay
@@ -118,6 +121,8 @@ services:
       INTERNAL_TOKEN_PATH: /run/secrets/zmodo_internal_token
       CZEVIEW_ADAPTER_TOKEN_PATH: /run/secrets/czeview_adapter_token
       NETATMO_ADAPTER_TOKEN_PATH: /run/secrets/netatmo_adapter_token
+      DETECTION_ADAPTER_TOKEN_PATH: /run/secrets/detection_adapter_token
+      MOTION_ASSET_ROOT: /data/motion-assets
       DISCOVERY_NETWORK: ${CAMERA_HUB_DISCOVERY_NETWORK:-192.168.1.0/24}
       TRUSTED_PROXY_NETWORKS: ${CAMERA_HUB_TRUSTED_PROXY_NETWORKS:-172.28.178.0/24}
       STATIC_AUTHENTICATED_CAMERA_IDS: ${CAMERA_HUB_STATIC_AUTHENTICATED_IDS:-}
@@ -130,6 +135,7 @@ services:
       - zmodo_internal_token
       - czeview_adapter_token
       - netatmo_adapter_token
+      - detection_adapter_token
     volumes:
       - ./web:/web:ro
       - ./backend/cameras.json:/config/cameras.json:ro
@@ -142,6 +148,44 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    networks:
+      - default
+      - detection-internal
+
+  detection-worker:
+    build: ./detection
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+    logging: *bounded-logging
+    environment:
+      BACKEND_INTERNAL: http://web:8090
+      DETECTION_ADAPTER_TOKEN_PATH: /run/secrets/detection_adapter_token
+      DETECTION_POLL_SECONDS: "5"
+    secrets:
+      - detection_adapter_token
+    networks:
+      - detection-internal
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+      - /run/detection-health:mode=0777,size=1m
+    cpus: "4.0"
+    mem_limit: 1536m
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /run/detection-health/worker"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   relay-manager:
     build: ./manager
@@ -235,6 +279,11 @@ networks:
     ipam:
       config:
         - subnet: 172.28.178.0/24
+  detection-internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.179.0/24
 
 volumes:
   zmodo-data:
@@ -249,5 +298,7 @@ secrets:
     file: ./runtime/secrets/czeview_adapter_token
   netatmo_adapter_token:
     file: ./runtime/secrets/netatmo_adapter_token
+  detection_adapter_token:
+    file: ./runtime/secrets/detection_adapter_token
   czeview_credentials:
     file: ./runtime/secrets/czeview_credentials.json
