@@ -46,6 +46,39 @@ Stoppen und Status:
 .\status-zmodo-pwa.ps1
 ```
 
+## SANNCE PoE/NVR
+
+Der N98PBM-Adapter übernimmt lokale H.264-Zweitstreams über den WebSocket-
+Medienpfad des Recorders und veröffentlicht sie als neutrale MediaMTX-Pfade.
+Die Zugangsdaten bleiben ausschließlich in der ignorierten Datei
+`poc/runtime/secrets/sannce_credentials.json`. Der Adapter wird mit dem
+Compose-Profil `sannce` aktiviert. Beispiel ohne reale Zugangsdaten:
+
+```json
+{
+  "host": "192.0.2.10",
+  "port": 3002,
+  "username": "Admin",
+  "password": "REPLACE_ME",
+  "channelCount": 8,
+  "discoverChannels": [2],
+  "channels": [
+    {"channel": 5, "stream": 1, "path": "sannce-5-low", "fps": 24}
+  ]
+}
+```
+
+`stream: 1` bezeichnet den kompatiblen Zweitstream. Die Kamera-Hauptstreams
+bleiben davon unberührt. Quelladressen und Geheimnisse werden nicht an den
+Browser ausgegeben.
+
+Die normale LAN-Suche kann das isolierte PoE-Netz des Recorders nicht direkt
+erreichen. Deshalb meldet der Adapter den NVR und seine belegten Kanäle über
+eine intern authentifizierte Inventarschnittstelle an die Kamerasuche. Einträge
+unter `discoverChannels` werden im Hintergrund geprüft. Sobald dort ein
+H.264-Zweitstream bereitsteht, kann der Kanal in der Kamerasuche ohne Kenntnis
+seiner internen `172.16.1.x`-Adresse hinzugefügt werden.
+
 ## Cloud-Konten und Akku-Kameras
 
 Die untersuchte CZEview-Kamera besitzt keinen nachgewiesenen lokalen

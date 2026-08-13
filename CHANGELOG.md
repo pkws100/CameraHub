@@ -6,6 +6,9 @@ Alle wesentlichen Änderungen an Camera Hub werden in dieser Datei dokumentiert.
 
 ### Hinzugefügt
 
+- lokaler SANNCE-N98PBM-Adapter für dauerhaft laufende H.264-Zweitstreams aus
+  PoE-Kanälen, mit getrenntem Docker-Secret, echtem MediaMTX-Frame-Nachweis und
+  recorderbasierter Kanal-Erkennung für das isolierte PoE-Netz;
 - widerrufbare Nur-Lese-Anzeigegeräte mit achtstelligem, zehn Minuten gültigem
   Einmalcode und 180-Tage-Gerätesitzung;
 - priorisierte Profilzuordnung, wiederkehrende Wochenzeitpläne in einer
