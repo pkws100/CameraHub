@@ -279,6 +279,44 @@ services:
       retries: 3
       start_period: 30s
 
+  sannce-bridge:
+    build: ./sannce
+    profiles: ["sannce"]
+    restart: unless-stopped
+    depends_on:
+      mediamtx:
+        condition: service_healthy
+    logging: *bounded-logging
+    environment:
+      MEDIAMTX_API: http://mediamtx:9997
+      MEDIAMTX_PUBLISH: rtsp://mediamtx:8554
+      SANNCE_CREDENTIALS_PATH: /run/secrets/sannce_credentials
+      INTERNAL_TOKEN_PATH: /run/secrets/zmodo_internal_token
+      SANNCE_INVENTORY_PORT: "8790"
+    secrets:
+      - sannce_credentials
+      - zmodo_internal_token
+    expose:
+      - "8790"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+      - /run/bridge-health:mode=0777,size=1m
+    cpus: "1.0"
+    mem_limit: 256m
+    pids_limit: 64
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /run/bridge-health/state && test $$(($$(date +%s) - $$(cat /run/bridge-health/state))) -lt 30"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
   blink-bridge:
     build: ./blink
     restart: unless-stopped
@@ -354,3 +392,5 @@ secrets:
     file: ./runtime/secrets/detection_adapter_token
   czeview_credentials:
     file: ./runtime/secrets/czeview_credentials.json
+  sannce_credentials:
+    file: ./runtime/secrets/sannce_credentials.json

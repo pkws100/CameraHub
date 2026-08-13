@@ -50,6 +50,7 @@ DETECTION_ADAPTER_TOKEN_PATH = Path(os.environ.get("DETECTION_ADAPTER_TOKEN_PATH
 MOTION_ASSET_ROOT = Path(os.environ.get("MOTION_ASSET_ROOT", "/data/motion-assets"))
 MEDIAMTX_API = os.environ.get("MEDIAMTX_API", "http://mediamtx:9997")
 BLINK_BRIDGE_INTERNAL = os.environ.get("BLINK_BRIDGE_INTERNAL", "http://blink-bridge:8788").rstrip("/")
+SANNCE_BRIDGE_INTERNAL = os.environ.get("SANNCE_BRIDGE_INTERNAL", "http://sannce-bridge:8790").rstrip("/")
 ALLOWED_NETWORK = ipaddress.ip_network(os.environ.get("DISCOVERY_NETWORK", "192.168.1.0/24"), strict=True)
 MAX_CAMERAS = int(os.environ.get("MAX_CAMERAS", "32"))
 SESSION_SECONDS = 8 * 60 * 60
@@ -57,7 +58,7 @@ DISPLAY_SESSION_SECONDS = 180 * 24 * 60 * 60
 DISPLAY_PAIRING_SECONDS = 10 * 60
 ELEVATION_SECONDS = 10 * 60
 SCAN_TTL_SECONDS = 15 * 60
-SCAN_PORTS = (80, 443, 554, 2020, 8000, 8080, 8554, 8899, 10080, 10554)
+SCAN_PORTS = (80, 443, 554, 2020, 3002, 8000, 8080, 8554, 8899, 10080, 10554)
 PH = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 DB_LOCK = threading.RLock()
 SCAN_LOCK = threading.Lock()
@@ -1640,6 +1641,18 @@ def blink_bridge_json(
             return json.load(response)
         except (ValueError, json.JSONDecodeError) as error:
             raise HTTPException(502, "blink-bridge-response-invalid") from error
+
+
+def sannce_bridge_inventory() -> dict | None:
+    request = Request(
+        f"{SANNCE_BRIDGE_INTERNAL}/internal/v1/inventory",
+        headers={"Authorization": f"Bearer {INTERNAL_TOKEN}", "Accept": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=4) as response:
+            return json.load(response)
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def blink_thumbnail_bytes(device_id: str) -> bytes:
@@ -5314,7 +5327,91 @@ def ws_discovery() -> set[str]:
 def discovery_sort_key(item: dict) -> tuple:
     if item.get("origin") == "cloud":
         return (1, item.get("provider", ""), item.get("accountLabel", ""), item.get("name", ""))
-    return (0, int(ipaddress.ip_address(item["address"])), "", "")
+    return (
+        0,
+        int(ipaddress.ip_address(item["address"])),
+        int(item.get("channel") or 0),
+        item.get("deviceKind", ""),
+    )
+
+
+def sannce_discovery_results() -> list[dict]:
+    inventory = sannce_bridge_inventory()
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT id,name,address,low_path,enabled FROM cameras
+               WHERE protocol='external' AND manufacturer='SANNCE'
+               ORDER BY position"""
+        ).fetchall()
+    configured: dict[int, sqlite3.Row] = {}
+    for row in rows:
+        match = re.search(r"(?:sannce-)(\d+)(?:-low)?$", row["low_path"] or row["id"])
+        if match:
+            configured[int(match.group(1))] = row
+    if not inventory and not configured:
+        return []
+    host = str((inventory or {}).get("host") or next((row["address"] for row in rows if row["address"]), ""))
+    try:
+        if ipaddress.ip_address(host) not in ALLOWED_NETWORK:
+            return []
+    except ValueError:
+        return []
+    manufacturer = str((inventory or {}).get("manufacturer") or "SANNCE")
+    model = str((inventory or {}).get("model") or "N98PBM")
+    reported = {int(item["channel"]): item for item in (inventory or {}).get("channels", [])}
+    channels = sorted(set(configured) | set(reported))
+    ready_count = sum(bool(reported.get(channel, {}).get("ready")) for channel in channels)
+    results = [{
+        "id": str(uuid.uuid4()),
+        "origin": "recorder",
+        "deviceKind": "recorder",
+        "address": host,
+        "manufacturer": manufacturer,
+        "model": model,
+        "channelCount": int((inventory or {}).get("channelCount") or 8),
+        "detectedChannels": len(channels),
+        "readyCount": ready_count,
+        "onvif": False,
+        "rtsp": False,
+        "openPorts": [80, 3002],
+        "profiles": [],
+        "previewAvailable": False,
+        "importAllowed": False,
+    }]
+    for channel in channels:
+        known = configured.get(channel)
+        status = reported.get(channel, {})
+        path = str(status.get("path") or (known["low_path"] if known else f"sannce-{channel}-low"))
+        ready = bool(status.get("ready"))
+        results.append({
+            "id": str(uuid.uuid4()),
+            "origin": "recorder",
+            "deviceKind": "channel",
+            "address": host,
+            "channel": channel,
+            "manufacturer": manufacturer,
+            "model": f"{model} · PoE-Kanal {channel}",
+            "onvif": False,
+            "rtsp": False,
+            "openPorts": [3002],
+            "profiles": [{
+                "token": f"channel-{channel}", "name": "NVR-Zweitstream",
+                "codec": str(status.get("codec") or "h264"),
+                "width": status.get("width"), "height": status.get("height"),
+                "frameRate": status.get("fps"), "streamPath": path,
+            }],
+            "ready": ready,
+            "detected": bool(status),
+            "previewAvailable": ready,
+            "previewVerified": ready,
+            "liveVerified": ready,
+            "importAllowed": ready and not known,
+            "configuredCameraId": known["id"] if known else None,
+            "configuredName": known["name"] if known else None,
+            "_configuredPreviewPath": path if ready else None,
+            "_adapterPath": path,
+        })
+    return results
 
 
 def scan_network(scan_id: str) -> None:
@@ -5349,7 +5446,11 @@ def scan_network(scan_id: str) -> None:
                         "model": row["model"] or "",
                         "profiles": saved_capabilities.get("profiles", []),
                     }
-            results = cloud_discovery_results() + [
+            recorder_results = sannce_discovery_results()
+            recorder_addresses = {
+                item["address"] for item in recorder_results if item.get("deviceKind") == "recorder"
+            }
+            results = cloud_discovery_results() + recorder_results + [
                 {
                     "id": str(uuid.uuid4()),
                     "origin": "local",
@@ -5375,13 +5476,15 @@ def scan_network(scan_id: str) -> None:
             SCANS[scan_id].update(results=list(results))
             # Known cameras and WS-Discovery responders are checked first. This
             # avoids starving devices that limit parallel management sockets.
-            priority_hosts = discovered | set(configured)
+            priority_hosts = discovered | set(configured) | recorder_addresses
             hosts = sorted(
                 (str(ip) for ip in ALLOWED_NETWORK.hosts()),
                 key=lambda ip: (ip not in priority_hosts, ipaddress.ip_address(ip)),
             )
             from concurrent.futures import ThreadPoolExecutor, as_completed
             def inspect_host(ip: str):
+                if ip in recorder_addresses:
+                    return None
                 known = configured.get(ip)
                 if known:
                     return None
@@ -5662,6 +5765,47 @@ def import_cloud_discovery_device(
     actor: sqlite3.Row = Depends(require_admin_elevated),
 ):
     _, item = discovery_item(scan_id, device_id)
+    if item.get("origin") == "recorder" and item.get("deviceKind") == "channel":
+        if item.get("configuredCameraId"):
+            raise HTTPException(409, "device-already-configured")
+        if not item.get("importAllowed") or not item.get("_adapterPath"):
+            raise HTTPException(409, "recorder-channel-not-ready")
+        channel = int(item["channel"])
+        camera_id = f"sannce-{channel}"
+        path = str(item["_adapterPath"])
+        stamp = now_iso()
+        capabilities = {
+            "device": {"manufacturer": "SANNCE", "model": "I71EQ via N98PBM", "hardwareId": "sannce-adapter"},
+            "profiles": item.get("profiles", []),
+            "audio": {"supported": False, "codecs": []},
+            "ptz": {"supported": False, "axes": [], "presets": []},
+            "snapshot": {"supported": True},
+            "imaging": False, "events": False, "analytics": False, "deviceIo": False,
+        }
+        with DB_LOCK, connect() as conn:
+            if conn.execute("SELECT 1 FROM cameras WHERE id=? OR low_path=?", (camera_id, path)).fetchone():
+                raise HTTPException(409, "device-already-configured")
+            if conn.execute("SELECT COUNT(*) FROM cameras").fetchone()[0] >= MAX_CAMERAS:
+                raise HTTPException(409, "camera-limit-reached")
+            position = conn.execute("SELECT COALESCE(MAX(position),-1)+1 FROM cameras").fetchone()[0]
+            conn.execute(
+                """INSERT INTO cameras(
+                   id,name,position,enabled,source_label,low_path,high_path,detail_quality,
+                   managed,address,protocol,port,codec,manufacturer,model,on_demand,
+                   external_capabilities_json,created_at,updated_at)
+                   VALUES(?,?,?,1,?,?,?,?,0,?,'external',3002,'h264','SANNCE',?,0,?,?,?)""",
+                (
+                    camera_id, body.name or f"SANNCE Kanal {channel}", position,
+                    "SANNCE N98PBM · PoE", path, path,
+                    "H.264-Zweitstream · 704×480", item["address"],
+                    "I71EQ via N98PBM", json.dumps(capabilities, separators=(",", ":")),
+                    stamp, stamp,
+                ),
+            )
+            audit(conn, actor["user_id"], "camera.recorder.imported", "camera", camera_id)
+            row = conn.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
+        item.update(configuredCameraId=camera_id, configuredName=row["name"], importAllowed=False)
+        return admin_camera(row)
     if item.get("origin") != "cloud":
         raise HTTPException(422, "cloud-device-required")
     with DB_LOCK, connect() as conn:

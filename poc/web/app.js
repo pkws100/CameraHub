@@ -718,22 +718,27 @@
       const row=document.createElement('article');
       row.className='device-row';
       const cloud=item.origin==='cloud';
+      const recorder=item.origin==='recorder';
       const cloudName={netatmo:'Netatmo',blink:'Blink',czeview:'CZEview'}[item.provider]||item.provider;
-      const protocols=cloud?[`${cloudName} Cloud`]:[item.onvif?'ONVIF':'',item.rtsp?'RTSP':''].filter(Boolean);
+      const protocols=cloud?[`${cloudName} Cloud`]:recorder?[item.deviceKind==='recorder'?'SANNCE NVR':'NVR-Kanal']:[item.onvif?'ONVIF':'',item.rtsp?'RTSP':''].filter(Boolean);
       const configured=Boolean(item.configuredCameraId);
-      const canProbe=!configured&&(cloud
+      const canProbe=!recorder&&!configured&&(cloud
         ?item.streamSupport!=='unsupported'&&(item.provider!=='blink'||item.streamSupport!=='verified')
         :(item.onvif||item.onvifPort||item.openPorts?.some(port=>[80,443,2020,8000,8080,8899,10080].includes(port))));
       const preview=item.previewAvailable
         ?`<img class="device-preview" src="/api/admin/discovery/scans/${encodeURIComponent(scanId)}/devices/${encodeURIComponent(item.id)}/preview?t=${Date.now()}" alt="Vorschau ${escapeHtml(item.model)}">`
         :`<div class="device-preview is-empty">${item.previewError?'Stream erkannt, aber kein Frame':'Keine Vorschau'}</div>`;
-      const locationText=cloud?`${item.accountLabel} · ${item.name}`:item.address;
+      const locationText=cloud?`${item.accountLabel} · ${item.name}`:recorder&&item.channel?`${item.address} · Kanal ${item.channel}`:item.address;
       const details=cloud
         ?`<span>${item.streamSupport==='verified'?'Livebild bestätigt':item.provider==='blink'&&item.previewVerified?'Cloud-Vorschau bestätigt · Live optional prüfen':item.streamSupport==='unsupported'?'Kein freigegebener Livezugriff':'Livebild noch prüfen'}</span>${item.reason?`<span>${escapeHtml(item.reason)}</span>`:''}`
-        :`<span>${escapeHtml(profileSummary(item.profiles))}</span><span>Ports: ${(item.openPorts||[]).join(', ')}</span>`;
-      const selectLabel=configured?'Bereits hinzugefügt':cloud?(item.importAllowed?'Hinzufügen':'Erst prüfen'):'Auswählen';
+        :recorder
+          ?item.deviceKind==='recorder'
+            ?`<span>${item.detectedChannels||0} Kanäle erkannt · ${item.readyCount||0} Streams bereit</span><span>PoE-Kameras werden über den Recorder erkannt – interne IPs sind nicht erforderlich</span>`
+            :`<span>${escapeHtml(profileSummary(item.profiles))}</span><span>${item.ready?'Stream über Recorder bereit':item.detected&&item.profiles?.[0]?.codec==='h265'?'Kanal erkannt · Zweitstream muss auf H.264 umgestellt werden':'Kanal derzeit offline'}</span>`
+          :`<span>${escapeHtml(profileSummary(item.profiles))}</span><span>Ports: ${(item.openPorts||[]).join(', ')}</span>`;
+      const selectLabel=recorder&&item.deviceKind==='recorder'?'Recorder erkannt':configured?'Bereits hinzugefügt':cloud?(item.importAllowed?'Hinzufügen':'Erst prüfen'):recorder?(item.importAllowed?'Hinzufügen':'Nicht bereit'):'Auswählen';
       const proofBadge=item.liveVerified?'<span class="connection-badge">Echte Videoframes bestätigt</span>':item.provider==='blink'&&item.previewVerified?'<span class="connection-badge">Passives Cloud-Vorschaubild bestätigt</span>':'';
-      row.innerHTML=`${preview}<div class="device-description"><h3>${escapeHtml(item.manufacturer)} ${escapeHtml(item.model)}</h3><div class="device-meta"><span>${escapeHtml(locationText)}</span>${protocols.map(value=>`<span class="protocol-pill">${value}</span>`).join('')}${details}${proofBadge}${configured?`<span class="connection-badge">Bereits hinzugefügt: ${escapeHtml(item.configuredName||'Kamera')}</span>`:''}</div></div><div class="discovery-actions">${canProbe?`<button type="button" data-probe>${item.provider==='blink'?'Livebild bewusst prüfen':'Streams & Vorschau prüfen'}</button>`:''}<button type="button" class="primary" data-select ${cloud&&!configured&&!item.importAllowed?'disabled':''}>${selectLabel}</button></div>`;
+      row.innerHTML=`${preview}<div class="device-description"><h3>${escapeHtml(item.manufacturer)} ${escapeHtml(item.model)}</h3><div class="device-meta"><span>${escapeHtml(locationText)}</span>${protocols.map(value=>`<span class="protocol-pill">${value}</span>`).join('')}${details}${proofBadge}${configured?`<span class="connection-badge">Bereits hinzugefügt: ${escapeHtml(item.configuredName||'Kamera')}</span>`:''}</div></div><div class="discovery-actions">${canProbe?`<button type="button" data-probe>${item.provider==='blink'?'Livebild bewusst prüfen':'Streams & Vorschau prüfen'}</button>`:''}<button type="button" class="primary" data-select ${(cloud&&!configured&&!item.importAllowed)||(recorder&&item.deviceKind==='recorder')||(recorder&&!configured&&!item.importAllowed)?'disabled':''}>${selectLabel}</button></div>`;
       const image=$('img.device-preview',row);
       image?.addEventListener('error',()=>{
         if(image.dataset.retried==='true')return;
@@ -741,17 +746,17 @@
         window.setTimeout(()=>{image.src=image.src.replace(/([?&])t=\d+/,`$1t=${Date.now()}`);},3000);
       });
       $('[data-probe]',row)?.addEventListener('click',()=>openDiscoveryProbe(item,scanId));
-      $('[data-select]',row).addEventListener('click',()=>configured?(cloud?toast('Diese Cloud-Kamera ist bereits in Camera Hub enthalten'):openConfiguredDiscovery(item)):(cloud?openCloudImportDialog(item,scanId):openCameraDialog(item)));
+      $('[data-select]',row).addEventListener('click',()=>configured?(cloud?toast('Diese Cloud-Kamera ist bereits in Camera Hub enthalten'):openConfiguredDiscovery(item)):((cloud||recorder)?openCloudImportDialog(item,scanId):openCameraDialog(item)));
       list.append(row);
     });
   }
   function openCloudImportDialog(item,scanId){
-    const suggested=item.name||item.model||'Cloud-Kamera';
+    const suggested=item.name||(item.origin==='recorder'?`SANNCE Kanal ${item.channel}`:item.model||'Cloud-Kamera');
     const form=$('#cloud-import-form');
     appState.cloudImportContext={item,scanId};
     form.reset();
     form.elements.name.value=suggested;
-    $('#cloud-import-target').textContent=`${item.manufacturer} ${item.model} · ${item.accountLabel}`;
+    $('#cloud-import-target').textContent=item.origin==='recorder'?`${item.manufacturer} ${item.model} · ${item.address}`:`${item.manufacturer} ${item.model} · ${item.accountLabel}`;
     $('#cloud-import-error').textContent='';
     $('#cloud-import-dialog').showModal();
   }
@@ -761,7 +766,7 @@
     if(!context)return;
     const {item,scanId}=context;
     const form=event.currentTarget,submit=form.querySelector('[type=submit]'),cancel=form.querySelector('[data-close-dialog]');
-    const suggested=item.name||item.model||'Cloud-Kamera';
+    const suggested=item.name||(item.origin==='recorder'?`SANNCE Kanal ${item.channel}`:item.model||'Cloud-Kamera');
     const name=form.elements.name.value.trim()||suggested;
     submit.disabled=true;
     cancel.disabled=true;
@@ -782,7 +787,7 @@
       appState.cloudImportContext=null;
       await loadAdminCameras();
       await loadCameras();
-      toast('Cloud-Kamera hinzugefügt');
+      toast(item.origin==='recorder'?'Recorder-Kanal hinzugefügt':'Cloud-Kamera hinzugefügt');
     }catch(error){
       appState.cloudImportContext=context;
       if(!$('#cloud-import-dialog').open)$('#cloud-import-dialog').showModal();
