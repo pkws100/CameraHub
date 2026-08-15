@@ -15,12 +15,21 @@ import struct
 import subprocess
 import threading
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 from urllib.error import HTTPError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import (
+    HTTPDigestAuthHandler,
+    HTTPPasswordMgrWithDefaultRealm,
+    Request,
+    build_opener,
+    urlopen,
+)
+from zoneinfo import ZoneInfo
 
 
 logging.disable(logging.CRITICAL)
@@ -36,12 +45,18 @@ MEDIAMTX_PUBLISH = os.environ.get("MEDIAMTX_PUBLISH", "rtsp://mediamtx:8554").rs
 CREDENTIALS_PATH = Path(os.environ.get("SANNCE_CREDENTIALS_PATH", "/run/secrets/sannce_credentials"))
 INTERNAL_TOKEN_PATH = Path(os.environ.get("INTERNAL_TOKEN_PATH", "/run/secrets/zmodo_internal_token"))
 INVENTORY_PORT = int(os.environ.get("SANNCE_INVENTORY_PORT", "8790"))
+RECORDER_TIMEZONE = ZoneInfo(os.environ.get("CAMERA_HUB_TIMEZONE", "Europe/Berlin"))
 HEALTH_PATH = Path("/run/bridge-health/state")
+RECORDING_TOKEN_SECONDS = 15 * 60
+PLAYBACK_MAX_SECONDS = 30 * 60
 
 stop_event = threading.Event()
 state_lock = threading.Lock()
 last_frames: dict[str, float] = {}
 detected_frames: dict[str, tuple[float, str]] = {}
+recording_lock = threading.Lock()
+recording_files: dict[str, tuple[float, "Recording"]] = {}
+playback_slots = threading.BoundedSemaphore(2)
 
 
 def log(event: str, **fields: object) -> None:
@@ -65,6 +80,16 @@ class Config:
     channel_count: int
     channels: tuple[Channel, ...]
     discover_channels: tuple[Channel, ...]
+
+
+@dataclass(frozen=True)
+class Recording:
+    token: str
+    channel: int
+    kind: str
+    start_at: str
+    end_at: str
+    filename: str
 
 
 def load_config(path: Path = CREDENTIALS_PATH) -> Config:
@@ -216,6 +241,31 @@ def media_payloads(data: bytes) -> Iterator[bytes]:
         offset += total
 
 
+class MediaParser:
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def feed(self, data: bytes) -> Iterator[bytes]:
+        self.buffer.extend(data)
+        while len(self.buffer) >= 28:
+            if self.buffer[:4] != MEDIA_MAGIC:
+                marker = self.buffer.find(MEDIA_MAGIC, 1)
+                if marker < 0:
+                    del self.buffer[:-3]
+                    return
+                del self.buffer[:marker]
+            if len(self.buffer) < 28:
+                return
+            total = struct.unpack_from("<H", self.buffer, 14)[0]
+            if total < 28:
+                del self.buffer[0]
+                continue
+            if len(self.buffer) < total:
+                return
+            yield bytes(self.buffer[28:total])
+            del self.buffer[:total]
+
+
 class FrameParser:
     def __init__(self) -> None:
         self.buffer = bytearray()
@@ -231,7 +281,7 @@ class FrameParser:
                 del self.buffer[:marker]
             if len(self.buffer) < 8:
                 return
-            total = 8 + struct.unpack_from("<I", self.buffer, 4)[0]
+            total = struct.unpack_from("<I", self.buffer, 4)[0]
             if total < 32 or total > MAX_FRAME_BYTES:
                 del self.buffer[0]
                 continue
@@ -387,6 +437,7 @@ def channel_session(config: Config, channel: Channel) -> None:
             f"{PREFIX}\tIP\tINNER\tCONNECT\t{channel.stream_index}\t1\t{command_id}"
             "\t\t0\t\t\t\t\n\n\n"
         ))
+        media_parser = MediaParser()
         parser = FrameParser()
         publisher_started = False
         forced = False
@@ -395,7 +446,7 @@ def channel_session(config: Config, channel: Channel) -> None:
             if command_finished.is_set():
                 raise EOFError("sannce-command-session-ended")
             message = data_socket.receive()
-            for payload in media_payloads(message):
+            for payload in media_parser.feed(message):
                 if not forced:
                     command_socket.send(command_packet(
                         f"{PREFIX}\tIP\tCMD\tFORCE_IFRAME\t{channel.stream_index}\t0\n\n\n"
@@ -440,6 +491,245 @@ def channel_worker(config: Config, channel: Channel, retry_seconds: int = 3) -> 
         stop_event.wait(retry_seconds)
 
 
+def recorder_opener(config: Config):
+    password_manager = HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password(
+        None, f"http://{config.host}", config.username, config.password
+    )
+    return build_opener(HTTPDigestAuthHandler(password_manager))
+
+
+def recorder_post_xml(config: Config, path: str, root: ET.Element) -> ET.Element:
+    request = Request(
+        f"http://{config.host}{path}",
+        data=ET.tostring(root, encoding="utf-8", xml_declaration=True),
+        method="POST",
+        headers={"Content-Type": "application/xml", "Accept": "application/xml"},
+    )
+    with recorder_opener(config).open(request, timeout=15) as response:
+        data = response.read(2 * 1024 * 1024)
+    return ET.fromstring(data)
+
+
+def local_recorder_time(value: str) -> datetime:
+    clean = value.strip().removesuffix("Z")
+    parsed = datetime.fromisoformat(clean)
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    return parsed.replace(tzinfo=RECORDER_TIMEZONE)
+
+
+def utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def search_recordings(
+    config: Config,
+    channel: int,
+    start_local: datetime,
+    end_local: datetime,
+    *,
+    position: int = 1,
+    maximum: int = 100,
+) -> tuple[int, list[Recording]]:
+    root = ET.Element("CMSearchDescription")
+    span_list = ET.SubElement(root, "timeSpanList")
+    span = ET.SubElement(span_list, "timeSpan")
+    ET.SubElement(span, "startTime").text = start_local.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ET.SubElement(span, "endTime").text = end_local.strftime("%Y-%m-%dT%H:%M:%SZ")
+    content = ET.SubElement(root, "contentTypeList")
+    ET.SubElement(content, "contentType").text = "video"
+    record_types = ET.SubElement(root, "RecTypeList")
+    ET.SubElement(record_types, "recType").text = "ALL"
+    detail_types = ET.SubElement(root, "vcaDetailTypeList")
+    ET.SubElement(detail_types, "vcaDetailType").text = "ALL"
+    ET.SubElement(root, "maxResults").text = str(maximum)
+    ET.SubElement(root, "searchResultPostion").text = str(position)
+    ET.SubElement(root, "channelID").text = str(channel - 1)
+    ET.SubElement(root, "streamType").text = "1"
+    ET.SubElement(root, "queryType").text = "0"
+    result = recorder_post_xml(config, "/ISAPI/ContentMgmt/search", root)
+    total = int(result.findtext("numOfMatches", "0") or 0)
+    records: list[Recording] = []
+    for item in result.findall(".//matchElement"):
+        filename = (item.findtext("fileName") or "").strip()
+        start_text = (item.findtext(".//startTime") or "").strip()
+        end_text = (item.findtext(".//endTime") or "").strip()
+        reported_channel = int(item.findtext("chanNo", "-1") or -1) + 1
+        if (
+            reported_channel != channel
+            or not filename
+            or len(filename) > 128
+            or any(character in filename for character in "\r\n\t")
+            or not start_text
+            or not end_text
+        ):
+            continue
+        start_at = utc_iso(local_recorder_time(start_text))
+        end_at = utc_iso(local_recorder_time(end_text))
+        digest = hmac.new(
+            config.password.encode("utf-8"),
+            f"{channel}\0{filename}\0{start_at}\0{end_at}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()[:40]
+        records.append(
+            Recording(
+                token=digest,
+                channel=channel,
+                kind=(item.findtext("type") or "recording")[:32],
+                start_at=start_at,
+                end_at=end_at,
+                filename=filename,
+            )
+        )
+    with recording_lock:
+        expires = time.time() + RECORDING_TOKEN_SECONDS
+        for record in records:
+            recording_files[record.token] = (expires, record)
+        for token, (expiry, _) in list(recording_files.items()):
+            if expiry <= time.time():
+                recording_files.pop(token, None)
+    return total, records
+
+
+def recordings_for_day(config: Config, channel: int, selected: date) -> list[Recording]:
+    start = datetime.combine(selected, datetime.min.time())
+    end = start + timedelta(days=1) - timedelta(seconds=1)
+    position, results, page_size = 1, [], 500
+    while len(results) < 2000:
+        _, page = search_recordings(
+            config, channel, start, end, position=position, maximum=page_size
+        )
+        if not page:
+            break
+        results.extend(page)
+        position += len(page)
+        if len(page) < page_size:
+            break
+    return results
+
+
+def recording_availability(config: Config, channel: int) -> dict:
+    now_local = datetime.now(RECORDER_TIMEZONE).replace(tzinfo=None)
+    start_local = now_local - timedelta(days=5 * 366)
+    position, page_size, maximum_records = 1, 1000, 20_000
+    first: Recording | None = None
+    last: Recording | None = None
+    limited = False
+    while position <= maximum_records:
+        _, page = search_recordings(
+            config, channel, start_local, now_local,
+            position=position, maximum=page_size,
+        )
+        if not page:
+            break
+        first = first or page[0]
+        last = page[-1]
+        position += len(page)
+        if len(page) < page_size:
+            break
+    else:
+        limited = True
+    if not first or not last:
+        return {"availableFrom": None, "availableTo": None, "limited": False}
+    return {
+        "availableFrom": first.start_at,
+        "availableTo": last.end_at,
+        "limited": limited,
+    }
+
+
+def recording_from_token(token: str) -> Recording | None:
+    with recording_lock:
+        item = recording_files.get(token)
+        if not item or item[0] <= time.time():
+            recording_files.pop(token, None)
+            return None
+        return item[1]
+
+
+def playback_process(
+    config: Config, recording: Recording, offset_seconds: int = 0
+) -> tuple[subprocess.Popen[bytes], threading.Event]:
+    command_socket, command_id = authenticate(config)
+    data_socket = WebSocket(config.host, config.port, timeout=15)
+    finished = threading.Event()
+    media_parser = MediaParser()
+    parser = FrameParser()
+    first_frames: list[bytes] = []
+    try:
+        data_socket.send(command_packet(
+            f"{PREFIX}\tIP\tINNER\tCONNECT\t250\t1\t{command_id}\t{recording.filename}"
+            "\t0\t-1\t1\t0\t1\t\t\t\t\t\t\t0\t\t\t\n\n\n"
+        ))
+        if offset_seconds:
+            time.sleep(0.15)
+            data_socket.send(command_packet(
+                f"{PREFIX}\tIP\tINNER\tCONNECT\t250\t1\t{command_id}\t{recording.filename}"
+                f"\t1\t{offset_seconds}\t1\t0\t1\n\n\n"
+            ))
+        first_frame_deadline = time.monotonic() + 15
+        while time.monotonic() < first_frame_deadline and not first_frames:
+            for payload in media_parser.feed(data_socket.receive()):
+                first_frames.extend(parser.feed(payload))
+        codec = next((detected_codec(frame) for frame in first_frames if detected_codec(frame)), None)
+        if codec not in {"h264", "h265"}:
+            raise OSError("recording-codec-unknown")
+        input_format = "hevc" if codec == "h265" else "h264"
+        process = subprocess.Popen(
+            [
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-fflags", "+genpts", "-r", "24", "-threads", "1",
+                "-f", input_format, "-i", "pipe:0",
+                "-an", "-vf", "scale=1280:-2", "-c:v", "libx264", "-preset", "ultrafast",
+                "-tune", "zerolatency", "-threads", "1", "-crf", "26",
+                "-pix_fmt", "yuv420p", "-movflags",
+                "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        data_socket.close()
+        command_socket.close()
+        raise
+
+    def produce() -> None:
+        deadline = time.monotonic() + PLAYBACK_MAX_SECONDS
+        try:
+            for frame in first_frames:
+                if process.stdin:
+                    process.stdin.write(frame)
+                    process.stdin.flush()
+            while time.monotonic() < deadline and not finished.is_set():
+                for payload in media_parser.feed(data_socket.receive()):
+                    for frame in parser.feed(payload):
+                        if process.stdin:
+                            process.stdin.write(frame)
+                            process.stdin.flush()
+        except (BrokenPipeError, EOFError, OSError, TimeoutError):
+            pass
+        finally:
+            finished.set()
+            try:
+                data_socket.send(command_packet(
+                    f"{PREFIX}\tIP\tINNER\tDISCONNECT\t250\t1\t0\n\n\n"
+                ))
+            except (OSError, EOFError):
+                pass
+            data_socket.close()
+            command_socket.close()
+            if process.stdin:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+
+    threading.Thread(target=produce, daemon=True).start()
+    return process, finished
+
+
 def inventory_payload(config: Config) -> dict:
     now = time.monotonic()
     with state_lock:
@@ -479,20 +769,131 @@ def start_inventory_server(config: Config) -> http.server.ThreadingHTTPServer:
     token = base64.urlsafe_b64encode(token_bytes).decode().rstrip("=")
 
     class InventoryHandler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            if self.path != "/internal/v1/inventory":
-                self.send_error(404)
-                return
+        protocol_version = "HTTP/1.0"
+
+        def authorized(self) -> bool:
             supplied = self.headers.get("Authorization", "")
-            if not hmac.compare_digest(supplied, f"Bearer {token}"):
-                self.send_error(401)
-                return
-            body = json.dumps(inventory_payload(config), separators=(",", ":")).encode()
-            self.send_response(200)
+            if hmac.compare_digest(supplied, f"Bearer {token}"):
+                return True
+            self.send_error(401)
+            return False
+
+        def json_response(self, payload: dict, status: int = 200) -> None:
+            body = json.dumps(payload, separators=(",", ":")).encode()
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if not self.authorized():
+                return
+            parsed = urlparse(self.path)
+            if parsed.path == "/internal/v1/inventory":
+                self.json_response(inventory_payload(config))
+                return
+            if parsed.path == "/internal/v1/recordings/availability":
+                try:
+                    channel = int((parse_qs(parsed.query).get("channel") or [""])[0])
+                    if channel < 1 or channel > config.channel_count:
+                        raise ValueError
+                    self.json_response(recording_availability(config, channel))
+                except ValueError:
+                    self.json_response({"error": "invalid-recording-query"}, 422)
+                except (HTTPError, OSError, TimeoutError, ET.ParseError):
+                    self.json_response({"error": "recorder-archive-unavailable"}, 503)
+                return
+            if parsed.path == "/internal/v1/recordings":
+                try:
+                    params = parse_qs(parsed.query)
+                    channel = int((params.get("channel") or [""])[0])
+                    selected = date.fromisoformat((params.get("date") or [""])[0])
+                    if channel < 1 or channel > config.channel_count:
+                        raise ValueError
+                    records = recordings_for_day(config, channel, selected)
+                    self.json_response({
+                        "recordings": [
+                            {
+                                "id": item.token,
+                                "startAt": item.start_at,
+                                "endAt": item.end_at,
+                                "kind": item.kind,
+                                "playable": True,
+                            }
+                            for item in records
+                        ]
+                    })
+                except ValueError:
+                    self.json_response({"error": "invalid-recording-query"}, 422)
+                except (HTTPError, OSError, TimeoutError, ET.ParseError):
+                    self.json_response({"error": "recorder-archive-unavailable"}, 503)
+                return
+            media_match = re.fullmatch(
+                r"/internal/v1/recordings/([a-f0-9]{40})/media", parsed.path
+            )
+            if media_match:
+                recording = recording_from_token(media_match.group(1))
+                if not recording:
+                    self.send_error(404)
+                    return
+                if not playback_slots.acquire(blocking=False):
+                    self.send_error(429)
+                    return
+                process = None
+                finished = None
+                try:
+                    try:
+                        offset_seconds = int((parse_qs(parsed.query).get("offset") or ["0"])[0])
+                    except ValueError:
+                        offset_seconds = -1
+                    duration = max(
+                        0,
+                        int(
+                            (
+                                datetime.fromisoformat(recording.end_at.replace("Z", "+00:00"))
+                                - datetime.fromisoformat(recording.start_at.replace("Z", "+00:00"))
+                            ).total_seconds()
+                        ),
+                    )
+                    if offset_seconds < 0 or (duration and offset_seconds >= duration):
+                        self.send_error(422)
+                        return
+                    try:
+                        process, finished = playback_process(config, recording, offset_seconds)
+                    except (EOFError, OSError, TimeoutError):
+                        self.send_error(502)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Cache-Control", "no-store, private")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    if not process.stdout:
+                        raise OSError("playback-output-unavailable")
+                    while not finished.is_set() or process.poll() is None:
+                        chunk = process.stdout.read1(64 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    if finished:
+                        finished.set()
+                    if process and process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                    playback_slots.release()
+                return
+            else:
+                self.send_error(404)
+                return
 
         def log_message(self, _format: str, *_args: object) -> None:
             return

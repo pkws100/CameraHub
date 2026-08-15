@@ -79,6 +79,22 @@ unter `discoverChannels` werden im Hintergrund geprüft. Sobald dort ein
 H.264-Zweitstream bereitsteht, kann der Kanal in der Kamerasuche ohne Kenntnis
 seiner internen `172.16.1.x`-Adresse hinzugefügt werden.
 
+### Aufzeichnungen
+
+Der Menüpunkt **Aufzeichnungen** führt vorhandene Archive herstellerneutral
+zusammen. SANNCE-Kanäle werden über die lesende ISAPI-Archivsuche des NVR
+aufgelistet und nach einem ausdrücklichen Klick über eine höchstens 30 Minuten
+laufende VOD-Sitzung abgespielt. Blink liefert seine letzten verfügbaren
+Cloud-Clips; Netatmo-Ereignisse erscheinen nur, wenn das offizielle Security-API
+sie für das verbundene Modell und Konto meldet. Kameras ohne nachgewiesene
+Archivschnittstelle bleiben sichtbar und werden als nicht unterstützt markiert.
+
+Das Öffnen der Seite erzeugt weder einen Live-Lease noch einen Snapshot- oder
+Wake-Aufruf. Cloud-Metadaten werden nur durch Öffnen oder Aktualisieren dieser
+Ansicht angefordert. Recorder-Dateinamen, Cloud-Medienadressen, OAuth-Token und
+Zugangsdaten verlassen Backend beziehungsweise Adapter nicht. Camera Hub legt
+keine eigene Daueraufzeichnung an.
+
 ## Cloud-Konten und Akku-Kameras
 
 Die untersuchte CZEview-Kamera besitzt keinen nachgewiesenen lokalen
@@ -272,7 +288,7 @@ Rollen:
 
 - **Eigentümer:** Benutzer, Kameras, Suche, Zonen und Liveansicht;
 - **Administrator:** Kameras, Suche, Zonen und Liveansicht;
-- **Betrachter:** Liveansicht und Systemstatus.
+- **Betrachter:** Liveansicht, vorhandene Aufzeichnungen und Systemstatus.
 
 Benutzeränderungen verlangen eine erneute Bestätigung des Eigentümerpassworts.
 Das eigene Passwort kann jede angemeldete Person im Systemstatus ändern.

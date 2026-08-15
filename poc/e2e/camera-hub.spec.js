@@ -68,6 +68,10 @@ async function mockApplication(page, count, {stream = false, profilePayload = nu
     if (url.pathname === '/api/display-profiles') return route.fulfill({json: profilePayload || {profiles: [], cameraOptions: cameras.map(({id, name, enabled, position}) => ({id, name, enabled, position}))}});
     if (url.pathname === '/api/cameras') return route.fulfill({json: {cameras}});
     if (url.pathname === '/api/health') return route.fulfill({json: {mediaMTX: 'online', cameras: cameras.map(item => ({camera: item.id, state: 'live'}))}});
+    if (url.pathname === '/api/recordings/sources') return route.fulfill({json: {timezone: 'Europe/Berlin', sources: cameras.map((item, index) => ({cameraId: item.id, name: item.name, provider: index === 0 ? 'sannce' : 'none', sourceType: index === 0 ? 'continuous' : 'none', status: index === 0 ? 'ready' : 'unsupported', availableFrom: index === 0 ? '2026-08-14T22:00:00Z' : null, availableTo: index === 0 ? '2026-08-15T20:00:00Z' : null, limited: false, limitLabel: index === 0 ? null : 'Keine Aufzeichnungsquelle verfügbar'}))}});
+    if (/^\/api\/cameras\/[^/]+\/recordings$/.test(url.pathname)) return route.fulfill({json: {cameraId: url.pathname.split('/')[3], nextCursor: null, recordings: [{id: 'recording-1', cameraId: url.pathname.split('/')[3], provider: 'sannce', startAt: '2026-08-15T08:00:00Z', endAt: '2026-08-15T08:30:00Z', kind: 'Timer', playable: true, durationSeconds: 1800}]}});
+    if (/^\/api\/cameras\/[^/]+\/recordings\/[^/]+\/playback$/.test(url.pathname)) return route.fulfill({json: {leaseId: 'recording-lease', mediaUrl: '/synthetic/recording.mp4', expiresAt: '2026-08-15T11:00:00Z', durationSeconds: 1800}});
+    if (url.pathname === '/api/recordings/playback/recording-lease') return route.fulfill({status: 204});
     if (url.pathname === '/api/detection/status') return route.fulfill({json: {mode: 'off', timezone: 'Europe/Berlin', configuredCameras: 0, configuredZones: 0, openMotionEvents: 0, worker: {state: 'paused', online: true, activeCameras: 0, processingDelayMs: 0}}});
     if (/^\/api\/admin\/cameras\/[^/]+\/zones$/.test(url.pathname)) return route.fulfill({json: {cameraId: url.pathname.split('/')[4], revision: 0, zones: []}});
     if (/^\/api\/admin\/cameras\/[^/]+\/detection$/.test(url.pathname)) return route.fulfill({json: {cameraId: url.pathname.split('/')[4], supported: true, enabled: false, schedules: [], zones: []}});
@@ -129,6 +133,23 @@ test('Kamera- und Zonenerkennung bleiben konfigurierbar', async ({page}) => {
   expect(savedDetection.enabled).toBeTruthy();
   expect(savedDetection.zones[0].sensitivity).toBe(65);
   expect(savedDetection.zones[0].snapshotEnabled).toBeFalsy();
+});
+
+test('Aufzeichnungen zeigen alle Kameras und eine gemeinsame Tageszeitleiste', async ({page}) => {
+  const liveLeaseRequests = [];
+  page.on('request', request => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/lease')) liveLeaseRequests.push(request.url());
+  });
+  await mockApplication(page, 2, {stream: true});
+  await page.goto('/index.html#recordings');
+  await expect(page.locator('#view-recordings')).toBeVisible();
+  await expect(page.locator('.recording-source')).toHaveCount(2);
+  await expect(page.locator('.recording-source').first()).toContainText('SANNCE Recorder');
+  await expect(page.locator('.recording-source').nth(1)).toContainText('Keine Aufzeichnungsquelle');
+  await expect(page.locator('.recording-segment')).toHaveCount(1);
+  await expect(page.locator('.recording-row')).toContainText('Timer');
+  await page.waitForTimeout(300);
+  expect(liveLeaseRequests).toEqual([]);
 });
 
 for (const count of [1, 2, 4, 6, 11]) {

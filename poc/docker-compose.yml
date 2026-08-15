@@ -307,8 +307,8 @@ services:
       - /tmp:mode=1777,size=64m
       - /run/bridge-health:mode=0777,size=1m
     cpus: "1.0"
-    mem_limit: 256m
-    pids_limit: 64
+    mem_limit: 768m
+    pids_limit: 128
     stop_grace_period: 10s
     healthcheck:
       test: ["CMD-SHELL", "test -s /run/bridge-health/state && test $$(($$(date +%s) - $$(cat /run/bridge-health/state))) -lt 30"]

@@ -199,6 +199,9 @@ try:
     viewer_session = request("/api/auth/login", "POST", {"username": "viewer1", "password": viewer_password}, opener=viewer_client)
     assert viewer_session["permissions"]["view"] and not viewer_session["permissions"]["manageCameras"]
     assert request("/api/cameras", opener=viewer_client)["cameras"]
+    viewer_recording_sources = request("/api/recordings/sources", opener=viewer_client)
+    assert viewer_recording_sources["sources"]
+    assert all(source["status"] == "unsupported" for source in viewer_recording_sources["sources"])
     assert request("/api/admin/cameras", expected=403, opener=viewer_client)["detail"] == "insufficient-role"
     assert request("/api/admin/users", expected=403, opener=viewer_client)["detail"] == "insufficient-role"
     denied_viewer_write = request("/api/admin/cameras/order", "PUT", {"cameraIds": ["garten"]}, viewer_session["csrfToken"], 403, viewer_client)
@@ -1526,9 +1529,29 @@ try:
     )
     try:
         blink_clips = camera_app.list_blink_clips(imported_blink["id"], None)
+        blink_recordings = request(
+            f"/api/cameras/{imported_blink['id']}/recordings"
+            "?from=2026-07-31T00:00:00Z&to=2026-08-01T00:00:00Z"
+        )
     finally:
         camera_app.blink_bridge_json = original_blink_bridge_json
     assert blink_clips["clips"][0]["id"] == "a" * 32
+    assert blink_recordings["recordings"][0]["provider"] == "blink"
+    assert "mediaUrl" not in blink_recordings["recordings"][0]
+    playback = request(
+        f"/api/cameras/{imported_blink['id']}/recordings/{'a' * 32}/playback",
+        "POST", {"offsetSeconds": 0}, csrf,
+    )
+    assert playback["mediaUrl"].startswith("/api/recordings/playback/")
+    request(
+        f"/api/recordings/playback/{playback['leaseId']}",
+        "DELETE", csrf=csrf, expected=204,
+    )
+    assert request(
+        f"/api/cameras/{imported_blink['id']}/recordings"
+        "?from=2026-01-01T00:00:00Z&to=2026-03-01T00:00:00Z",
+        expected=422,
+    )["detail"] == "recording-range-invalid"
 
     assert request(
         "/api/admin/cloud/providers/netatmo",
@@ -2039,7 +2062,7 @@ try:
     manifest, backup_database, source_key = camera_app.decode_backup_archive(
         backup_archive, backup_passphrase
     )
-    assert manifest["schemaVersion"] == 11 and manifest["appVersion"] == "1.6.0-dev"
+    assert manifest["schemaVersion"] == 11 and manifest["appVersion"] == "1.7.0-dev"
     assert len(backup_database) <= camera_app.BACKUP_DATABASE_MAX_BYTES
     assert camera_app.BACKUP_EXPANDED_MAX_BYTES > len(base64.b64encode(backup_database))
     for invalid_archive, invalid_passphrase, expected_code in (

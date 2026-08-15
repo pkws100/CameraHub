@@ -31,7 +31,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from argon2 import PasswordHasher
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request as FastAPIRequest, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request as FastAPIRequest, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -77,6 +77,10 @@ DISPLAY_PAIR_ATTEMPTS: dict[str, list[float]] = {}
 NETATMO_TOKEN_LOCKS: dict[str, threading.Lock] = {}
 NETATMO_STREAM_CACHE: dict[str, tuple[float, list[str]]] = {}
 CLOUD_PROBE_LEASES: dict[str, dict] = {}
+RECORDING_CACHE_LOCK = threading.Lock()
+RECORDING_ITEMS: dict[tuple[str, str], tuple[float, dict]] = {}
+RECORDING_SOURCE_SUMMARIES: dict[str, tuple[float, dict]] = {}
+PLAYBACK_LEASES: dict[str, dict] = {}
 OPERATIONS_STOP = threading.Event()
 OPERATIONS_THREAD: threading.Thread | None = None
 OPERATIONS_INTERVAL_SECONDS = int(os.environ.get("OPERATIONS_INTERVAL_SECONDS", "30"))
@@ -94,9 +98,12 @@ BACKUP_SCRYPT_N = 2**17
 BACKUP_LEGACY_SCRYPT_N = 2**14
 BACKUP_FORMAT = "pkws-camera-hub-backup"
 BACKUP_VERSION = 1
-APP_VERSION = "1.6.0-dev"
+APP_VERSION = "1.7.0-dev"
 BLINK_LIVE_MAX_SECONDS = 5 * 60
 BLINK_MEDIA_MAX_BYTES = 128 * 1024 * 1024
+RECORDING_MEDIA_MAX_BYTES = 512 * 1024 * 1024
+RECORDING_TOKEN_SECONDS = 15 * 60
+RECORDING_PLAYBACK_SECONDS = 30 * 60
 MOTION_ASSET_MAX_BYTES = int(os.environ.get("MOTION_ASSET_MAX_BYTES", str(500 * 1024 * 1024)))
 MOTION_ASSET_RETENTION_SECONDS = int(os.environ.get("MOTION_ASSET_RETENTION_SECONDS", str(7 * 24 * 60 * 60)))
 MOTION_METADATA_RETENTION_SECONDS = int(os.environ.get("MOTION_METADATA_RETENTION_SECONDS", str(90 * 24 * 60 * 60)))
@@ -1153,6 +1160,10 @@ class OrderUpdate(BaseModel):
     cameraIds: list[str] = Field(min_length=1, max_length=MAX_CAMERAS)
 
 
+class RecordingPlaybackInput(BaseModel):
+    offsetSeconds: float = Field(default=0, ge=0, le=24 * 60 * 60)
+
+
 def hash_token(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
@@ -1653,6 +1664,35 @@ def sannce_bridge_inventory() -> dict | None:
             return json.load(response)
     except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
         return None
+
+
+def sannce_bridge_request(path: str, timeout: float = 30):
+    if not path.startswith("/") or any(character in path for character in "\r\n"):
+        raise HTTPException(500, "sannce-bridge-path-invalid")
+    request = Request(
+        f"{SANNCE_BRIDGE_INTERNAL}{path}",
+        headers={"Authorization": f"Bearer {INTERNAL_TOKEN}", "Accept": "application/json"},
+    )
+    try:
+        return urlopen(request, timeout=timeout)
+    except HTTPError as error:
+        try:
+            body = json.loads(error.read().decode("utf-8", "replace"))
+            code = str(body.get("error") or "sannce-bridge-request-failed")
+        except Exception:
+            code = "sannce-bridge-request-failed"
+        status = error.code if error.code in {400, 404, 409, 410, 422, 429, 503, 504} else 502
+        raise HTTPException(status, code) from error
+    except (URLError, TimeoutError, OSError, ValueError) as error:
+        raise HTTPException(503, "sannce-bridge-unavailable") from error
+
+
+def sannce_bridge_json(path: str, timeout: float = 30) -> dict:
+    with sannce_bridge_request(path, timeout) as response:
+        try:
+            return json.load(response)
+        except (ValueError, json.JSONDecodeError) as error:
+            raise HTTPException(502, "sannce-bridge-response-invalid") from error
 
 
 def blink_thumbnail_bytes(device_id: str) -> bytes:
@@ -2588,6 +2628,10 @@ def public_camera(row: sqlite3.Row, stream_mode: str = "auto") -> dict:
             "ptz": bool(capabilities.get("ptz", {}).get("supported")),
             "ptzAxes": capabilities.get("ptz", {}).get("axes", []),
             "clips": bool(capabilities.get("clips")),
+            "recordings": bool(
+                cloud_provider in {"blink", "netatmo"}
+                or str(row["manufacturer"] or "").lower() == "sannce"
+            ),
         },
     }
 
@@ -6720,6 +6764,474 @@ def require_camera_media_access(
     with connect() as conn:
         require_active_display_camera(conn, display, camera_id)
     return display
+
+
+def recording_camera(camera_id: str) -> sqlite3.Row:
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT c.*,d.id AS cloud_device_ref,d.account_id,d.external_id_ct,d.home_id_ct,
+                      d.capabilities_json AS cloud_capabilities_json,
+                      a.provider AS cloud_provider,a.status AS account_status,
+                      a.enabled AS account_enabled
+               FROM cameras c
+               LEFT JOIN cloud_devices d ON d.id=c.cloud_device_id
+               LEFT JOIN cloud_accounts a ON a.id=d.account_id
+               WHERE c.id=?""",
+            (camera_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "camera-not-found")
+    return row
+
+
+def recording_provider(row: sqlite3.Row) -> str:
+    cloud = str(row["cloud_provider"] or "")
+    if cloud in {"blink", "netatmo"}:
+        return cloud
+    if str(row["manufacturer"] or "").lower() == "sannce":
+        return "sannce"
+    return "none"
+
+
+def sannce_camera_channel(row: sqlite3.Row) -> int:
+    match = re.search(r"(?:sannce-)(\d+)(?:-low)?$", row["low_path"] or row["id"])
+    if not match:
+        raise HTTPException(409, "sannce-channel-unknown")
+    return int(match.group(1))
+
+
+def parse_recording_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid recording timestamp") from error
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def recording_timestamp(value: object) -> str | None:
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), timezone.utc).isoformat().replace("+00:00", "Z")
+    if not value:
+        return None
+    try:
+        return parse_recording_timestamp(str(value)).isoformat().replace("+00:00", "Z")
+    except ValueError:
+        return None
+
+
+def remember_recording(camera_id: str, item: dict, private: dict) -> dict:
+    public = {
+        "id": str(item["id"]),
+        "cameraId": camera_id,
+        "provider": str(item["provider"]),
+        "startAt": str(item["startAt"]),
+        "endAt": str(item["endAt"]),
+        "kind": str(item.get("kind") or "recording")[:32],
+        "playable": bool(item.get("playable")),
+        "durationSeconds": item.get("durationSeconds"),
+    }
+    with RECORDING_CACHE_LOCK:
+        RECORDING_ITEMS[(camera_id, public["id"])] = (
+            time.time() + RECORDING_TOKEN_SECONDS,
+            {**public, **private},
+        )
+        now = time.time()
+        for key, (expires, _) in list(RECORDING_ITEMS.items()):
+            if expires <= now:
+                RECORDING_ITEMS.pop(key, None)
+    return public
+
+
+def blink_recordings(row: sqlite3.Row) -> list[dict]:
+    device = blink_cloud_device(row["id"])
+    result = blink_bridge_json(
+        f"/internal/v1/devices/{quote(device['id'], safe='')}/clips", timeout=20
+    )
+    recordings = []
+    for clip in list(result.get("clips") or [])[:50]:
+        clip_id = str(clip.get("id") or "")
+        start_at = recording_timestamp(clip.get("createdAt"))
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", clip_id) or not start_at:
+            continue
+        duration = float(clip.get("durationSeconds") or 30)
+        end_at = (
+            parse_recording_timestamp(start_at) + timedelta(seconds=max(1, min(duration, 600)))
+        ).isoformat().replace("+00:00", "Z")
+        recordings.append(remember_recording(
+            row["id"],
+            {
+                "id": clip_id, "provider": "blink", "startAt": start_at,
+                "endAt": end_at, "kind": clip.get("kind") or "motion",
+                "durationSeconds": clip.get("durationSeconds"), "playable": True,
+            },
+            {"providerRecordingId": clip_id},
+        ))
+    return recordings
+
+
+def safe_netatmo_recording_url(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > 4096:
+        return None
+    try:
+        parsed = urlparse(value)
+        if (
+            parsed.scheme != "https" or not parsed.hostname or parsed.username
+            or parsed.password or parsed.fragment
+            or not parsed.hostname.lower().endswith((".netatmo.net", ".netatmo.com"))
+        ):
+            return None
+        return value
+    except ValueError:
+        return None
+
+
+def netatmo_recordings(row: sqlite3.Row) -> list[dict]:
+    if not row["account_enabled"]:
+        raise HTTPException(409, "netatmo-account-disabled")
+    if row["account_status"] != "active":
+        raise HTTPException(409, "netatmo-account-reauth-required")
+    home_id = decrypt_text(row["home_id_ct"])
+    external_id = decrypt_text(row["external_id_ct"])
+    body = netatmo_api_json(
+        row["account_id"], "geteventsuntil", {"home_id": home_id, "size": "100"}
+    )
+    events = body.get("events") or (body.get("home") or {}).get("events") or []
+    recordings = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_camera = str(
+            event.get("camera_id") or event.get("module_id") or event.get("device_id") or ""
+        )
+        if event_camera and event_camera != external_id:
+            continue
+        start_at = recording_timestamp(event.get("time") or event.get("timestamp"))
+        if not start_at:
+            continue
+        duration = float(event.get("duration") or 30)
+        end_at = (
+            parse_recording_timestamp(start_at) + timedelta(seconds=max(1, min(duration, 1800)))
+        ).isoformat().replace("+00:00", "Z")
+        provider_id = str(event.get("id") or event.get("event_id") or "")
+        if not provider_id:
+            provider_id = hashlib.sha256(
+                f"{external_id}\0{start_at}\0{event.get('type', '')}".encode()
+            ).hexdigest()
+        public_id = hmac.new(
+            AES_KEY, f"netatmo-recording:{row['id']}:{provider_id}".encode(), hashlib.sha256
+        ).hexdigest()[:40]
+        media_url = next((
+            safe_netatmo_recording_url(event.get(key))
+            for key in ("video_url", "videoUrl", "media_url", "mediaUrl")
+            if event.get(key)
+        ), None)
+        available = str(event.get("video_status") or "available").lower() == "available"
+        recordings.append(remember_recording(
+            row["id"],
+            {
+                "id": public_id, "provider": "netatmo", "startAt": start_at,
+                "endAt": end_at, "kind": event.get("type") or "event",
+                "durationSeconds": event.get("duration"),
+                "playable": bool(media_url and available),
+            },
+            {"mediaUrl": media_url, "accountId": row["account_id"]},
+        ))
+    return recordings
+
+
+def sannce_recordings(row: sqlite3.Row, selected_dates: list[str]) -> list[dict]:
+    channel = sannce_camera_channel(row)
+    recordings = []
+    for selected in selected_dates:
+        result = sannce_bridge_json(
+            f"/internal/v1/recordings?channel={channel}&date={quote(selected, safe='')}",
+            timeout=30,
+        )
+        for item in list(result.get("recordings") or [])[:500]:
+            item_id = str(item.get("id") or "")
+            start_at = recording_timestamp(item.get("startAt"))
+            end_at = recording_timestamp(item.get("endAt"))
+            if not re.fullmatch(r"[a-f0-9]{40}", item_id) or not start_at or not end_at:
+                continue
+            duration = max(
+                0, (parse_recording_timestamp(end_at) - parse_recording_timestamp(start_at)).total_seconds()
+            )
+            recordings.append(remember_recording(
+                row["id"],
+                {
+                    "id": item_id, "provider": "sannce", "startAt": start_at,
+                    "endAt": end_at, "kind": item.get("kind") or "continuous",
+                    "durationSeconds": duration, "playable": bool(item.get("playable", True)),
+                },
+                {"providerRecordingId": item_id},
+            ))
+    return recordings
+
+
+def source_from_recordings(row: sqlite3.Row, provider: str, recordings: list[dict]) -> dict:
+    ordered = sorted(recordings, key=lambda item: item["startAt"])
+    return {
+        "cameraId": row["id"], "name": row["name"], "provider": provider,
+        "sourceType": "continuous" if provider == "sannce" else "events",
+        "status": "ready", "availableFrom": ordered[0]["startAt"] if ordered else None,
+        "availableTo": ordered[-1]["endAt"] if ordered else None,
+        "limited": provider in {"blink", "netatmo"},
+        "limitLabel": "Letzte 50 verfügbare Clips" if provider == "blink" else (
+            "Letzte von Netatmo gemeldete Ereignisse" if provider == "netatmo" else None
+        ),
+    }
+
+
+@app.get("/api/recordings/sources")
+def list_recording_sources(
+    refresh: bool = False, _: sqlite3.Row = Depends(require_session)
+):
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT c.*,d.id AS cloud_device_ref,d.account_id,d.external_id_ct,d.home_id_ct,
+                      d.capabilities_json AS cloud_capabilities_json,
+                      a.provider AS cloud_provider,a.status AS account_status,
+                      a.enabled AS account_enabled
+               FROM cameras c
+               LEFT JOIN cloud_devices d ON d.id=c.cloud_device_id
+               LEFT JOIN cloud_accounts a ON a.id=d.account_id
+               WHERE c.enabled=1 ORDER BY c.position"""
+        ).fetchall()
+    sources = []
+    for row in rows:
+        if refresh:
+            RECORDING_SOURCE_SUMMARIES.pop(row["id"], None)
+        cached = RECORDING_SOURCE_SUMMARIES.get(row["id"])
+        if cached and cached[0] > time.time():
+            sources.append(cached[1])
+            continue
+        provider = recording_provider(row)
+        if provider == "none":
+            source = {
+                "cameraId": row["id"], "name": row["name"], "provider": "none",
+                "sourceType": "none", "status": "unsupported", "availableFrom": None,
+                "availableTo": None, "limited": False,
+                "limitLabel": "Keine Aufzeichnungsquelle verfügbar",
+            }
+        try:
+            if provider == "sannce":
+                channel = sannce_camera_channel(row)
+                availability = sannce_bridge_json(
+                    f"/internal/v1/recordings/availability?channel={channel}", timeout=30
+                )
+                source = {
+                    "cameraId": row["id"], "name": row["name"], "provider": provider,
+                    "sourceType": "continuous", "status": "ready",
+                    "availableFrom": availability.get("availableFrom"),
+                    "availableTo": availability.get("availableTo"),
+                    "limited": bool(availability.get("limited")), "limitLabel": None,
+                }
+            elif provider == "blink":
+                source = source_from_recordings(row, provider, blink_recordings(row))
+            elif provider == "netatmo":
+                source = source_from_recordings(row, provider, netatmo_recordings(row))
+        except HTTPException as error:
+            source = {
+                "cameraId": row["id"], "name": row["name"], "provider": provider,
+                "sourceType": "continuous" if provider == "sannce" else "events",
+                "status": "reauth-required" if "reauth" in str(error.detail) else "unavailable",
+                "availableFrom": None, "availableTo": None, "limited": provider != "sannce",
+                "limitLabel": str(error.detail),
+            }
+        RECORDING_SOURCE_SUMMARIES[row["id"]] = (time.time() + 60, source)
+        sources.append(source)
+    return {"sources": sources, "timezone": CAMERA_HUB_TIMEZONE}
+
+
+@app.get("/api/cameras/{camera_id}/recordings")
+def list_camera_recordings(
+    camera_id: str,
+    from_: str = Query(default="", alias="from"),
+    to: str = "",
+    cursor: str = "",
+    _: sqlite3.Row = Depends(require_session),
+):
+    row = recording_camera(camera_id)
+    provider = recording_provider(row)
+    if provider == "none":
+        return {"cameraId": camera_id, "recordings": [], "nextCursor": None}
+    try:
+        start = parse_recording_timestamp(from_) if from_ else datetime.now(timezone.utc) - timedelta(days=1)
+        end = parse_recording_timestamp(to) if to else datetime.now(timezone.utc)
+        offset = int(cursor or 0)
+    except (ValueError, TypeError):
+        raise HTTPException(422, "recording-range-invalid")
+    if end <= start or end - start > timedelta(days=31) or offset < 0:
+        raise HTTPException(422, "recording-range-invalid")
+    if provider == "sannce":
+        local_start = start.astimezone(DISPLAY_TIMEZONE).date()
+        local_end = (end - timedelta(microseconds=1)).astimezone(DISPLAY_TIMEZONE).date()
+        dates = []
+        selected = local_start
+        while selected <= local_end:
+            dates.append(selected.isoformat())
+            selected += timedelta(days=1)
+        recordings = sannce_recordings(row, dates)
+    elif provider == "blink":
+        recordings = blink_recordings(row)
+    else:
+        recordings = netatmo_recordings(row)
+    recordings = sorted(
+        (
+            item for item in recordings
+            if parse_recording_timestamp(item["endAt"]) > start
+            and parse_recording_timestamp(item["startAt"]) < end
+        ),
+        key=lambda item: item["startAt"],
+    )
+    page = recordings[offset:offset + 200]
+    next_cursor = str(offset + len(page)) if offset + len(page) < len(recordings) else None
+    return {"cameraId": camera_id, "recordings": page, "nextCursor": next_cursor}
+
+
+@app.post("/api/cameras/{camera_id}/recordings/{recording_id}/playback")
+def create_recording_playback(
+    camera_id: str,
+    recording_id: str,
+    body: RecordingPlaybackInput,
+    actor: sqlite3.Row = Depends(require_csrf),
+):
+    recording_camera(camera_id)
+    with RECORDING_CACHE_LOCK:
+        cached = RECORDING_ITEMS.get((camera_id, recording_id))
+    if not cached or cached[0] <= time.time():
+        raise HTTPException(404, "recording-not-found-or-expired")
+    item = cached[1]
+    if not item.get("playable"):
+        raise HTTPException(409, "recording-not-playable")
+    duration = float(item.get("durationSeconds") or 0)
+    if duration and body.offsetSeconds >= duration:
+        raise HTTPException(422, "recording-offset-invalid")
+    lease_id = secrets.token_urlsafe(24)
+    expires = int(time.time()) + RECORDING_PLAYBACK_SECONDS
+    with RECORDING_CACHE_LOCK:
+        now = time.time()
+        for existing_id, existing in list(PLAYBACK_LEASES.items()):
+            if existing["expiresAt"] <= now and not existing.get("response"):
+                PLAYBACK_LEASES.pop(existing_id, None)
+        PLAYBACK_LEASES[lease_id] = {
+            **item, "userId": actor["user_id"], "cameraId": camera_id,
+            "sessionHash": actor["token_hash"], "offsetSeconds": body.offsetSeconds,
+            "expiresAt": expires, "response": None,
+        }
+    return {
+        "leaseId": lease_id,
+        "mediaUrl": f"/api/recordings/playback/{quote(lease_id, safe='')}/media",
+        "expiresAt": datetime.fromtimestamp(expires, timezone.utc).isoformat().replace("+00:00", "Z"),
+        "durationSeconds": item.get("durationSeconds"),
+    }
+
+
+def recording_media_response(response, lease_id: str, *, maximum: int = RECORDING_MEDIA_MAX_BYTES):
+    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+    if content_type not in {"video/mp4", "video/mpeg", "application/octet-stream"}:
+        response.close()
+        raise HTTPException(502, "recording-media-invalid")
+    try:
+        content_length = int(response.headers.get("Content-Length", "0"))
+    except ValueError:
+        content_length = 0
+    if content_length > maximum:
+        response.close()
+        raise HTTPException(413, "recording-media-too-large")
+
+    def chunks():
+        total = 0
+        read_chunk = getattr(response, "read1", response.read)
+        try:
+            while True:
+                chunk = read_chunk(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > maximum:
+                    break
+                yield chunk
+        finally:
+            response.close()
+            with RECORDING_CACHE_LOCK:
+                lease = PLAYBACK_LEASES.get(lease_id)
+                if lease:
+                    lease["response"] = None
+
+    return StreamingResponse(
+        chunks(), media_type="video/mp4" if content_type == "application/octet-stream" else content_type,
+        headers={
+            "Cache-Control": "no-store, private", "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.get("/api/recordings/playback/{lease_id}/media")
+def play_recording_media(lease_id: str, actor: sqlite3.Row = Depends(require_session)):
+    with RECORDING_CACHE_LOCK:
+        lease = PLAYBACK_LEASES.get(lease_id)
+    if (
+        not lease or lease["expiresAt"] <= time.time()
+        or lease["userId"] != actor["user_id"]
+        or lease["sessionHash"] != actor["token_hash"]
+    ):
+        raise HTTPException(404, "recording-playback-expired")
+    provider = lease["provider"]
+    if provider == "sannce":
+        response = sannce_bridge_request(
+            f"/internal/v1/recordings/{quote(lease['providerRecordingId'], safe='')}/media"
+            f"?offset={int(lease['offsetSeconds'])}",
+            timeout=RECORDING_PLAYBACK_SECONDS + 30,
+        )
+    elif provider == "blink":
+        device = blink_cloud_device(lease["cameraId"])
+        response = blink_bridge_request(
+            f"/internal/v1/devices/{quote(device['id'], safe='')}/clips/"
+            f"{quote(lease['providerRecordingId'], safe='')}", timeout=30,
+        )
+    elif provider == "netatmo" and lease.get("mediaUrl"):
+        request = Request(
+            lease["mediaUrl"],
+            headers={
+                "Authorization": f"Bearer {netatmo_access_token(lease['accountId'])}",
+                "Accept": "video/mp4,application/octet-stream",
+                "User-Agent": "PKWS-CameraHub/1",
+            },
+        )
+        try:
+            response = urlopen(request, timeout=30)
+        except (HTTPError, URLError, TimeoutError, OSError) as error:
+            raise HTTPException(502, "netatmo-recording-unavailable") from error
+    else:
+        raise HTTPException(409, "recording-not-playable")
+    with RECORDING_CACHE_LOCK:
+        current = PLAYBACK_LEASES.get(lease_id)
+        if current:
+            current["response"] = response
+    return recording_media_response(response, lease_id)
+
+
+@app.delete("/api/recordings/playback/{lease_id}")
+def stop_recording_playback(lease_id: str, actor: sqlite3.Row = Depends(require_csrf)):
+    with RECORDING_CACHE_LOCK:
+        lease = PLAYBACK_LEASES.get(lease_id)
+        if (
+            not lease or lease["userId"] != actor["user_id"]
+            or lease["sessionHash"] != actor["token_hash"]
+        ):
+            raise HTTPException(404, "recording-playback-not-found")
+        PLAYBACK_LEASES.pop(lease_id, None)
+    response = lease.get("response")
+    if response:
+        try:
+            response.close()
+        except OSError:
+            pass
+    return Response(status_code=204)
 
 
 @app.get("/api/cameras/{camera_id}/clips")
